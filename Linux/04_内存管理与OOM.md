@@ -10,9 +10,9 @@ created: 2026-09-16
 
 # 内存管理与 OOM
 
-> 本笔记对应 [[Linux/00_简介|Linux 大纲]] 的「阶段 3：内存管理与 OOM」。目标：能正确读 `free`／`/proc/meminfo`，能讲清 Page Cache、swap、超额分配与 OOM 判定，能回答「内存去哪了」，并且能在 OOM 之后拿出证据说清楚是谁被杀、为什么被杀。
+> 本笔记对应 [[Linux/00_简介|Linux 大纲]] 的「阶段 4：内存管理与 OOM」。目标：能正确读 `free`／`/proc/meminfo`，能讲清 Page Cache、swap、超额分配与 OOM 判定，能回答「内存去哪了」，并且能在 OOM 之后拿出证据说清楚是谁被杀、为什么被杀。
 >
-> 关联复习：[[02_进程与信号]]（进程状态与 cgroup 基础）、[[04_存储与文件系统]]（swap 设备、脏页回写与 IO 延迟）、[[09_性能分析与排障]]（PSI 与延迟分析的方法论）、[[Kubernetes/03_调度_资源_QoS|Kubernetes 资源与 QoS]]（容器内存限制与 OOMKilled）。
+> 关联复习：[[03_进程与信号]]（进程状态与 cgroup 基础）、[[05_存储与文件系统]]（swap 设备、脏页回写与 IO 延迟）、[[10_性能分析与排障]]（PSI 与延迟分析的方法论）、[[Kubernetes/03_调度_资源_QoS|Kubernetes 资源与 QoS]]（容器内存限制与 OOMKilled）。
 >
 > 说明：内核参数与算法以内核源码和 `Documentation/admin-guide/sysctl/vm.rst` 为准，字段口径以 `proc(5)` 与 `meminfo.c` 为准；默认值一律给查询命令，因为**发行版与 tuned 会覆盖内核默认值**。cgroup 以 **v2** 为准，v1 差异单独标注。
 
@@ -218,7 +218,7 @@ flowchart TD
 
 > [!warning] `vm.panic_on_oom=2` 会让 cgroup OOM 也导致整机 panic
 > 内核文档写得很直白：`0` 只杀进程；`1` 在整机 OOM 时 panic（若只是被 mempolicy/cpuset 限制导致的局部 OOM，则不 panic）；**`2` 连 memory cgroup 内的 OOM 也会让整机 panic**。
-> 文档同时给了个组合技：**`panic_on_oom=2` + kdump = 非常强的 OOM 取证手段**（能拿到完整内存快照）。这与 [[01_启动流程与内核]] 的 kdump 衔接——如果你的场景需要「OOM 必留现场」，这是一个值得评估的选项，但它显然不适合「宁可杀一个进程也不许重启」的服务。
+> 文档同时给了个组合技：**`panic_on_oom=2` + kdump = 非常强的 OOM 取证手段**（能拿到完整内存快照）。这与 [[02_启动流程与内核]] 的 kdump 衔接——如果你的场景需要「OOM 必留现场」，这是一个值得评估的选项，但它显然不适合「宁可杀一个进程也不许重启」的服务。
 
 ### 1.6 cgroup v2 的内存控制
 
@@ -290,7 +290,7 @@ pmap -X <pid> | tail -5              # 验证：带 Pss 列的映射明细（不
 三个附加答案也要记住，避免把账算错：
 
 - `PageTables`、`KernelStack`、`VmallocUsed`、`Percpu`：内核自身的内存开销，大内存机器上不可忽略；
-- **硬件与内核预留**：`MemTotal` 通常小于标称内存，因为固件、显卡、以及**为 kdump 预留的 `crashkernel=` 内存都不计入 `MemTotal`**（与 [[01_启动流程与内核]] 呼应：这也是「机器有 128G 但 `free` 显示不到」的常见原因之一）；
+- **硬件与内核预留**：`MemTotal` 通常小于标称内存，因为固件、显卡、以及**为 kdump 预留的 `crashkernel=` 内存都不计入 `MemTotal`**（与 [[02_启动流程与内核]] 呼应：这也是「机器有 128G 但 `free` 显示不到」的常见原因之一）；
 - HugePages 预留（`HugePages_Total × Hugepagesize`）：预留后即使没人用，也**不参与**常规内存分配。
 
 ```text
@@ -365,7 +365,7 @@ Memory cgroup out of memory: Killed process 12345 (java) total-vm:..., anon-rss:
 
 取证按六步走，顺序不要乱：
 
-1. **定时间点与影响面**：`journalctl --since '<时间>'`、`journalctl -b -1` 对齐业务告警时间（时间与时区基线见 [[01_启动流程与内核]]）。
+1. **定时间点与影响面**：`journalctl --since '<时间>'`、`journalctl -b -1` 对齐业务告警时间（时间与时区基线见 [[02_启动流程与内核]]）。
 2. **分清整机 OOM 还是 cgroup OOM**：看日志前缀是 `Out of memory:` 还是 `Memory cgroup out of memory:`。
 3. **看被选中进程与它的权重**：`oom_score_adj` 是否为负、`RSS` 与 `pgtables` 各占多少——这能解释「为什么杀的是它」。
 4. **看当时的整机水位**：OOM 日志前面会打印各 zone 的 `free/min/low/high`，能判断是「真的没了」还是「卡在某个水位」。
@@ -380,7 +380,7 @@ cat /sys/fs/cgroup/.../memory.stat | grep -E '^(anon|file|shmem|slab|sock) '   #
 ```
 
 > [!warning] 普通 OOM 不会自动留下 `vmcore`
-> OOM 是「内核杀进程」，不是内核崩溃，所以默认不会有 `vmcore`（[[01_启动流程与内核]] 的 kdump 在这里帮不上忙），除非显式配了 `vm.panic_on_oom=2`。
+> OOM 是「内核杀进程」，不是内核崩溃，所以默认不会有 `vmcore`（[[02_启动流程与内核]] 的 kdump 在这里帮不上忙），除非显式配了 `vm.panic_on_oom=2`。
 > 因此**平时就要把 journal 做持久化**（`/var/log/journal`）并保证容器侧的 cgroup 事件能被采集，否则 OOM 之后只能靠业务日志猜。
 
 ## 2. 生产实践
@@ -533,7 +533,7 @@ grep VmSwap /proc/*/status 2>/dev/null | sort -k2 -rn | head    # 验证：哪�
 2. **分口径**：`RssAnon` 持续涨才是典型的堆泄漏；`RssFile`/`file` 涨多半是缓存；`shmem` 涨要查共享内存/临时文件。
 3. **看 PSS/USS**：共享库与共享内存多时，RSS 会误导；用 `smaps_rollup` 的 `Private_Dirty` 看私有占用。
 4. **对压力**：如果涨的同时 `major fault`、PSI、GC 时间都在恶化，问题优先级就要提高。
-5. **处置**：先加 cgroup 上限与告警止损，再配合 dump/heap 分析定位（必要时结合 [[02_进程与信号]] 的 core 取证）。
+5. **处置**：先加 cgroup 上限与告警止损，再配合 dump/heap 分析定位（必要时结合 [[03_进程与信号]] 的 core 取证）。
 
 ```text
 for i in $(seq 1 6); do date; grep -E 'VmRSS|RssAnon|RssFile|RssShmem' /proc/<pid>/status; sleep 600; done
@@ -754,9 +754,9 @@ docker stats --no-stream <ctr>       # 或 kubectl top / describe pod，看运�
 - [x] frontmatter 有 `tags` 和 `created`，全篇只有一个 `#` 标题
 - [x] 速览卡 6 条，每条都是结论 + 可复现的证据
 - [x] 涉及默认值、内核行为或版本差异的地方都标注了适用版本与发行版（`min_free_kbytes` 的默认算法、`dirty_*` 默认值、`panic_on_oom` 语义均取自内核源码/文档）
-- [x] 涉及时间的地方写明了时区与时间同步前提（OOM 取证第 1 步与阶段 1 的时间基线一致）
-- [x] 跨笔记引用都用 wikilink；跨目录引用用路径写法；指向尚未创建的阶段笔记（[[04_存储与文件系统]]、[[09_性能分析与排障]]）的链接与 [[Linux/00_简介|00_简介]] 的规划保持一致，目前在 Obsidian 中显示为未解析属预期
-- [x] [[Linux/00_简介|00_简介]] 的阶段 3 已有「对应笔记」链接与 checklist 条目
+- [x] 涉及时间的地方写明了时区与时间同步前提（OOM 取证第 1 步与阶段 2 的时间基线一致）
+- [x] 跨笔记引用都用 wikilink；跨目录引用用路径写法；指向尚未创建的阶段笔记（[[05_存储与文件系统]]、[[10_性能分析与排障]]）的链接与 [[Linux/00_简介|00_简介]] 的规划保持一致，目前在 Obsidian 中显示为未解析属预期
+- [x] [[Linux/00_简介|00_简介]] 的阶段 4 已有「对应笔记」链接与 checklist 条目
 - [ ] 每条命令都附了「验证什么」与预期输出，并在真实实验机上跑过
 - [ ] 第 4 节的六个实验全部实操完成，把实测输出与踩坑回填到对应小节
 - [ ] 各条默认值（`swappiness`、`dirty_*`、`min_free_kbytes`、THP、`panic_on_oom`）已在本机确认，并记录发行版与 tuned 是否覆盖
