@@ -13,7 +13,7 @@ created: 2026-09-15
 >
 > **状态**：已展开（2026-09-17）。本阶段标 ★，是大纲里的两个重点之一。
 >
-> 关联复习：[[AI-Infra/00_简介|00_简介]]、[[01_驱动与内核模块]]、[[02_GPU拓扑与PCIe_NUMA]]、[[04_perftest与性能基线]]、[[05_容器内GPU与RDMA]]、[[06_NCCL排障]]、[[08_可观测性与监控告警]]；通用主机调优（IRQ 亲和、软中断、环形缓冲、MTU）见 [[05_网络协议栈与排障]]。
+> 关联复习：[[AI-Infra/00_简介|00_简介]]、[[01_驱动与内核模块]]、[[02_GPU拓扑与PCIe_NUMA]]、[[04_perftest与性能基线]]、[[05_容器内GPU与RDMA]]、[[06_NCCL排障]]、[[08_可观测性与监控告警]]；通用主机调优（IRQ 亲和、软中断、环形缓冲、MTU）见 [[Linux/06_网络协议栈与排障|Linux 网络协议栈与排障]]。
 >
 > 说明：本文命令与结论以官方文档为准——NVIDIA DOCA 文档（RDMA over Converged Ethernet、Flow Control、Explicit Congestion Notification、Congestion Control Infrastructure、Adaptive Retransmission、InfiniBand QoS）、NCCL User Guide 环境变量页、Linux 内核 `Documentation/ABI/stable/sysfs-class-infiniband` 与 mlx5 驱动源码、mlnx-tools 源码（`show_gids` / `cma_roce_mode` / `cma_roce_tos` / `mlnx_qos`）、infiniband-diags 手册页（`perfquery` / `ibstat` / `ibdiagnet`）。**计数器名字与默认值会随驱动版本变化**：落地前用文中的「清点命令」取本机实际输出，不要凭记忆抄名字。
 
