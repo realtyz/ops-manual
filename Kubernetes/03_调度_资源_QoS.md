@@ -9,7 +9,7 @@ created: 2026-09-12
 
 # 调度、资源与 QoS
 
-> 本笔记对应 [[00_简介]] 的「阶段 3」，是整套路线图里生产价值最高的一段。目标：能讲清调度器怎么选节点、NodeAffinity / Taint / 优先级这三种「摆放手段」的边界、requests 与 limits 的真实作用面、QoS 三档的判定规则，以及节点压力下驱逐与 OOM 的实际顺序。
+> 本笔记对应 [[Kubernetes/00_简介]] 的「阶段 3」，是整套路线图里生产价值最高的一段。目标：能讲清调度器怎么选节点、NodeAffinity / Taint / 优先级这三种「摆放手段」的边界、requests 与 limits 的真实作用面、QoS 三档的判定规则，以及节点压力下驱逐与 OOM 的实际顺序。
 >
 > 关联复习：[[01_核心架构与对象模型]]、[[02_工作负载与控制器]]
 >
@@ -973,7 +973,7 @@ LimitRange 是 namespace 级的「单对象约束 + 默认值注入」：
 ### 10.4 Topology Manager
 
 - 用来把 CPU、内存、设备等资源对齐到同一个 NUMA 节点：scope 可选 `container`（默认）或 `pod`，policy 可选 `none`、`best-effort`、`restricted`、`single-numa-node`。
-- 要真正生效需要 CPU Manager（必要时还有 Memory Manager）配合，这是 GPU 与高性能场景的常见组合，与 [[00_简介]] 阶段 8 的拓扑感知调度是同一套底层机制。
+- 要真正生效需要 CPU Manager（必要时还有 Memory Manager）配合，这是 GPU 与高性能场景的常见组合，与 [[Kubernetes/00_简介]] 阶段 8 的拓扑感知调度是同一套底层机制。
 
 ### 10.5 节点预留
 
@@ -1114,7 +1114,7 @@ kubectl get events -A --sort-by=.lastTimestamp
 
 ## 14. 回到路线图
 
-完成本笔记后，回到 [[00_简介]]：
+完成本笔记后，回到 [[Kubernetes/00_简介]]：
 
 - [ ] 能讲清过滤 / 打分两阶段与调度框架的扩展点
 - [ ] 能区分 `nodeSelector`、`nodeAffinity`、Pod 亲和反亲和、TopologySpreadConstraints 的适用场景

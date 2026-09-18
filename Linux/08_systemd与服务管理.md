@@ -10,9 +10,9 @@ created: 2026-09-17
 
 # systemd、服务与定时任务
 
-> 本笔记对应 [[Linux/00_简介|Linux 大纲]] 的「阶段 8：systemd、服务与定时任务」。目标：把 systemd 讲成三件事——**怎么描述一个服务（unit 文件与 `Type=`）**、**它怎么被拉起与约束（依赖、资源、沙箱、重启策略）**、**它留下的证据在哪里（`systemctl status` / `journalctl`）**——并能把这套模型用到定时任务（timer/cron）与临时文件治理（tmpfiles）上。
+> 本笔记对应 [[00_学习大纲|Linux 大纲]] 的「阶段 8：systemd、服务与定时任务」。目标：把 systemd 讲成三件事——**怎么描述一个服务（unit 文件与 `Type=`）**、**它怎么被拉起与约束（依赖、资源、沙箱、重启策略）**、**它留下的证据在哪里（`systemctl status` / `journalctl`）**——并能把这套模型用到定时任务（timer/cron）与临时文件治理（tmpfiles）上。
 >
-> 关联复习：[[02_启动流程与内核]]（`default.target`、救援入口、`systemd-analyze blame`/`critical-chain`、内核参数与 `sysctl.d`）、[[03_进程与信号]]（`ulimit`/`limits.conf`/`LimitNOFILE` 三层限制、D 状态与 `kill -9`、cgroup 与 namespace）、[[05_存储与文件系统]]（`/tmp` 的挂载与 `nosuid`/`noexec`、日志写满根分区）、[[06_网络协议栈与排障]]（服务起不来时的端口/防火墙判定）、[[07_权限与安全加固]]（`User=`、`NoNewPrivileges`、`CapabilityBoundingSet`、SUID 与 capabilities）、[[09_日志与监控]]（journald 与 rsyslog 的分工、轮转与保留）、[[11_生产运维与高可用]]（变更窗口、批量重启、回滚）、[[12_复习与自测]]，以及 [[Kubernetes/03_调度_资源_QoS|Kubernetes 资源与 QoS]]（`systemd` 的 cgroup 是容器 QoS 的宿主侧基础）。
+> 关联复习：[[Linux/02_启动流程与内核/00_导读与知识地图|02 启动流程与内核]]（`default.target`、救援入口、`systemd-analyze blame`/`critical-chain`、内核参数与 `sysctl.d`）、[[Linux/03_进程与信号/00_导读与知识地图|03 进程与信号]]（`ulimit`/`limits.conf`/`LimitNOFILE` 三层限制、D 状态与 `kill -9`、cgroup 与 namespace）、[[Linux/05_存储与文件系统/00_导读与知识地图|05 存储与文件系统]]（`/tmp` 的挂载与 `nosuid`/`noexec`、日志写满根分区）、[[Linux/06_网络协议栈与排障/00_导读与知识地图|06 网络协议栈与排障]]（服务起不来时的端口/防火墙判定）、[[07_权限与安全加固]]（`User=`、`NoNewPrivileges`、`CapabilityBoundingSet`、SUID 与 capabilities）、[[09_日志与监控]]（journald 与 rsyslog 的分工、轮转与保留）、[[11_生产运维与高可用]]（变更窗口、批量重启、回滚）、[[12_复习与自测]]，以及 [[Kubernetes/03_调度_资源_QoS|Kubernetes 资源与 QoS]]（`systemd` 的 cgroup 是容器 QoS 的宿主侧基础）。
 >
 > 说明：结论以 man 页（`systemd.unit(5)`、`systemd.service(5)`、`systemd.exec(5)`、`systemd.timer(5)`、`systemd.time(7)`、`systemd.kill(5)`、`journald.conf(5)`、`tmpfiles.d(5)`、`crontab(5)`、`cron(8)`）与发行版官方文档为准。**本文的数字默认来自 Ubuntu 24.04.4 LTS / 内核 `6.6.87.2-microsoft-standard-WSL2` / systemd 255（255.4-1ubuntu8.17）的实测**，用户单元实验在 `systemctl --user` 下完成，换发行版或 systemd 版本要重新取一遍；RHEL 系的差异单列并标注「未在本机实测」。
 
@@ -81,7 +81,7 @@ flowchart TD
 开机后 PID 1 是 systemd，它做的事可以概括成：**读 unit → 解析依赖 → 并行拉起 → 用 cgroup 管住 → 把日志收进 journald**。四个概念先分清：
 
 - **unit**：被管理的对象。文件形式在磁盘上（`/usr/lib/systemd/system/*.service`），运行时形式在内存里（transient/scope）。
-- **target**：一组 unit 的集合，用来表达「系统到哪一步了」。`default.target` 是开机默认目标（多指向 `graphical.target` 或 `multi-user.target`），`rescue.target`/`emergency.target` 是救援入口（[[02_启动流程与内核]]）。
+- **target**：一组 unit 的集合，用来表达「系统到哪一步了」。`default.target` 是开机默认目标（多指向 `graphical.target` 或 `multi-user.target`），`rescue.target`/`emergency.target` 是救援入口（[[Linux/02_启动流程与内核/00_导读与知识地图|02 启动流程与内核]]）。
 - **slice**：cgroup 层级的组织单位。用户的 systemd 实例整体在 `user-1000.slice/user@1000.service` 下（本机实测服务 cgroup 路径为 `/user.slice/user-1000.slice/user@1000.service/app.slice/lab-limit.service`），系统的服务在 `system.slice`。
 - **scope**：不由 systemd 创建的进程组（例如登录会话 `session-1.scope`），systemd 只是把它们纳入 cgroup 管理而不管启动。
 
@@ -110,7 +110,7 @@ graphical.target @1.000s
 | `socket` | 监听套接字 / FIFO，可激活对应 service | 按需启动、重启服务不断连接 | `.socket` |
 | `timer` | 定时触发另一个 unit | 替代 cron | `.timer` |
 | `target` | 一组 unit 的集合 | 启动阶段、`multi-user.target` | `.target` |
-| `mount` / `automount` | 挂载点与按需挂载 | `/data`、网络盘（[[05_存储与文件系统]]） | `.mount` |
+| `mount` / `automount` | 挂载点与按需挂载 | `/data`、网络盘（[[Linux/05_存储与文件系统/00_导读与知识地图|05 存储与文件系统]]） | `.mount` |
 | `path` | 监听文件系统路径变化 | 文件出现就跑一个任务 | `.path` |
 | `slice` | cgroup 层级 | 资源分组（`system.slice`、`user.slice`） | `.slice` |
 | `scope` | 外部创建的进程组 | 登录会话 | `.scope` |
@@ -333,8 +333,8 @@ $ cat .../cpu.max
 
 三个必须说清的边界：
 
-- **`limits.conf`、`ulimit`、`LimitNOFILE` 是三套东西**：`limits.conf` 由 PAM 的 `pam_limits` 在**登录会话**生效；`ulimit` 是 shell 内置、只影响当前进程树；systemd 服务走 unit 的 `LimitNOFILE=`（[[03_进程与信号]]）。**这就是「改 `limits.conf` 对服务不生效」的原因。**
-- **`MemoryMax=` 的单位与行为**：可写 `32M`/`512M`/`2G`，`systemctl show` 会换算成字节；触发上限时 cgroup v2 会先回收、再 OOM（[[04_内存管理与OOM]]）。`MemoryHigh=` 是软上限（只限速不杀）。
+- **`limits.conf`、`ulimit`、`LimitNOFILE` 是三套东西**：`limits.conf` 由 PAM 的 `pam_limits` 在**登录会话**生效；`ulimit` 是 shell 内置、只影响当前进程树；systemd 服务走 unit 的 `LimitNOFILE=`（[[Linux/03_进程与信号/00_导读与知识地图|03 进程与信号]]）。**这就是「改 `limits.conf` 对服务不生效」的原因。**
+- **`MemoryMax=` 的单位与行为**：可写 `32M`/`512M`/`2G`，`systemctl show` 会换算成字节；触发上限时 cgroup v2 会先回收、再 OOM（[[Linux/04_内存管理与OOM/00_导读与知识地图|04 内存管理与 OOM]]）。`MemoryHigh=` 是软上限（只限速不杀）。
 - **`CPUQuota=` 的语义是「配额」不是「亲和」**：`10%` 表示每个周期最多用 10% 的单核算力；要绑核用 `CPUAffinity=`/`AllowedCPUs=`。
 
 #### 生命周期与重启策略
@@ -410,7 +410,7 @@ $ systemd-run --user --wait --collect --property=PrivateTmp=yes \
 12434                                                 # 服务内
 ```
 
-`PrivateTmp=yes` 的实用含义：服务把文件写进 `/tmp` 时，**其它服务/宿主用户看不到**（排查时用 `systemd-cgls`/`/proc/<pid>/root/tmp` 或直接 `nsenter` 进命名空间，[[03_进程与信号]]）；反过来，服务依赖 `tmpwatch`/`systemd-tmpfiles` 清理 `/tmp` 的假设也要重新想——**私有 `/tmp` 随服务停止就消失**，不适合放跨重启的持久文件。
+`PrivateTmp=yes` 的实用含义：服务把文件写进 `/tmp` 时，**其它服务/宿主用户看不到**（排查时用 `systemd-cgls`/`/proc/<pid>/root/tmp` 或直接 `nsenter` 进命名空间，[[Linux/03_进程与信号/00_导读与知识地图|03 进程与信号]]）；反过来，服务依赖 `tmpwatch`/`systemd-tmpfiles` 清理 `/tmp` 的假设也要重新想——**私有 `/tmp` 随服务停止就消失**，不适合放跨重启的持久文件。
 
 `ProtectSystem=` 的取值（`yes`/`full`/`strict`）逐级收紧，`strict` 下整个文件系统只读（除了 `/dev`、`/proc`、`/sys` 与显式 `ReadWritePaths=`）；写日志、写 pid、写缓存都要显式开口。**改了沙箱选项后，`systemctl start` 报的往往不是业务错误码，而是 `200/CHDIR`、`203/EXEC`、`226/NAMESPACE` 这类 systemd 退出码**——先用 `systemd-analyze exit-status 200 203 216 226` 查含义（本机实测输出：`CHDIR/EXEC/GROUP/NAMESPACE`）。
 
@@ -834,7 +834,7 @@ WantedBy=multi-user.target
 | 常见做法或说法 | 后果或事实 |
 | --- | --- |
 | 「改了 unit 文件，`restart` 一下就好」 | 没 `daemon-reload` 时 systemd 用的还是旧配置（实测 `status` 会提示 changed on disk）；reload 后**运行中的进程仍用旧环境**，必须 restart |
-| 「`limits.conf` 里调大 `nofile` 就行」 | 服务走 unit 的 `LimitNOFILE=`；`limits.conf` 只作用于 PAM 登录会话（[[03_进程与信号]]） |
+| 「`limits.conf` 里调大 `nofile` 就行」 | 服务走 unit 的 `LimitNOFILE=`；`limits.conf` 只作用于 PAM 登录会话（[[Linux/03_进程与信号/00_导读与知识地图\|03 进程与信号]]） |
 | 「`After=` 加上就有依赖了」 | `After` 只排序不拉起；要 `Wants`/`Requires` + `After` 一起写 |
 | 「后台 daemon 用 `Type=simple` 就行」 | 父进程退出后服务被判为 inactive，子进程被控制组清掉；要么 `Type=forking`，要么让程序前台运行 |
 | 「日志里打印了 ready，systemd 还超时，肯定是 systemd 有 bug」 | 先查 `Type=notify` 与 `NotifyAccess=`（实测默认只允许 main PID 发通知） |
@@ -879,7 +879,7 @@ journalctl -u myapp.service -b -p err --no-pager | tail -20
 1. **`Loaded: not-found`**：unit 文件不存在/名字拼错/没 `daemon-reload`（新文件）；`systemctl list-unit-files | grep <名字>` 确认。
 2. **`Loaded: masked`**：被 `mask` 了（见 1.11），`systemctl unmask` 或找谁屏蔽的。
 3. **`Loaded` 正常但起不来**：进入退出码/日志分析——`203` 查路径与权限（[[07_权限与安全加固]]），`200` 查工作目录，`226` 查沙箱，业务退出码查应用日志。
-4. **`active (running)` 但服务不可用**：不是「起不来」，是「起来了但没就绪」——查端口（`ss -lntp`）、依赖（DB/缓存）、就绪探针与日志（[[06_网络协议栈与排障]]）。
+4. **`active (running)` 但服务不可用**：不是「起不来」，是「起来了但没就绪」——查端口（`ss -lntp`）、依赖（DB/缓存）、就绪探针与日志（[[Linux/06_网络协议栈与排障/00_导读与知识地图|06 网络协议栈与排障]]）。
 
 ### 3.2 服务「启动成功」但行为不对
 
@@ -1268,7 +1268,7 @@ crontab -r; rm -f ~/lab-cron-env.txt ~/lab-cron-log.txt
 > - **`limits.conf`**：PAM 的 `pam_limits` 在**登录会话**里设置 rlimit（`login`/`su`/`sudo`/`cron` 等引用），对 systemd 服务无效。
 > - **`ulimit`**：shell 内置，只影响当前 shell 及其子进程，是最外层的临时手段。
 > - **`LimitNOFILE=`**：unit 里的设置，由 systemd 在创建服务进程时应用（实测 `LimitNOFILE=64` → 服务内 `ulimit -n` 为 64）；systemd 服务的默认值来自 manager 的 `DefaultLimitNOFILE`（本机实测 1048576）。
-> - **验证**：`systemctl show -p LimitNOFILE <unit>` + 服务内 `ulimit -n` 对照；进程运行中想改可用 `prlimit`（[[03_进程与信号]]）。
+> - **验证**：`systemctl show -p LimitNOFILE <unit>` + 服务内 `ulimit -n` 对照；进程运行中想改可用 `prlimit`（[[Linux/03_进程与信号/00_导读与知识地图|03 进程与信号]]）。
 > - **第一反应不要是什么**：不要在 `limits.conf` 里反复加行——对 systemd 服务它永远不生效。
 
 > [!question]- 脚本在命令行能跑、放进 `cron` 就跑不通，为什么？
@@ -1322,7 +1322,7 @@ crontab -r; rm -f ~/lab-cron-env.txt ~/lab-cron-log.txt
 
 ## 6. 回到路线图
 
-完成本笔记后，回到 [[Linux/00_简介|00_简介]]：
+完成本笔记后，回到 [[00_学习大纲|00_学习大纲]]：
 
 - [ ] 能说出 unit 的常见类型（service/socket/timer/target/mount/path/slice/scope）与各自的职责，并知道 `.timer` 触发的是同名 `.service`
 - [ ] 能说出 unit 的三处位置与优先级（`/etc/systemd/system` > `/run/systemd/system` > `/usr/lib/systemd/system`），会用 `systemd-analyze unit-paths`、`systemctl cat`、`systemctl edit` 的 drop-in
@@ -1381,8 +1381,8 @@ crontab -r; rm -f ~/lab-cron-env.txt ~/lab-cron-log.txt
 - [x] 数字都带单位（秒、毫秒、字节、次数、百分比），cgroup 与 unit 的对照值都给了原始命令
 - [x] 破坏性或影响面大的操作（`journalctl --vacuum-*`、系统单元变更、`mask` 系统单元、`crontab -`）要么只在实验机做，要么显式标为「未实测」并给出前置条件
 - [x] 涉及时间的地方统一说明时区与 NTP 前提（`timedatectl`、journal 的本地时间 vs UTC）
-- [x] 跨笔记引用都用 wikilink；跨目录引用用路径写法（[[Kubernetes/03_调度_资源_QoS|Kubernetes 资源与 QoS]]）；指向尚未创建的阶段笔记的链接与 [[Linux/00_简介|00_简介]] 的规划一致
-- [x] [[Linux/00_简介|00_简介]] 的阶段 8 已有「对应笔记」链接与 checklist 条目，本次补齐了模板单元、`ExecReload`、`TimeoutStartSec`、slice/cgroup、`systemd-analyze` 工具箱、tmpfiles `age-by`、cron 环境与 `%` 转义等条目
+- [x] 跨笔记引用都用 wikilink；跨目录引用用路径写法（[[Kubernetes/03_调度_资源_QoS|Kubernetes 资源与 QoS]]）；指向尚未创建的阶段笔记的链接与 [[00_学习大纲|00_学习大纲]] 的规划一致
+- [x] [[00_学习大纲|00_学习大纲]] 的阶段 8 已有「对应笔记」链接与 checklist 条目，本次补齐了模板单元、`ExecReload`、`TimeoutStartSec`、slice/cgroup、`systemd-analyze` 工具箱、tmpfiles `age-by`、cron 环境与 `%` 转义等条目
 - [x] 本机实验产生的用户单元、drop-in、`user-tmpfiles.d` 配置、`~/lab-*` 文件与实验 crontab 已清理并复核（用户 journal 中的实验日志保留，无害）
 - [ ] 在有 root 的真机上补做实验 10（system 单元、系统级 `enable --now`、journald vacuum、system 单元限流、chrony/RHEL 差异），并把输出回填到 1.6～1.12 与验证进度
 - [ ] Mermaid 图在 Obsidian 里预览过，能正常渲染
