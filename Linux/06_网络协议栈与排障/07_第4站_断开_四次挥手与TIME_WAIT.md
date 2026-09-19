@@ -70,8 +70,9 @@ sequenceDiagram
 
 ### 1.3 实测：`TIME_WAIT` 到底停多久
 
+实验 4（完整脚本见子笔记 13）让主动关闭方进入 `TIME_WAIT` 并计时到消失：
+
 ```text
-# 实验 4（完整脚本见子笔记 13）：主动关闭方进入 TIME_WAIT，并计时到消失
 客户端本地端口: 33868
 0.0 秒: TIME-WAIT      # 主动 close() 后立刻进入
 ...
@@ -178,6 +179,17 @@ sysctl net.ipv4.ip_local_port_range net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_fin
 | 为了消除 `TIME_WAIT` 把 `tcp_max_tw_buckets` 调小 | 会提前触发内核销毁 `TIME_WAIT`，破坏 2MSL 保护，可能造成旧报文被误收 |
 | 用 `ss` 的瞬时值判断「泄漏」 | 要看**趋势**：隔几分钟采两次，比较句柄数与状态数是否单调增长 |
 | 认为 `TIME_WAIT` 会「拖慢」服务端 | 它不占用服务端端口，也不影响服务端接受新连接；影响的是**主动关闭方的源端口** |
+
+## 决策练习
+
+> [!question]- 场景：一台反向代理上 `TIME_WAIT` 数量很高，同事查资料后建议「调小 `tcp_fin_timeout`」。
+> A. 调小 `tcp_fin_timeout`
+> B. 先判断谁在主动关闭、算「QPS × 60s vs 源端口数」，再看 `TCPTimeWaitOverflow`；真接近上限才按「改应用 → 扩源端口 → `tcp_tw_reuse=1` → `tcp_max_tw_buckets` 兜底」处理
+> C. 开 `tcp_tw_recycle`
+>
+> **答案：B。**
+> `tcp_fin_timeout` 只管 `FIN_WAIT2`，与 `TIME_WAIT` 无关；`tcp_tw_recycle` 已被移除且在 NAT 下有害。多数「很多 `TIME_WAIT`」其实远没到端口上限。
+> **第一反应不要是什么**：不要为了消灭 `TIME_WAIT` 去动这两个参数。
 
 ## 要点自测
 

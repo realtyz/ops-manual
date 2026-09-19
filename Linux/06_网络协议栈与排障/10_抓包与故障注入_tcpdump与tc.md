@@ -84,10 +84,8 @@ flowchart LR
 ```
 
 ```bash
-# 客户端
-timeout 30 tcpdump -i eth0 -nn -c 50 host <server_ip> and port <port>
-# 服务端（同时执行）
-timeout 30 tcpdump -i eth0 -nn -c 50 host <client_ip> and port <port>
+timeout 30 tcpdump -i eth0 -nn -c 50 host <server_ip> and port <port>   # 客户端
+timeout 30 tcpdump -i eth0 -nn -c 50 host <client_ip> and port <port>   # 服务端（同时执行）
 ```
 
 （**未实测**；两台机器的时间要大致对齐，最好先 `date` 对一下。）
@@ -104,15 +102,18 @@ tc -s qdisc show                        # 验证：所有设备的队列与丢�
 
 ### 2.2 注入延迟与丢包（实测）
 
+实验 5（完整脚本见子笔记 13）先在隔离环境的 veth 上注入 50ms 延迟：
+
 ```bash
-# 实验 5（完整脚本见子笔记 13）：在隔离环境的 veth 上注入 50ms 延迟
 tc qdisc add dev veth0 root netem delay 50ms
 ping -c3 10.0.0.1                       # 实测 RTT：0.029ms → 50.044/50.161/50.250 ms
+```
 
-# 实测：追加 20% 丢包
+再追加 20% 丢包，最后删除 qdisc 恢复：
+
+```bash
 tc qdisc change dev veth0 root netem delay 50ms loss 20%
 ping -c10 10.0.0.1                      # 实测：10 包收到 7 包（30% 丢包，样本小，量级吻合即可）
-
 tc qdisc del dev veth0 root             # 验证：删除后 RTT 立刻回到 0.016/0.023/0.031 ms
 ```
 
@@ -146,9 +147,10 @@ tc qdisc del dev veth0 root             # 验证：删除后 RTT 立刻回到 0.
 6. **恢复**：`tc qdisc del dev <dev> root`，确认 RTT 回到基线。
 7. **清理**：`tc qdisc show` 确认无残留，`ip netns del` 回收拓扑。
 
+在 `delay 50ms loss 20%` 的状态下跑应用并改参数，随后加大难度、最后恢复：
+
 ```bash
 tc qdisc add dev veth0 root netem delay 50ms loss 20%
-# … 跑应用与改参数 …
 tc qdisc change dev veth0 root netem delay 200ms      # 加大难度再跑一次
 tc qdisc del dev veth0 root                            # 恢复
 ping -c3 10.0.0.1                                      # 验证：RTT 回到基线
@@ -194,6 +196,17 @@ ls -lh /tmp/cap.pcap                             # 验证：文件大小是否�
 | 只在 `lo` 上做注入实验 | `lo` 会影响本机所有走回环的服务（含 DNS 存根） |
 | 注入后忘记删除 qdisc | 残留会持续影响流量；收尾必须 `tc qdisc show` 确认 |
 | 抓到的包长期留在服务器上 | 占空间且含业务数据；分析完应及时删除或归档 |
+
+## 决策练习
+
+> [!question]- 场景：生产偶发 50ms 延迟，只在高峰期出现。同事说「在业务机上 `tcpdump -i any` 抓一天总能看到」。
+> A. 直接抓一天
+> B. 先在实验链路上用 `tc netem` 复现延迟/丢包，再决定是否在生产限流限时抓包；生产抓包要过滤、落盘、限数量
+> C. 放弃抓包，直接改内核参数
+>
+> **答案：B。**
+> 偶发问题直接抓一天命中率低、代价高；先用注入复现能确定抓包过滤条件。生产抓包必须有「限流、限时、落盘」纪律，否则高峰期会把机器抓挂。
+> **第一反应不要是什么**：不要在生产高峰 `tcpdump -i any` 全量抓。
 
 ## 要点自测
 

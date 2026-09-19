@@ -164,6 +164,17 @@ sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max
 | 忽略 conntrack 容量 | 集群规模大时它是常见瓶颈，且表满是**静默丢包** |
 | 直接把 `nf_conntrack_max` 调到极大 | 内存开销上升，且治标不治本；要靠连接复用与合理超时 |
 
+## 决策练习
+
+> [!question]- 场景：Pod 里服务连不上，宿主机上 `ss -lntp` 看不到那个端口。同事说「服务没起来，重启 Pod」。
+> A. 直接重启 Pod
+> B. 进 Pod 网络命名空间 `nsenter -t <pid> -n ss -lntp` 确认监听，再查 Service 转发、CNI 规则与 NetworkPolicy，区分「没监听」还是「转发被拦」
+> C. 在宿主机上 `iptables -F` 清空规则
+>
+> **答案：B。**
+> 宿主机与 Pod 的网络命名空间不同，宿主机 `ss` 看不到 Pod 端口是正常的；问题可能出在 CNI/Service/NetworkPolicy。C 会清空宿主机全部防火墙规则，风险极高。
+> **第一反应不要是什么**：不要用宿主机视图推断 Pod 状态，也不要清空防火墙。
+
 ## 要点自测
 
 > [!question]- Pod 网络由哪三部分构成？这解释了哪些现象？

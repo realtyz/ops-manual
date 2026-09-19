@@ -138,12 +138,11 @@ nstat -az | grep -iE 'conntrack|drop'   # 验证：内核计数口径的丢包�
 | 本机连接表正常但业务超时 | 应用层或后端依赖 | 往应用层查 |
 | 云主机：安全组/LB/云网络 | 主机侧计数器干净，且路径经过这些设备 | 找云平台侧确认 |
 
+两侧对照的最小做法（需要两台机器同时操作）：
+
 ```bash
-# 两侧对照的最小做法（需要两台机器同时操作）
-# 客户端：
-tcpdump -i eth0 -nn -c 20 host <server_ip> and port <port>
-# 服务端：
-tcpdump -i eth0 -nn -c 20 host <client_ip> and port <port>
+tcpdump -i eth0 -nn -c 20 host <server_ip> and port <port>   # 客户端
+tcpdump -i eth0 -nn -c 20 host <client_ip> and port <port>   # 服务端
 ```
 
 （抓包必须限流限时，完整纪律见子笔记 10；此处的 `-c 20` 只是最小示例。）
@@ -182,6 +181,17 @@ ip -s link
 | 「云主机通不通先看本机防火墙」 | 安全组/LB 在主机之外；主机侧规则与计数器都干净时，要找云平台侧确认 |
 | 认为 conntrack 只和 NAT 有关 | 状态化防火墙、容器 Service 转发都依赖它 |
 | 在容器里查 conntrack 却看宿主机的数据 | 命名空间不同；容器有自己的一套（子笔记 14） |
+
+## 决策练习
+
+> [!question]- 场景：云上 K8s 节点偶发新连接超时，老连接正常，主机侧 `ss`/`nstat` 基本干净。同事说「重启一下网络，或者把 `ip_forward` 重写一遍」。
+> A. 重启网络服务
+> B. 先查 `nf_conntrack_count/max`、`dmesg` 的 `table full`、`conntrack -S`；主机侧真干净就按「中间设备/安全组/LB/对端」方向排查
+> C. 直接把 `nf_conntrack_max` 调到最大
+>
+> **答案：B。**
+> 新连接失败、老连接正常是 conntrack 满或中间过滤的常见形状；重启网络会毁掉现场，且不解决表满。C 会放大内存开销，未必对症。
+> **第一反应不要是什么**：不要在主机侧没有异常时继续反复调本机参数。
 
 ## 要点自测
 

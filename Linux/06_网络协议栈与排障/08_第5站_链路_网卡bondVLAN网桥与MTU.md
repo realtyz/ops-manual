@@ -107,17 +107,22 @@ MTU 不一致**只影响大包**，所以：
 
 ### 3.2 实测：`-s 1472` 全丢、`-s 1372` 全通
 
+实验 6（完整脚本见子笔记 13）在一端 MTU=1400、另一端 MTU=1500 的 veth 上验证：
+
 ```bash
-# 实验 6（完整脚本见子笔记 13）：一端 MTU=1400、另一端 MTU=1500
 ip netns exec cli ping -M do -s 1472 -c2 10.0.0.1     # 需要 1500 字节承载
 ip netns exec cli ping -M do -s 1372 -c2 10.0.0.1     # 需要 1400 字节承载
 ```
 
-```text
-# 1500 字节（-s 1472）
-2 packets transmitted, 0 received, 100% packet loss   # ← 设了 DF，不能被分片，直接丢
+1500 字节（`-s 1472`）时：
 
-# 1400 字节（-s 1372）
+```text
+2 packets transmitted, 0 received, 100% packet loss   # ← 设了 DF，不能被分片，直接丢
+```
+
+1400 字节（`-s 1372`）时：
+
+```text
 2 packets transmitted, 2 received, 0% packet loss
 rtt min/avg/max/mdev = 0.022/0.024/0.027/0.002 ms
 ```
@@ -150,8 +155,9 @@ tracepath <ip>                          # 验证：看到哪一跳的 MTU 变小
 
 常见场景：VPN/隧道（GENEVE/VXLAN/IPIP 有额外封装开销）、overlay 网络（容器 CNI）、跨运营商链路。**处置方式**：统一两端 MTU，或在网关上做 MSS clamping，而不是把 MTU 一调了之：
 
+在网关/转发节点上限制 SYN 的 MSS，可以规避 PMTU 黑洞（nftables 侧请按发行版语法实现）：
+
 ```bash
-# 在网关/转发节点上限制 SYN 的 MSS，规避 PMTU 黑洞（nftables 侧请按发行版语法实现）
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ```
 
@@ -200,6 +206,17 @@ sysctl net.ipv4.tcp_mtu_probing
 | 直接把 `eth0` 的 MTU 改小 | 影响该接口**所有**流量；应优先在隧道/overlay 或网关侧解决 |
 | 用 `iptables` 看桥接流量却看不到 | 需要 `br_netfilter` + `bridge-nf-call-iptables`（K8s 常见） |
 | 依赖接口名识别网卡 | 名字会随插槽/固件/命名策略改变；用 MAC 与台账 |
+
+## 决策练习
+
+> [!question]- 场景：用户反馈「能 SSH、小请求正常，一传大文件就卡死」。同事说「带宽不够，扩到 10G」。
+> A. 直接扩带宽
+> B. 先 `ping -M do -s 1472`（不行再缩到 1372）两分钟定性 MTU，再查 `ip link`、隧道/overlay 封装开销
+> C. 先关掉 offload
+>
+> **答案：B。**
+> 「小包通、大包不通」是 MTU/PMTU 黑洞的典型指纹，扩带宽解决不了。C 只影响 CPU 与抓包视图，不解决路径 MTU 不一致。
+> **第一反应不要是什么**：不要一上来就扩容，也不要直接改整块网卡的 MTU。
 
 ## 要点自测
 
