@@ -26,7 +26,7 @@ created: 2026-09-18
 ## 0. 30 秒速览
 
 > [!abstract] 这一篇只要记住五句话
-> - **`No space left on device` 至少有四种来源**：容量满、inode 满、ext4 的保留块、只读文件系统；**报错文本一样，处置完全不同**。
+> - **「写不进去」至少有六类来源**：容量满、inode 满、ext4 保留块、配额到顶、文件系统只读、thin pool 写满；**errno 与报错文本并不相同**（前三种是 `ENOSPC`/`No space left on device`、配额是 `EDQUOT`/`Disk quota exceeded`、只读是 `EROFS`/`Read-only file system`），处置完全不同——**先按报错文本分流，不要一律当成「磁盘满」**。
 > - **配额到顶报的是另一个错误**：`Disk quota exceeded`（`EDQUOT`），与 `ENOSPC` 不是同一个 errno，但现象也是「写不进去」。
 > - **`df` 与 `du` 对不上有四类**：已删除但仍被持有、被挂载覆盖、保留块与元数据、稀疏文件与延迟分配。
 > - **第一组判据永远是三条命令**：`df -h`、`df -i`、`lsof +L1`。三条一起看，六种原因里的四种当场就能排除。
@@ -64,8 +64,9 @@ df -i                                # 验证：哪个文件系统的 inode 接�
 du --inodes -s /var/* 2>/dev/null | sort -rn | head -10
                                      # 验证：按 inode 数找出"文件最多的目录"
 find /var -xdev -type f | wc -l      # 验证：某个文件系统上的文件总数（-xdev 不跨文件系统）
-sudo tune2fs -l /dev/<dev> | grep -E 'Inode count|Free inodes|Bytes per inode'
-                                     # 验证：ext4 的 inode 总量、剩余与"每个 inode 摊到多少字节"
+sudo tune2fs -l /dev/<dev> | grep -E 'Inode count|Free inodes|Inode size'
+                                     # 验证：ext4 的 inode 总量、剩余与 inode 大小
+                                     # 注意：tune2fs -l 没有「Bytes per inode」字段（本机实测 grep 计数 0）
 ```
 
 治理思路（短期 + 长期 + 监控三条都要有）：
@@ -166,7 +167,7 @@ sudo lvs -o+lv_size,data_percent,metadata_percent
 > [!example]- 实验 6：制造 `df` 与 `du` 不一致的两类现场
 > **怎么做**：先造「已删除但被进程持有」，再造「被挂载覆盖的目录」。
 > ```bash
-> LOOP1=/dev/loop9                     # 沿用子笔记 04 实验 1 的 ext4 环设备
+> LOOP1=/dev/loop0                     # 用你在子笔记 04 实验 1 里记下的环设备名；本机实测为 /dev/loop0，**不要硬编码 loop9**
 > sudo mount "${LOOP1}p1" /mnt/lab
 > sudo dd if=/dev/zero of=/mnt/lab/bigfile bs=1M count=200
 > df -h /mnt/lab                       # 验证：记录当前用量

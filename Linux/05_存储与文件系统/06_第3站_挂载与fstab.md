@@ -159,7 +159,7 @@ findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS
 > [!example]- 实验 3：写一条 fstab 并验收，再故意写坏它
 > **怎么做**：在 loop 文件系统上走完「挂载 → 写 fstab → 验收」，然后在实验机上体验一次「写坏 fstab 会有什么报错」（**只在可快照实验机**）。
 > ```bash
-> LOOP1=/dev/loop9                     # 沿用子笔记 04 实验 1 留下的 ext4 环设备
+> LOOP1=/dev/loop0                     # 用你在子笔记 04 实验 1 里记下的环设备名；本机实测为 /dev/loop0，**不要硬编码 loop9**
 > sudo mkdir -p /mnt/lab && sudo mount "${LOOP1}p1" /mnt/lab
 > UUID=$(sudo blkid -s UUID -o value "${LOOP1}p1")
 > echo "UUID=$UUID /mnt/lab ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab

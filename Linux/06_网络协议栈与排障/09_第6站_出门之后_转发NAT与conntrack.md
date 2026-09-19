@@ -14,8 +14,15 @@ created: 2026-09-18
 > [!cite] 参考资料
 > `man 8 iptables`、`man 8 nft`、`man 8 conntrack`、`man 8 sysctl`、`man 8 ip`、`man 8 ss`、`man 8 nstat`，内核文档 `Documentation/networking/nf_conntrack-sysctl.rst` 与 `Documentation/networking/ip-sysctl.rst`（`ip_forward`、`rp_filter`）。
 >
-> 实测数据来自 **Ubuntu 24.04 / 内核 6.6（WSL2）** 的 `sysctl` 采集：`nf_conntrack_max=262144`、`nf_conntrack_buckets=262144`、`nf_conntrack_tcp_timeout_established=432000`（5 天）、`nf_conntrack_tcp_timeout_time_wait=120`、`nf_conntrack_tcp_timeout_syn_recv=60`、`net.ipv4.ip_forward=0`。
-> **未实测**：`conntrack -S`/`conntrack -C` 的输出、`dmesg` 里 `nf_conntrack: table full, dropping packet` 的原文、云厂商安全组的具体行为。文中已标注。
+> **实测状态**：本篇已在**本实验机**上本次重跑并粘贴，替换了原 WSL2 输出。实测环境：**Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 `6.8.0-139-generic` / 4 vCPU / root 可用。** 实验全部在**独立 network namespace** 里做（`c6 —— r6（路由器） —— s6` 三命名空间 + nftables DNAT/MASQUERADE，脚本留存为 `.labvm/evidence/06_nat_conntrack_router`、`06_conntrack_table_full`），宿主网络栈未改动（实测宿主 `net.ipv4.ip_forward` 始终为 `0`、`conntrack -C` 始终为 `0`）。
+>
+> **本机最重要的事实：`nf_conntrack` 模块默认未加载、而且默认不参与记账。**
+> - `lsmod` 里没有 `nf_conntrack`，`/proc/sys/net/netfilter/` 下只有 `nf_hooks_lwtunnel`/`nf_log`/`nf_log_all_netns`，**`nf_conntrack_max` 不存在**；
+> - 加载后（`modprobe nf_conntrack`）才有值：`nf_conntrack_max=262144`、`nf_conntrack_buckets=262144`、`nf_conntrack_tcp_timeout_established=432000`（5 天）、`nf_conntrack_tcp_timeout_time_wait=120`、`nf_conntrack_tcp_timeout_syn_recv=60`；
+> - **`nf_conntrack_max` 是全局参数**：在 netns 内 `sysctl -w net.netfilter.nf_conntrack_max=64` 会被拒（`Operation not permitted`）；
+> - 更关键的一条：**没有 NAT/状态化规则时，conntrack 根本不注册钩子**。实测宿主命名空间有活跃的 SSH 流量，但 `nf_conntrack_count` 与 `conntrack -C` 都是 **0**；在 netns 的路由器上转发了几十 GB 的 `iperf3` 流量（38.7 Gbits/sec），`nf_conntrack_count` 依然是 **0**——直到加上 `dnat`/`masquerade` 与 `ct state` 规则，表里才出现条目。
+>
+> **未实测**：云厂商安全组/LB 的具体行为（本实验环境没有云控制台）。文中已标注。
 
 > **这篇讲什么**：包离开本机之后会发生什么，以及**为什么「主机侧一切正常」时不应该继续在本机上折腾**。核心是三件事：转发（`ip_forward`）、地址转换（NAT）、以及把这两件事串起来的**连接跟踪表（conntrack）**。
 >
@@ -28,11 +35,16 @@ created: 2026-09-18
 ## 0. 30 秒速览
 
 > [!abstract] 这一篇只要记住六句话
-> - **`ip_forward=1` 才允许三层转发**（实测默认 `0`）；它**不是**「打开端口转发」的开关，打开后必须自己保证路由与防火墙策略完整。容器节点、网关、Kubernetes 节点默认是开的。
-> - **NAT 与 `state`/`ct state` 规则都依赖 conntrack**：连接跟踪表记录每条连接的状态，SNAT/DNAT、`established` 放行、Service 转发全靠它。
-> - **conntrack 表满 = 静默丢包**：内核默认不回复任何错误，所以客户端看到的是**超时**而不是拒绝，应用层毫无感觉——只在 `dmesg`、`conntrack -S` 与相关计数器里留痕。
-> - **两个最该看的数是 `nf_conntrack_count / nf_conntrack_max`**（实测默认 262144），以及 `nf_conntrack_tcp_timeout_established`（实测 **432000 秒 = 5 天**）。
-> - **ESTABLISHED 超时 5 天意味着闲置连接也会一直占表项**：短连接多的机器要重点看这一项——它是「表满」最常见的慢性原因。
+> - **`ip_forward=1` 才允许三层转发**
+>   - 证据：宿主本机默认 `net.ipv4.ip_forward = 0`；在 netns 的路由器里实测「`ip_forward=0` 时 `c6 → s6` 100% 丢包，改成 `1` 后 2 发 2 收 0% 丢包」，而**宿主的 `ip_forward` 全程保持 0**（netns 内改不影响宿主）。它**不是**「打开端口转发」的开关，打开后必须自己保证路由与防火墙策略完整。
+> - **NAT 与 `state`/`ct state` 规则都依赖 conntrack**
+>   - 证据：实测在路由器 netns 里加 `dnat to 10.66.2.2:9002` 前后，`10.66.1.1:9002` 从 `ConnectionRefusedError` 变成可连通；此时 `conntrack -L` 给出改写后的四元组（见第 3.3 节）。
+> - **没有 NAT/状态化规则时，conntrack 一条都不记**
+>   - 证据：宿主有活跃 SSH、路由器 netns 转发过 38.7 Gbits/sec 的流量，`nf_conntrack_count` 与 `conntrack -C` **都是 0**，`/proc/net/stat/nf_conntrack` 甚至不存在。**「机器上没有 conntrack」是正常状态，不是故障。**
+> - **conntrack 表满 = 静默丢包 + 一条内核日志**
+>   - 证据：把全局 `nf_conntrack_max` 压到 `64` 后从 `c6` 建 120 条并发长连接，只有 **63 条**成功、**57 条**失败；`dmesg`/`journalctl -k` 出现 `nf_conntrack: nf_conntrack: table full, dropping packet`，`conntrack -S` 里 `invalid=126 drop=27`。
+> - **两个最该看的数是 `nf_conntrack_count / nf_conntrack_max`，以及 `nf_conntrack_tcp_timeout_established`**
+>   - 证据：加载后实测 `262144` / `262144`，ESTABLISHED 超时 **432000 秒 = 5 天**——闲置连接也会一直占表项，是「表满」最常见的慢性原因。
 > - **判定「问题不在本机」的三个条件**：本机 `ss`/`nstat`/`ethtool -S` 都干净、两侧抓包对照显示「这边发了那边没收到」（或反之）、按出口路径排查到云网络/安全组/LB。此时继续在本机调参是浪费时间。
 
 ## 1. 转发：从「终端」变成「路由器」
@@ -101,28 +113,119 @@ conntrack 记录每条连接（及其关联连接，如 FTP 的数据连接）�
 ```bash
 sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count
                                         # 验证：上限与当前用量（count 逼近 max 就是危险信号）
+                                        # 本机注意：模块默认未加载时这两行会报 No such file or directory
 cat /proc/sys/net/netfilter/nf_conntrack_count   # 验证：与上面的 count 同源，适合脚本采集
-conntrack -C                            # 验证：当前连接跟踪条目数（本文未实测，需要 conntrack 工具）
-conntrack -S                            # 验证：conntrack 统计数据，重点看 insert_failed / drop（未实测）
+conntrack -C                            # 验证：当前连接跟踪条目数（需要 conntrack-tools；本机已装 v1.4.8）
+conntrack -S                            # 验证：conntrack 统计数据，重点看 insert_failed / drop
 dmesg -T | grep -i conntrack            # 验证：日志里的 "nf_conntrack: table full, dropping packet"
 nstat -az | grep -iE 'conntrack|drop'   # 验证：内核计数口径的丢包线索
 ```
 
+本机实测的三种「读不到值」的情形，都不是故障。
+
+**情形①：模块未加载时**（本机默认状态）——`/proc/sys/net/netfilter/` 下没有 conntrack 相关键：
+
+```text
+$ ls /proc/sys/net/netfilter/
+nf_hooks_lwtunnel  nf_log  nf_log_all_netns
+$ cat /proc/sys/net/netfilter/nf_conntrack_max
+cat: /proc/sys/net/netfilter/nf_conntrack_max: No such file or directory
+$ lsmod | grep -c conntrack
+0
+```
+
+**情形②：模块加载了、但没有规则用它**——计数恒为 0，且 `/proc/net/stat/nf_conntrack` 不存在：
+
+```text
+$ sysctl -n net.netfilter.nf_conntrack_max      # 262144
+$ conntrack -C                                  # 0
+$ ls /proc/net/stat/nf_conntrack
+ls: cannot access '/proc/net/stat/nf_conntrack': No such file or directory
+```
+
+**情形③：`conntrack -S` 的形态**——它按「可能的 CPU」展开（本机 4 vCPU 却打了 128 行），未启用时全是 0；真正有流量时 `invalid`/`drop` 才会动：
+
+```text
+$ conntrack -S | head -1
+cpu=0   	found=0 invalid=126 insert=0 insert_failed=0 drop=27 early_drop=0 error=0 search_restart=0 clash_resolve=0 chaintoolong=0 
+```
+
 ### 3.2 实测默认值（必须按本机重采）
 
-| 参数 | 实测默认 | 含义 |
+先说明取值方式：**本机默认没有这个模块**，下面的值都是 `modprobe nf_conntrack` 之后读到的（顺带把 `nf_conntrack_netlink` 一起带了起来，所以 `rmmod nf_conntrack` 会报 `Module nf_conntrack is in use by: nf_conntrack_netlink`——**要还原就先卸 `nf_conntrack_netlink`**）。
+
+| 参数 | 加载后实测值 | 含义 |
 | --- | --- | --- |
-| `nf_conntrack_max` | `262144` | 表的最大条目数 |
+| `nf_conntrack_max` | `262144` | 表的最大条目数（**全局参数，netns 内不可写**） |
 | `nf_conntrack_buckets` | `262144` | 哈希桶数（影响查找性能与内存） |
 | `nf_conntrack_tcp_timeout_established` | `432000`（**5 天**） | 已建立连接的空闲超时 |
 | `nf_conntrack_tcp_timeout_time_wait` | `120` | `TIME_WAIT` 状态的跟踪超时 |
 | `nf_conntrack_tcp_timeout_syn_recv` | `60` | 半开连接的超时 |
+| `nf_conntrack_tcp_timeout_close_wait` | `60` | 半关闭（应用没 `close()`）的跟踪超时 |
+| `nf_conntrack_udp_timeout` | `30` | UDP 会话超时 |
+| `nf_conntrack_icmp_timeout` | `30` | ICMP 会话超时 |
+| `nf_conntrack_expect_max` | `4096` | 关联连接（如 FTP 数据连接）的期望表上限 |
 
-> [!important] conntrack 表满的现场是「超时、丢包、日志」三选一，不是「连接被拒绝」
-> 表满时内核**直接丢包**（默认不回复），所以客户端看到超时而不是拒绝；服务端应用层毫无反应，只在 `dmesg`/`journalctl -k` 与 `conntrack -S` 的计数里留痕。
+> [!important] conntrack 表满的现场是「超时、丢包、一条日志」，不是「连接被拒绝」
+> 表满时内核**直接丢包**（不回复 RST），所以客户端看到的是**超时**而不是拒绝。**本机实测**：把上限压到 `64` 后建 120 条并发长连接，客户端侧 `connected = 63  failed = 57`；日志侧出现
+> `nf_conntrack: nf_conntrack: table full, dropping packet`（`dmesg -T` 与 `journalctl -k` 都能看到，同一秒内可能连续多条）；统计侧 `conntrack -S` 的 `invalid=126 drop=27`。
 > 处置顺序：先确认 `count / max` 的比例 → 看是不是「短连接太多」或「ESTABLISHED 超时太长」（5 天意味着闲置连接仍占着表项）→ 再决定是调大表、缩短超时，还是从应用侧改成连接池/长连接（**治本**）。
 
-### 3.3 三个容易搞错的点
+### 3.3 实测：一台 netns 路由器上的转发、DNAT、MASQUERADE 与 conntrack
+
+拓扑（全部在 netns，可整机回收）：`c6(10.66.1.2) —— veth —— r6(10.66.1.1 / 10.66.2.1，路由器) —— veth —— s6(10.66.2.2)`，`s6` 上跑一个真实 HTTP 服务在 `9001`。
+
+```bash
+ip netns exec r6 sysctl -w net.ipv4.ip_forward=1     # 只在 r6 里开转发
+ip netns exec r6 nft -f /tmp/06-nat.nft              # DNAT + masquerade（规则见下）
+```
+
+```text
+table ip nat6 {
+  chain prerouting { type nat hook prerouting priority dstnat; policy accept;
+    iifname "v6cp" tcp dport 9001 dnat to 10.66.2.2:9001 }
+  chain postrouting { type nat hook postrouting priority srcnat; policy accept;
+    oifname "v6sp" masquerade }
+}
+```
+
+实测四步。
+
+**① 转发开关**：`ip_forward=0` 时 `c6 -> s6` 不通；在 `r6` 内改成 `1` 后立刻连通（宿主命名空间的 `ip_forward` 全程仍是 `0`）：
+
+```text
+2 packets transmitted, 0 received, 100% packet loss, time 1045ms     ← 改之前
+2 packets transmitted, 2 received, 0% packet loss, time 1041ms       ← 改之后
+```
+
+**② 没有 DNAT 规则时**访问路由器自己的 `9001`：被拒（该地址上没有监听者）：
+
+```text
+DNAT 之前： ConnectionRefusedError [Errno 111] Connection refused
+```
+
+**③ 有 DNAT 规则后**：拿到真实响应：
+
+```text
+DNAT 生效：connected，本地端口 35748 → HTTP/1.0 200 OK
+```
+
+**④ `r6` 里的 conntrack 表**把 DNAT 与 MASQUERADE 记在同一行（前半段是原始方向，后半段是改写后的应答方向）：
+
+```text
+tcp      6 59 CLOSE_WAIT src=10.66.1.2 dst=10.66.1.1 sport=35748 dport=9002 \
+         src=10.66.2.2 dst=10.66.2.1 sport=9002 dport=35748 [ASSURED] mark=0 use=1
+```
+
+服务端 `s6` 看到的对端是 MASQUERADE 之后的 `10.66.2.1`（而不是原始的 `10.66.1.2`）：
+CLOSE-WAIT 1      0          10.66.2.2:9002    10.66.2.1:35748
+```
+
+**怎么读这一行 `conntrack -L`**：前半段 `src=10.66.1.2 dst=10.66.1.1` 是**原始方向**（客户端以为自己在连路由器），后半段 `src=10.66.2.2 dst=10.66.2.1` 是**应答方向**（经过 DNAT 与 MASQUERADE 之后）——**NAT 就是在改写这两组地址，而 conntrack 负责记住「怎么还原」**。
+
+**同一个实验还顺带证明了另一件事**：在加 NAT 规则之前，`r6` 转发了几十 GB 的 `iperf3` 流量（`38.7 Gbits/sec`），`nf_conntrack_count` 仍然是 **0**、`r6` 里 `nft list ruleset` 是空的、`/proc/net/stat/nf_conntrack` 不存在。**内核只在有规则显式引用 conntrack 时才为这个命名空间注册钩子**（`nf_ct_netns_get`）。所以：「`conntrack -C` 是 0」既可能是「没有连接」，也可能是**「这台机器根本没有在做连接跟踪」**——判据是 `lsmod | grep conntrack` 与 `/proc/net/stat/nf_conntrack` 是否存在。
+
+### 3.4 三个容易搞错的点
 
 - **调大 `nf_conntrack_max` 需要同时关注内存**：每个表项都占内存，数十万到数百万条目时是可观的常驻开销。
 - **缩短 ESTABLISHED 超时会让「长连接但长时间空闲」的连接被提前回收**：表现为「偶发需要重连」，所以它同样是影响业务的变更，不是「调小就更好」。
@@ -141,11 +244,11 @@ nstat -az | grep -iE 'conntrack|drop'   # 验证：内核计数口径的丢包�
 两侧对照的最小做法（需要两台机器同时操作）：
 
 ```bash
-tcpdump -i eth0 -nn -c 20 host <server_ip> and port <port>   # 客户端
-tcpdump -i eth0 -nn -c 20 host <client_ip> and port <port>   # 服务端
+tcpdump -i v6cp -nn -c 20 host <server_ip> and port <port>   # 路由器入口侧（netns 内，等价于「客户端方向」）
+tcpdump -i v6sp -nn -c 20 host <client_ip> and port <port>   # 路由器出口侧（netns 内，等价于「服务端方向」）
 ```
 
-（抓包必须限流限时，完整纪律见子笔记 10；此处的 `-c 20` 只是最小示例。）
+（抓包必须限流限时，完整纪律见子笔记 10；此处的 `-c 20` 只是最小示例。**跨两台真机的对照抓包在本环境未实测**——只有一台虚拟机；但可以在本机用「路由器两侧的 veth 各抓一次」做到等价的分段定位，本机的 DNAT 实验就是这么做的。）
 
 > [!tip] 「先证明问题在哪一段」比「猜哪个参数不对」快得多
 > 网络排障最大的浪费不是查错方向，而是**在正确的方向上没有证据就改参数**。两侧对照抓包是划分「本机 / 中间 / 对端」最直接的证据。
@@ -155,7 +258,7 @@ tcpdump -i eth0 -nn -c 20 host <client_ip> and port <port>   # 服务端
 按顺序做，**每一条都要留下输出**：
 
 1. **本机计数器**：`nstat -az` 采两次对比（重传、超时、队列溢出、conntrack drop）。
-2. **连接跟踪**：`nf_conntrack_count` 与 `nf_conntrack_max` 的比值；`dmesg -T | grep -i conntrack`。
+2. **连接跟踪**：`nf_conntrack_count` 与 `nf_conntrack_max` 的比值；`dmesg -T | grep -i conntrack`。**本机要先确认「有没有在跟踪」**（`lsmod | grep conntrack`、`/proc/net/stat/nf_conntrack`），否则 `count` 恒为 0 会误导判断。
 3. **防火墙与转发**：`sysctl net.ipv4.ip_forward`、`nft list ruleset`（或 `iptables -S`）。
 4. **接口计数**：`ip -s link`、`ethtool -S <dev>`。
 5. **两侧对照**：必要时在客户端与服务端同时限流抓包。
@@ -173,11 +276,13 @@ ip -s link
 
 | 常见做法或说法 | 后果或事实 |
 | --- | --- |
+| 看到 `conntrack -C` 是 0 就以为「表是空的、很健康」 | 本机实测：模块未加载（`nf_conntrack_max` 不存在）或没有 NAT/`ct` 规则时，**连钩子都没注册**，计数恒为 0 且 `/proc/net/stat/nf_conntrack` 不存在——先确认「有没有在跟踪」，再看「表里有多少」 |
+| 在 netns 里改 `nf_conntrack_max` 做实验 | 实测被拒：`sysctl: setting key "net.netfilter.nf_conntrack_max": Operation not permitted`——**它是全局参数**，要改就得全局改并立刻还原 |
 | 把 `ip_forward=1` 当成「端口转发」开关 | 它只放开三层转发能力；放行还取决于 `FORWARD` 链与 conntrack |
 | 「`INPUT` 是空的所以应该能通」 | 转发流量走 `FORWARD`，与 `INPUT` 无关 |
-| 表满时指望应用报错 | conntrack 满**静默丢包**，应用只会超时；证据在内核日志与 conntrack 统计里 |
+| 表满时指望应用报错 | conntrack 满**静默丢包**，应用只会超时；本机实测证据是 `dmesg`/`journalctl -k` 的 `nf_conntrack: nf_conntrack: table full, dropping packet` 与 `conntrack -S` 的 `drop=27` |
 | 直接把 `nf_conntrack_max` 调到很大 | 内存开销随之上升；且短连接多时表会继续被填满，**治本在应用连接复用** |
-| 为了「省表项」把 ESTABLISHED 超时改得很短 | 长时间空闲的长连接会被提前回收，表现为业务偶发重连 |
+| 为了「省表项」把 ESTABLISHED 超时改得很短 | 长时间空闲的长连接会被提前回收（实测默认 `432000` 秒 = 5 天），表现为业务偶发重连 |
 | 「云主机通不通先看本机防火墙」 | 安全组/LB 在主机之外；主机侧规则与计数器都干净时，要找云平台侧确认 |
 | 认为 conntrack 只和 NAT 有关 | 状态化防火墙、容器 Service 转发都依赖它 |
 | 在容器里查 conntrack 却看宿主机的数据 | 命名空间不同；容器有自己的一套（子笔记 14） |
@@ -196,10 +301,10 @@ ip -s link
 ## 要点自测
 
 > [!question]- conntrack 表满是怎样的现场？怎么处置？
-> - **现场**：客户端间歇性超时、服务端应用无感，`dmesg` 里 `nf_conntrack: table full, dropping packet`；`nf_conntrack_count` 逼近 `nf_conntrack_max`（实测默认 262144）。
-> - **定性**：它是**丢包**不是拒绝——所以「重试能好」的偶发故障要优先怀疑它。
+> - **现场**：客户端间歇性超时、服务端应用无感，`dmesg` 里有 `nf_conntrack: nf_conntrack: table full, dropping packet`；`nf_conntrack_count` 逼近 `nf_conntrack_max`。
+> - **本机实测**：`nf_conntrack` **默认未加载**，先 `modprobe nf_conntrack`（加载后 `max=262144`）；把上限压到 `64` 后从客户端建 120 条并发长连接，只有 **63 条**成功、**57 条**失败，`conntrack -S` 的 `invalid=126 drop=27`，日志里出现上述消息——**它是丢包不是拒绝**，所以「重试能好」的偶发故障要优先怀疑它。
 > - **处置**：调大 `nf_conntrack_max`（同时看内存与 buckets）→ 缩短 `nf_conntrack_tcp_timeout_established`（实测默认 432000s = 5 天，短连接多的机器影响很大）→ **根治是让应用用长连接/连接池**。
-> - **第一反应不要是什么**：不要直接关掉 conntrack（NAT 与 Service 转发都依赖它）。
+> - **第一反应不要是什么**：不要直接关掉 conntrack（NAT 与 Service 转发都依赖它）；也不要在只看到 `count` 小的时候就断定「这台机器没在跟踪连接」——先用 `lsmod` 与 `/proc/net/stat/nf_conntrack` 确认钩子注册了没有。
 
 > [!question]- 转发场景下，「开了 `ip_forward` 还是不通」应查哪几项？
 > - **路由**：目的地址的路由是否存在、下一跳是否可达（`ip route get`）。

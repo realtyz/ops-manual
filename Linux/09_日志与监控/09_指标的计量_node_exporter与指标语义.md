@@ -13,7 +13,8 @@ created: 2026-09-19
 > [!cite] 参考资料
 > Prometheus 官方文档的「Data model」「Metric types」「Instrumentation」「Exporters and integrations」；`node_exporter` 的「Collectors」与 README；`man 5 proc_pid_pressure`（PSI）、`man 8 ss`、`man 1 vmstat`。
 >
-> 实测输出来自 Ubuntu 24.04.4（WSL2）/ systemd 255 / 非 root：`prometheus-node-exporter` 以 `apt-get download` + `dpkg-deb -x` **解包运行**（版本 `1.7.0-1ubuntu0.3`），监听 `127.0.0.1:19100`，实验后已清理。
+> 实测状态：**实测环境：Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 `6.8.0-139-generic` / systemd 255（`255.4-1ubuntu8.17`）/ cgroup2fs（v2）/ 4 vCPU / `MemTotal` 7894 MiB / root 可用（`uid=0`，另有 `realtyz` `uid=1000`）。**
+> 本篇输出已在**本实验机**上本次重跑并粘贴，替换了原 WSL2 输出。`prometheus-node-exporter` 仍以 `apt-get download` + `dpkg-deb -x` **解包运行**（版本 `1.7.0-1ubuntu0.3`），监听本章端口区间内的 `127.0.0.1:20600`，实验后进程与临时目录已清理（无残留进程、无监听端口）。**`apt-get download` + 解包运行不是 Linux 常态，而是「装不了包」的绕行手法**——详见第 6 节的方法论说明。
 
 > **这篇讲什么**：指标从哪来、长什么样、怎么读。重点是把「指标名」翻译成「能回答什么问题」，以及三个最容易踩的边界：counter 与 gauge 用错、`up` 与自监控被忽略、label 基数失控。
 >
@@ -29,11 +30,11 @@ created: 2026-09-19
 > - **Prometheus 用 pull 模型：Prometheus 按周期主动抓目标的 `/metrics`。**
 >   - 证据：实测 `curl -o /dev/null -w "%{http_code} %{content_type}"` 返回 `200 text/plain; version=0.0.4; charset=utf-8`。
 > - **一次抓取的数据量比想象中大，这就是「基数就是成本」的直观感受。**
->   - 证据：实测 node_exporter 一次抓取 **1756 行**指标（含不同 label 组合）。
+>   - 证据：实测 node_exporter 一次抓取 **1574 行**非注释指标（含不同 label 组合；总行数 1585）。
 > - **关键指标的含义比名字重要。**
->   - 证据：实测 `node_load1=0.07`、`node_memory_MemAvailable_bytes=1.595e10`（约 14.9 GiB）、`node_filesystem_avail_bytes{mountpoint="/"}=1.007e12`、`node_filefd_allocated=1488`、`node_sockstat_TCP_inuse=6`。
+>   - 证据：实测 `node_load1=0.18`、`node_memory_MemAvailable_bytes=7.495938048e+09`（约 7.0 GiB）、`node_filesystem_avail_bytes{mountpoint="/"}=3.8498992128e+10`、`node_filefd_allocated=1472`、`node_sockstat_TCP_inuse=20`。
 > - **counter 必须用 `rate()` 看，裸值没有意义。**
->   - 证据：`node_cpu_seconds_total{cpu="0",mode="idle"} 390.42` 只是累计秒数，要算「每秒增长了多少」再看比例。
+>   - 证据：`node_cpu_seconds_total{cpu="0",mode="idle"} 3906.51` 只是累计秒数，要算「每秒增长了多少」再看比例。
 > - **exporter 自己也要被监控，采集慢/超时先看它。**
 >   - 证据：实测 `node_scrape_collector_duration_seconds{collector="cpu"}` 一类指标给出每个采集器的耗时。
 > - **能复用就复用：真正该自建的是业务指标。**
@@ -51,17 +52,17 @@ sequenceDiagram
   P->>P: 按 evaluation_interval 评估规则
 ```
 
-实测（解包运行 node_exporter）：
+实测（解包运行 node_exporter，监听本章端口区间内的 20600）：
 
 ```bash
-ne/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:19100 --log.level=error &
-curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://127.0.0.1:19100/metrics
-curl -s http://127.0.0.1:19100/metrics | grep -vc "^#"
+ne/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:20600 --log.level=error &
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://127.0.0.1:20600/metrics
+curl -s http://127.0.0.1:20600/metrics | grep -vc "^#"
 ```
 
 ```text
 200 text/plain; version=0.0.4; charset=utf-8; escaping=values
-1756
+1574
 ```
 
 pull 模型带来三个不同于「自己推数据」的特性，也是理解后面所有内容的前提：
@@ -72,23 +73,26 @@ pull 模型带来三个不同于「自己推数据」的特性，也是理解后
 
 ## 2. 关键指标族与语义
 
-实测的一组 `node_*` 指标（解包运行，`127.0.0.1:19100`）：
+实测的一组 `node_*` 指标（解包运行，`127.0.0.1:20600`）：
 
 ```text
-node_boot_time_seconds 1.789792651e+09
-node_filefd_allocated 1488
-node_filesystem_avail_bytes{device="/dev/sdd",fstype="ext4",mountpoint="/"} 1.00738502656e+12
-node_filesystem_size_bytes{device="/dev/sdd",fstype="ext4",mountpoint="/"} 1.081101176832e+12
-node_load1 0.07
-node_memory_MemAvailable_bytes 1.5951147008e+10
+node_boot_time_seconds 1.789801709e+09
+node_filefd_allocated 1472
+node_filesystem_avail_bytes{device="/dev/mapper/ubuntu--vg-ubuntu--lv",fstype="ext4",mountpoint="/"} 3.8498992128e+10
+node_filesystem_size_bytes{device="/dev/mapper/ubuntu--vg-ubuntu--lv",fstype="ext4",mountpoint="/"} 5.0403627008e+10
+node_load1 0.18
+node_memory_MemAvailable_bytes 7.495938048e+09
+node_memory_SwapTotal_bytes 4.2949632e+09
 node_procs_running 1
-node_sockstat_TCP_inuse 6
-node_cpu_seconds_total{cpu="0",mode="idle"} 390.42
-node_network_receive_bytes_total{device="eth0"} 5.1292607e+07
-node_disk_read_bytes_total{device="sda"} 7.5981824e+07
-node_scrape_collector_duration_seconds{collector="arp"} 4.9933e-05
-node_scrape_collector_duration_seconds{collector="btrfs"} 6.2756e-05
+node_sockstat_TCP_inuse 20
+node_cpu_seconds_total{cpu="0",mode="idle"} 3906.51
+node_network_receive_bytes_total{device="ens33"} 3.97479002e+08
+node_disk_read_bytes_total{device="dm-0"} 2.654426112e+09
+node_scrape_collector_duration_seconds{collector="cpu"} 0.000299835
+node_scrape_collector_duration_seconds{collector="filesystem"} 0.00244448
 ```
+
+注意三处与「单块虚拟盘 + 无 swap」的旧环境不同的地方：**根分区在 LVM 上（`/dev/mapper/ubuntu--vg-ubuntu--lv`，`/boot` 是 `/dev/sda2`）**，网卡是 **`ens33`**（VMware 模拟网卡 `e1000`），并且本机**有 4095 MiB swap**（`node_memory_SwapTotal_bytes 4.2949632e+09`）。指标名里的 `device` label 直接来自这些设备名，换环境时告警表达式里的 `device=~...` 也要跟着改。
 
 | 指标（前缀） | 类型 | 用途与注意点 |
 | --- | --- | --- |
@@ -112,7 +116,7 @@ node_scrape_collector_duration_seconds{collector="btrfs"} 6.2756e-05
 | gauge | 可升可降的瞬时值 | 直接看值、比较阈值 | 对 gauge 做 `rate()` |
 
 > [!important] 实测数字只说明「现在是这个值」，不说明「趋势」
-> `node_load1=0.07` 是在某个具体时刻、某台具体机器上的读数。**任何指标的结论都要带「时间 + 机器 + 口径」三要素**——这也是子笔记 13 反复强调的纪律。
+> `node_load1=0.18` 是在某个具体时刻、某台具体机器上的读数。**任何指标的结论都要带「时间 + 机器 + 口径」三要素**——这也是子笔记 13 反复强调的纪律。
 
 ## 3. USE：不要漏资源的检查表
 
@@ -126,17 +130,17 @@ USE（Utilization / Saturation / Errors）是一张「按资源问三个问题�
 | 网络 | `node_network_*`、`sar -n DEV` 带宽 | `ss -s` 的队列/重传、conntrack 使用率 | `nstat` 丢包/错误、`ip -s link` |
 | 句柄/连接 | `filefd_allocated`、`TCP_inuse` | 接近上限时的排队/拒绝 | 新建连接失败日志 |
 
-本机实测的三类「水位」信号：
+本机实测的三类「水位」信号（同一台机器上同一时刻采集）：
 
 ```text
 $ grep -H . /proc/pressure/io
-/proc/pressure/io:some avg10=0.72 avg60=0.13 avg300=0.02 total=179842
-/proc/pressure/io:full avg10=0.72 avg60=0.13 avg300=0.02 total=178856
+/proc/pressure/io:some avg10=0.00 avg60=0.24 avg300=0.17 total=1581696
+/proc/pressure/io:full avg10=0.00 avg60=0.17 avg300=0.12 total=1264253
 $ cat /proc/sys/fs/file-nr
-1344	0	9223372036854775807
+1632	0	9223372036854775807
 $ ss -s | head -2
-Total: 188
-TCP:   3 (estab 0, closed 0, orphaned 0, timewait 0)
+Total: 217
+TCP:   9 (estab 5, closed 0, orphaned 0, timewait 0)
 ```
 
 PSI 的 `some/full` 要分清：**`some` = 至少有一个任务被卡**（局部抖动），**`full` = 所有任务都被卡**（全面停顿）。内存/IO 的 `full` 长期非 0，即使平均值看着还行，延迟也已经受影响了。
@@ -174,30 +178,35 @@ PSI 的 `some/full` 要分清：**`some` = 至少有一个任务被卡**（局�
 > [!example]- 实验 5：抓一次真实 `/metrics`，产出一张可评审的检查表
 > 目标：把「这台机器有没有指标、指标能不能回答 USE 三个问题」变成一份清单。
 > ```bash
-> D=$(mktemp -d /tmp/ne-lab.XXXXXX); cd "$D"
+> D=$(mktemp -d /tmp/09a-ne.XXXXXX); cd "$D"
 > apt-get download prometheus-node-exporter >/dev/null 2>&1
 > mkdir ne; dpkg-deb -x prometheus-node-exporter_*.deb ne
-> ne/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:19100 --log.level=error & NE=$!
+> ne/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:20600 --log.level=error & NE=$!
 > sleep 2
-> curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://127.0.0.1:19100/metrics
-> curl -s http://127.0.0.1:19100/metrics | grep -vc "^#"                # 验证：指标行数
-> curl -s http://127.0.0.1:19100/metrics | grep -E "^node_(load1|memory_MemAvailable_bytes|sockstat_TCP_inuse|filefd_allocated|boot_time_seconds|procs_running) "
-> curl -s http://127.0.0.1:19100/metrics | grep -E '^node_filesystem_(avail|size)_bytes\{[^}]*mountpoint="/"'
-> curl -s http://127.0.0.1:19100/metrics | grep "^node_scrape_collector_duration_seconds" | head -4
+> curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://127.0.0.1:20600/metrics
+> curl -s http://127.0.0.1:20600/metrics | grep -vc "^#"                # 验证：指标行数
+> curl -s http://127.0.0.1:20600/metrics | grep -E "^node_(load1|memory_MemAvailable_bytes|sockstat_TCP_inuse|filefd_allocated|boot_time_seconds|procs_running) "
+> curl -s http://127.0.0.1:20600/metrics | grep -E '^node_filesystem_(avail|size)_bytes\{[^}]*mountpoint="/"'
+> curl -s http://127.0.0.1:20600/metrics | grep "^node_scrape_collector_duration_seconds" | head -4
 > kill $NE; cd /; rm -rf "$D"
 > ```
-> **预期**：`200 text/plain; version=0.0.4`；指标行数在千级（本机实测 1756）；能取到 `load1`/`MemAvailable`/`filesystem_avail_bytes`/`TCP_inuse`/`filefd_allocated` 与采集器耗时。
-> **风险**：低（解包运行、只监听本机高位端口）。
+> **预期**：`200 text/plain; version=0.0.4`；非注释指标行数在千级（本机实测 **1574**）；能取到 `load1`/`MemAvailable`/`filesystem_avail_bytes`/`TCP_inuse`/`filefd_allocated` 与采集器耗时。
+> **风险**：低（解包运行、只监听本机本章端口区间内的高位端口）。
 > **回滚**：`kill` 进程、删除临时目录；不写系统目录。
 > **耗时**：15 分钟。
 >
-> 环境：Ubuntu 24.04.4（WSL2）/ 非 root。**生产上这一步只做只读部分**：`curl -s -o /dev/null -w "%{http_code}" http://<target>:9100/metrics`。
+> 环境：Ubuntu 24.04.5 LTS（VMware 虚拟机）/ root 可用。**生产上这一步只做只读部分**：`curl -s -o /dev/null -w "%{http_code}" http://<target>:9100/metrics`。
+
+> [!important] 为什么这里仍然用「解包运行」——这是**绕行手法**，不是 Linux 常态
+> 本机**有 root、有互联网、`apt` 可用**，正常做法就是 `apt-get install prometheus-node-exporter`（或部署官方二进制到 `/usr/local/bin` 并配 systemd unit）。本篇保持解包，只因为 `BASELINE.md` §2.2 的作业纪律要求：**不给这台被多章共用的实验机留下常驻服务与监听端口**。
+>
+> `apt-get download` + `dpkg-deb -x` 的适用场景是**非 root / 无法装包的环境**（容器、WSL2、只读根）；它的代价是：没有 systemd unit、没有 `/etc/default` 配置入口、二进制路径与包内默认路径不一致（子笔记 11 会看到 Alertmanager 的模板路径就栽在这上面）。**判断标准：能正常安装就正常安装，解包只是绕行。**
 
 ## 常见坑
 
 | 常见做法或说法 | 后果或事实 |
 | --- | --- |
-| 「指标越多越好」 | 高基数 label 会让时序数量与成本爆炸；实测一次抓取就有 1756 行 |
+| 「指标越多越好」 | 高基数 label 会让时序数量与成本爆炸；实测一次抓取就有 1574 行非注释指标 |
 | 「直接看 `node_cpu_seconds_total` 就知道 CPU 忙不忙」 | 它是 counter，裸值只是累计秒数；要 `rate()` 后按 mode 求比例 |
 | 「`MemFree` 低说明内存不够」 | 要看 `MemAvailable`；`MemFree` 不包含可回收的缓存 |
 | 「load 高就是 CPU 忙」 | load 包含 D 状态（不可中断睡眠）进程；IO 阻塞同样推高 load |
@@ -224,7 +233,7 @@ PSI 的 `some/full` 要分清：**`some` = 至少有一个任务被卡**（局�
 > [!question]- pull 模型和 push 模型有什么本质区别？
 > - **pull**：Prometheus 主动按周期抓 `/metrics`；**抓取成功/失败本身是数据**（`up`），目标清单是运维对象。
 > - **push**：被监控端主动推给网关；适合短生命周期任务（批处理作业），但「没推」和「推失败」难以区分。
-> - **实测**：解包运行 node_exporter 后 `curl /metrics` 返回 `200 text/plain; version=0.0.4`，一次抓取 1756 行。
+> - **实测**：解包运行 node_exporter 后 `curl /metrics` 返回 `200 text/plain; version=0.0.4`，一次抓取 1574 行非注释指标。
 > - **推论**：周期性抓取必然漏掉短脉冲——这是分位数与 PSI 累计值存在的理由（子笔记 13）。
 > - **第一反应不要是什么**：不要把 pull 模型理解成「监控端随时能拿到任意时刻的数据」。
 
@@ -238,8 +247,8 @@ PSI 的 `some/full` 要分清：**`some` = 至少有一个任务被卡**（局�
 > - **第一反应不要是什么**：不要只看 CPU 和内存，就以为覆盖了「这台机器健康」。
 
 > [!question]- counter 和 gauge 该怎么用？
-> - **counter**：只增不减，用 `rate()`/`increase()`；进程重启会归零，要容忍跳变。实测 `node_cpu_seconds_total{cpu="0",mode="idle"} 390.42` 是累计秒数，裸值无意义。
-> - **gauge**：可升可降，直接看值与阈值。实测 `node_load1 0.07`、`node_memory_MemAvailable_bytes 1.5951147008e+10` 都是 gauge。
+> - **counter**：只增不减，用 `rate()`/`increase()`；进程重启会归零，要容忍跳变。实测 `node_cpu_seconds_total{cpu="0",mode="idle"} 3906.51` 是累计秒数，裸值无意义。
+> - **gauge**：可升可降，直接看值与阈值。实测 `node_load1 0.18`、`node_memory_MemAvailable_bytes 7.495938048e+09` 都是 gauge。
 > - **混用的后果**：对 counter 求平均会掩盖趋势；对 gauge 求 `rate()` 会得到无意义的「变化速率」。
 > - **第一反应不要是什么**：不要凭指标名猜类型，看它是不是只增。
 

@@ -14,7 +14,9 @@ created: 2026-09-19
 > [!cite] 参考资料
 > Prometheus 官方文档的「Data model」「Querying basics」「Operators」「Alerting rules」「Recording rules」「Configuration」；`promtool check rules` 的用法。
 >
-> 实测输出来自 Ubuntu 24.04.4（WSL2）/ systemd 255 / 非 root：`prometheus` 以 `apt-get download` + `dpkg-deb -x` **解包运行**，抓取解包运行的 node_exporter（`127.0.0.1:19100`），规则文件写在一个必然触发的告警表达式上；实验后进程与临时目录已清理。
+> 实测状态：**实测环境：Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 `6.8.0-139-generic` / systemd 255（`255.4-1ubuntu8.17`）/ cgroup2fs（v2）/ 4 vCPU / `MemTotal` 7894 MiB / root 可用。**
+> 本篇输出已在**本实验机**上本次重跑并粘贴，替换了原 WSL2 输出。`prometheus` 仍以 `apt-get download` + `dpkg-deb -x` **解包运行**，抓取同样解包运行的 node_exporter（`127.0.0.1:20700`），自身 HTTP API 在 `127.0.0.1:20701`；规则文件用 `promtool check rules` / `test rules` 实跑校验，并用 `/api/v1/rules` 与 `ALERTS` 观察真实求值。实验后进程与临时目录已清理（无残留进程、无监听端口）。
+> **解包运行是「装不了包」的绕行手法，不是 Linux 常态**——本机有 root、有 `apt`，正常做法是 `apt-get install prometheus`；保持解包只为不给共用的实验机留下常驻服务（判断标准见子笔记 09 第 6 节）。
 
 > **这篇讲什么**：从「采到数据」到「判定出事了」。包括 Prometheus 的数据模型、四类最常用的 PromQL 写法、记录规则与告警规则的分工，以及怎么**在不依赖通知渠道**的前提下验证一条告警规则是否真的生效。
 >
@@ -30,13 +32,13 @@ created: 2026-09-19
 > - **数据模型是「指标名 + label 集合 → 时间序列」，label 变了就是另一条时序。**
 >   - 怎么验证：查一次 `up`，看返回里的 `__name__` + `instance` + `job` 三个 label 才唯一确定一条序列；这也是基数决定成本的原因。
 > - **counter 必须用 `rate()`，裸值只是累计秒数。**
->   - 证据：`node_cpu_seconds_total{cpu="0",mode="idle"} 390.42`。
+>   - 证据：`node_cpu_seconds_total{cpu="0",mode="idle"} 3906.51`。
 > - **窗口要 ≥ 2×`scrape_interval`，否则 `rate()` 会得到空值或剧烈抖动。**
->   - 证据：本机实验用 `scrape_interval: 2s` 配 `[30s]` 窗口算 CPU 使用率得到 `85.55`；窗口太短就会抖。
+>   - 证据：本机实验用 `scrape_interval: 5s` 配 `[1m]` 窗口（12 倍关系）算 CPU 使用率得到 `0.0385000000000012`（约 3.85%）；窗口缩到与抓取间隔同量级就会抖或为空。
 > - **规则文件要像代码一样进版本管理并在 CI 里校验。**
->   - 证据：实测 `promtool check rules rules.yml` → `SUCCESS: 2 rules found`。
+>   - 证据：实测 `promtool check rules /tmp/09b-good.yml` → `SUCCESS: 4 rules found`（rc=0）；故意写坏的三份规则分别报 `unclosed left parenthesis`、`field 'expr' must be set in rule`、`unknown unit " minutes" in duration "5 minutes"`（rc=1）。
 > - **告警算没算出来，看 `ALERTS` 这条特殊时序，不用等通知渠道。**
->   - 证据：实测 `ALERTS{alertname="LabAlwaysFiring",alertstate="firing",severity="warning"}` 值为 `1`；记录规则 `lab:node_load1` 也返回 `0.13`。
+>   - 证据：实测一条恒真告警规则触发后 `ALERTS{alertname="AlwaysFiringDemo",alertstate="firing",severity="info"} = 1`；`/api/v1/rules` 里记录规则 `instance:node_cpu_utilisation:rate5m` 的 `health` 为 `ok`（在评但阈值没到）。另一次自洽实测中记录规则 `lab:node_cpu_utilisation:rate1m` 查询直接返回 `0.8255288125000102`——**记录规则的结果是可以像普通指标一样被查询的**。
 > - **`for: 0s` 会让抖动直接变成通知。**
 >   - 怎么验证：本文用 `for: 0s` 只是为了让实验立刻出结果；生产上按告警类型给几分钟，并配合分位数/持续窗口过滤毛刺。
 
@@ -46,8 +48,10 @@ created: 2026-09-19
 flowchart LR
   A["指标名<br/>node_filesystem_avail_bytes"] --> D["时间序列"]
   B["label 集合<br/>device=… fstype=… mountpoint=…"] --> D
-  D --> E["样本：时间戳 + 值<br/>1789792700.226 → 1.00738502656e+12"]
+  D --> E["样本：时间戳 + 值<br/>1789805706.867 → 3.8498992128e+10"]
 ```
+
+（上面的时间戳与该值取自**同一次抓取**：`node_time_seconds 1.7898057068670387e+09` 与 `node_filesystem_avail_bytes{...} 3.8498992128e+10` 都在那一份 `/metrics` 输出里。）
 
 三条必须记住的推论：
 
@@ -64,24 +68,40 @@ flowchart LR
 | 聚合与分组 | `sum by (instance) (rate(http_requests_total[5m]))` | `by` 决定输出维度；`without` 相反 |
 | 告警表达式 | `up == 0`、`rate(errors[5m]) / rate(total[5m]) > 0.01` | 先算比率再判断，避免绝对值受流量影响 |
 
-实测：解包运行 Prometheus（`scrape_interval: 2s`、`evaluation_interval: 2s`）抓解包运行的 node_exporter，用 HTTP API 查询：
+实测：解包运行 Prometheus（`scrape_interval: 1m`、`evaluation_interval: 1m`）抓解包运行的 node_exporter（`127.0.0.1:20700`），用 HTTP API 查询（Prometheus 自身在 `127.0.0.1:20701`）：
 
 ```bash
-curl -s "http://127.0.0.1:19090/api/v1/query?query=up"
-curl -s "http://127.0.0.1:19090/api/v1/query?query=lab:node_load1"
-curl -s "http://127.0.0.1:19090/api/v1/query?query=ALERTS"
-curl -s --data-urlencode "query=100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[30s])) * 100)" \
-    http://127.0.0.1:19090/api/v1/query
+curl -s --get --data-urlencode "query=up" localhost:20701/api/v1/query
+curl -s --get --data-urlencode "query=instance:node_cpu_utilisation:rate5m" localhost:20701/api/v1/query
+curl -s --get --data-urlencode "query=ALERTS" localhost:20701/api/v1/query
+curl -s --get --data-urlencode "query=1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m]))" \
+    localhost:20701/api/v1/query
 ```
 
 ```text
-[{'metric': {'__name__': 'up', 'instance': '127.0.0.1:19100', 'job': 'node'}, 'value': [1789792700.226, '1']}]
-[{'metric': {'__name__': 'lab:node_load1', 'instance': '127.0.0.1:19100', 'job': 'node'}, 'value': [1789792700.24, '0.13']}]
-[('LabAlwaysFiring', 'firing', 'warning', '1')]
-[1789792700.267, '85.5547740888667']
+--- up
+{'__name__': 'up', 'instance': '127.0.0.1:20700', 'job': 'node'} 1
+--- count(up)
+{} 1
+--- 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m]))
+{'instance': '127.0.0.1:20700'} 0.0385000000000012
+--- ALERTS（阈值未触发时为空）
+(空)
+--- node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}
+0.765624323223307
 ```
 
-四条查询分别验证了：**目标抓得到（`up=1`）→ 记录规则在算（`lab:node_load1=0.13`）→ 告警进入 firing → 用真实指标算得出使用率（85.6%）**。这套顺序就是「告警链路自检」的最小闭环。
+四条查询分别验证了：**目标抓得到（`up=1`）→ 表达式算得出真实使用率（CPU 3.85%、磁盘剩余 76.6%）→ 阈值没到则 `ALERTS` 为空（不误报）**。这套顺序就是「告警链路自检」的最小闭环。
+
+`/api/v1/rules` 接口同时给出规则的求值健康度（下面这段说明记录规则与告警规则**都在被评估**，只是没触发）：
+
+```text
+"name": "instance:node_cpu_utilisation:rate5m", "health": "ok",  "type": "recording"
+"name": "NodeCpuHigh",  "state": "inactive", "health": "ok", "duration": 600, "type": "alerting"
+"name": "NodeMemoryLow", "state": "inactive", "health": "ok", "duration": 300, "type": "alerting"
+```
+
+**注意 `ALERTS` 为空是正确结果，不是故障**——它说明规则在评、只是条件不成立。要验证「告警真能进 firing」，得另造一条必然为真的规则（见第 3 节与实验 6）。
 
 ## 3. 记录规则与告警规则
 
@@ -90,28 +110,93 @@ curl -s --data-urlencode "query=100 - (avg(rate(node_cpu_seconds_total{mode=\"id
 | recording rule | 预计算并保存表达式结果，固化口径、降低查询成本 | `record: job:http_error_ratio:5m` | 复杂表达式被反复查询、或被告警规则/面板共用 |
 | alerting rule | 表达式为真时产生告警 | `alert: NodeDown` / `expr: up == 0` | 需要让人做动作的条件 |
 
-本机实测用到的规则文件（一条记录规则 + 一条必然触发的告警规则）：
+本机实测用到的规则文件（一条记录规则 + 三条告警规则，实测校验通过 4 条）：
 
 ```yaml
 groups:
-  - name: lab
+  - name: node-basics
+    interval: 30s
     rules:
-      - record: lab:node_load1
-        expr: node_load1
-      - alert: LabAlwaysFiring
-        expr: vector(1) > 0
-        for: 0s
+      - record: instance:node_cpu_utilisation:rate5m
+        expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+      - alert: NodeCpuHigh
+        expr: instance:node_cpu_utilisation:rate5m > 0.8
+        for: 10m
         labels: {severity: warning}
-        annotations: {summary: 实验室告警（用于验证规则链路）}
+        annotations:
+          summary: "实例 {{ $labels.instance }} CPU 使用率持续 10 分钟高于 80%"
+          description: "当前值 {{ $value | humanizePercentage }}"
+      - alert: NodeMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "可用内存低于 10%"}
+      - alert: FilesystemAlmostFull
+        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes < 0.15
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.device }} ({{ $labels.mountpoint }}) 剩余空间不足 15%"}
 ```
 
 ```bash
-promtool check rules rules.yml
+promtool check rules /tmp/09b-good.yml
 ```
 
 ```text
-Checking rules.yml
-  SUCCESS: 2 rules found
+Checking /tmp/09b-good.yml
+  SUCCESS: 4 rules found
+```
+
+**故意写坏的三份也要能看到报错**（这才是把校验放进 CI 的意义）：
+
+```text
+/tmp/09b-bad1.yml: 5:15: group "broken", rule 1, "Bad": could not parse expression: 1:32: parse error: unclosed left parenthesis
+/tmp/09b-bad2.yml: 0:0: group "broken2", rule 1, "NoExpr": field 'expr' must be set in rule
+/tmp/09b-bad3.yml: unknown unit " minutes" in duration "5 minutes"
+```
+
+### 3.0 `promtool test rules`：把 PromQL 也写成单元测试
+
+`check rules` 只验语法，**不验「算得对不对」**。`promtool test rules` 用合成序列喂给规则文件，断言表达式求值结果与告警是否触发：
+
+```yaml
+rule_files:
+  - /tmp/09b-good.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{cpu="0",mode="idle",instance="linux-lab:9100"}'
+        values: '0+45x20'
+      - series: 'node_cpu_seconds_total{cpu="0",mode="user",instance="linux-lab:9100"}'
+        values: '0+15x20'
+    promql_expr_test:
+      - expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+        eval_time: 10m
+        exp_samples:
+          - labels: '{instance="linux-lab:9100"}'
+            value: 0.25
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: NodeCpuHigh
+        exp_alerts: []
+```
+
+第一次把 idle 写成了 `0+60x20`（等于 `rate()` 后 idle 占 100%），断言 `0.5` 与实算 `0` 不符而失败；改成 `0+45x20`（idle 占 75%，即使用率 25%）后 `SUCCESS`。再把 user 拉到 `0+54x30`，`NodeCpuHigh` 就在 `eval_time: 16m` 真的触发了——**整套告警规则可以在不连任何真实目标的情况下被验证**。
+
+```text
+Unit Testing:  /tmp/09b-tests.yml
+  FAILED:
+    expr: "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", time: 10m,
+        exp: {instance="linux-lab:9100"} 5E-01
+        got: {instance="linux-lab:9100"} 0E+00
+rc=1
+Unit Testing:  /tmp/09b-tests2.yml
+  SUCCESS
+rc=0
+Unit Testing:  /tmp/09b-tests3.yml
+  SUCCESS
+rc=0
 ```
 
 三条工程习惯：
@@ -130,8 +215,14 @@ ALERTS{alertname="…", alertstate="pending|firing", severity="…"} = 0 或 1
 
 它带来两个非常实用的能力：
 
-- **验证规则**：`ALERTS{alertname="X"}` 有值就说明规则算出来了，**不需要等通知渠道**。
-- **排查「告警不响」**：先看 `ALERTS`，再看 `/api/v1/rules` 的 `state` 与 `lastEvaluation`，最后才查 Alertmanager 与通知渠道（子笔记 17）。
+- **验证规则**：`ALERTS{alertname="X"}` 有值就说明规则算出来了，**不需要等通知渠道**。本机加了一条恒真规则 `AlwaysFiringDemo`（`expr: vector(1) > 0`，没有 `for`），实测在 `evaluation_interval: 5s` 下第二轮就进入 `firing`：
+
+```text
+{'__name__': 'ALERTS', 'alertname': 'AlwaysFiringDemo', 'alertstate': 'firing', 'severity': 'info'} 1
+{'__name__': 'ALERTS_FOR_STATE', 'alertname': 'AlwaysFiringDemo', 'severity': 'info'} 1789805362
+```
+
+- **排查「告警不响」**：先看 `ALERTS`，再看 `/api/v1/rules` 的 `state` 与 `lastEvaluation`，最后才查 Alertmanager 与通知渠道（子笔记 17）。本机同一时刻 `/api/v1/rules` 里 `NodeCpuHigh` 是 `state: inactive` 而 `AlwaysFiringDemo` 已 firing——**「规则在评」与「条件成立」是两件事，用这两个视图就能区分**。
 
 ### 3.2 `for`：过滤毛刺的那道闸
 
@@ -142,7 +233,7 @@ ALERTS{alertname="…", alertstate="pending|firing", severity="…"} = 0 或 1
   labels: {severity: critical}
 ```
 
-`for` 的含义是「表达式持续为真这么久，才从 `pending` 变成 `firing`」。**实测里用 `for: 0s` 是为了让验证立刻成功**；生产上 `for: 0s` 意味着任何一次抖动都会直接通知人。
+`for` 的含义是「表达式持续为真这么久，才从 `pending` 变成 `firing`」。**实测里那条恒真规则故意不写 `for`，就是为了让验证立刻成功**；生产上不写 `for`（等价 `for: 0s`）意味着任何一次抖动都会直接通知人。反过来，本机的 `NodeCpuHigh` 带 `for: 10m`，在 `evaluation_interval: 5s` 下一直是 `state: inactive`——**`for` 越长，越不容易响，也越容易漏掉真正的短故障**。
 
 | `for` 取值 | 效果 | 适用 |
 | --- | --- | --- |
@@ -152,35 +243,71 @@ ALERTS{alertname="…", alertstate="pending|firing", severity="…"} = 0 或 1
 
 ## 4. 生产动作：把规则写好、验好、管好
 
-> [!example]- 实验 6：写一条记录规则 + 一条告警规则，并用 `ALERTS` 验证
+> [!example]- 实验 6：写一组规则，用 `promtool` 校验 + 用 `ALERTS` 验证
 > 目标：在本地跑通「抓取 → 规则评估 → 告警 firing」全链路，不依赖任何外部系统。
 > ```bash
-> D=$(mktemp -d /tmp/prom-lab.XXXXXX); cd "$D"
-> apt-get download prometheus prometheus-node-exporter >/dev/null 2>&1
-> mkdir p ne; for f in *.deb; do case "$f" in prometheus-node-exporter*) dpkg-deb -x "$f" ne;; prometheus*) dpkg-deb -x "$f" p;; esac; done
-> ne/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:19100 --log.level=error & NE=$!
-> printf "%s\n" "global:" "  scrape_interval: 2s" "  evaluation_interval: 2s" \
->   "rule_files: [\"$D/rules.yml\"]" "scrape_configs:" "  - job_name: node" \
->   "    static_configs: [{targets: [\"127.0.0.1:19100\"]}]" > prom.yml
-> printf "%s\n" "groups:" "  - name: lab" "    rules:" \
->   "      - record: lab:node_load1" "        expr: node_load1" \
->   "      - alert: LabAlwaysFiring" "        expr: vector(1) > 0" "        for: 0s" \
->   "        labels: {severity: warning}" > rules.yml
-> p/usr/bin/promtool check rules rules.yml                       # 验证：SUCCESS: N rules found
-> p/usr/bin/prometheus --config.file=prom.yml --storage.tsdb.path=$D/data \
->   --web.listen-address=127.0.0.1:19090 --log.level=error & PR=$!
-> sleep 8
-> curl -s "http://127.0.0.1:19090/api/v1/query?query=up" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['result'])"
-> curl -s "http://127.0.0.1:19090/api/v1/query?query=lab:node_load1" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['result'])"
-> curl -s "http://127.0.0.1:19090/api/v1/query?query=ALERTS" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['result'])"
-> kill $PR $NE; cd /; rm -rf "$D"
+> D=/tmp/09b-prometheus; mkdir -p "$D"; cd /tmp/09b-probe
+> ne/usr/bin/prometheus-node-exporter --web.listen-address=127.0.0.1:20700 --log.level=error & NE=$!
+> cat > "$D/rules-good.yml" <<'EOF'                       # 记录规则 + 三条告警规则
+> groups:
+>   - name: node-basics
+>     interval: 30s
+>     rules:
+>       - record: instance:node_cpu_utilisation:rate5m
+>         expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+>       - alert: NodeCpuHigh
+>         expr: instance:node_cpu_utilisation:rate5m > 0.8
+>         for: 10m
+>         labels: {severity: warning}
+>         annotations: {summary: "实例 {{ $labels.instance }} CPU 使用率持续 10 分钟高于 80%"}
+>       - alert: NodeMemoryLow
+>         expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+>         for: 5m
+>         labels: {severity: critical}
+>         annotations: {summary: "可用内存低于 10%"}
+>       - alert: FilesystemAlmostFull
+>         expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes < 0.15
+>         for: 15m
+>         labels: {severity: warning}
+>         annotations: {summary: "{{ $labels.device }} ({{ $labels.mountpoint }}) 剩余空间不足 15%"}
+> EOF
+> xprom/usr/bin/promtool check rules "$D/rules-good.yml"    # 验证：SUCCESS: 4 rules found
+> cat > "$D/prometheus.yml" <<'EOF'
+> global:
+>   scrape_interval: 5s
+>   evaluation_interval: 5s
+> rule_files:
+>   - /tmp/09b-prometheus/rules-good.yml
+>   - /tmp/09b-prometheus/fire.yml
+> scrape_configs:
+>   - job_name: node
+>     static_configs:
+>       - targets: ['127.0.0.1:20700']
+> EOF
+> cat > "$D/fire.yml" <<'EOF'                              # 恒真规则：用来看到 firing 长什么样
+> groups:
+>   - name: demo-firing
+>     interval: 5s
+>     rules:
+>       - alert: AlwaysFiringDemo
+>         expr: vector(1) > 0
+>         labels: {severity: info}
+>         annotations: {summary: "演示：表达式恒为真，用于观察 pending -> firing"}
+> EOF
+> xprom/usr/bin/prometheus --config.file="$D/prometheus.yml" --storage.tsdb.path="$D/data" \
+>   --web.listen-address=127.0.0.1:20701 --storage.tsdb.retention.time=1h --log.level=error & PR=$!
+> sleep 12
+> curl -s --get --data-urlencode 'query=up' localhost:20701/api/v1/query
+> curl -s --get --data-urlencode 'query=ALERTS' localhost:20701/api/v1/query        # 验证：alertstate=firing
+> curl -s localhost:20701/api/v1/rules
+> kill $PR $NE; rm -rf "$D"
 > ```
-> **预期**：`up` 的值为 `1`；记录规则返回 `lab:node_load1`；`ALERTS` 里出现 `alertstate="firing"`（本机实测 `[('LabAlwaysFiring', 'firing', 'warning', '1')]`）。
-> **风险**：低（解包运行、监听本机高位端口、数据落在临时目录）。
+> **预期**：`up` 的值为 `1`；`ALERTS` 里出现 `alertname="AlwaysFiringDemo", alertstate="firing"`（本机实测值为 `1`）；`/api/v1/rules` 里 `NodeCpuHigh` 是 `state: inactive`（阈值没到）。
+> **风险**：低（解包运行、只监听本章端口区间内的高位端口、数据落在临时目录）。
 > **回滚**：`kill` 两个进程并删除临时目录。
 > **耗时**：20 分钟。
 >
-> 环境：Ubuntu 24.04.4（WSL2）/ 非 root。**生产环境请用发行版包正常安装**，并给 Prometheus 配好数据目录权限与自启。
+> 环境：Ubuntu 24.04.5 LTS（VMware 虚拟机）/ root 可用。**生产环境请用发行版包正常安装**（`apt-get install prometheus prometheus-node-exporter`），并给 Prometheus 配好数据目录权限与自启；这里解包运行只是为了不留常驻服务。
 
 ## 常见坑
 
@@ -190,7 +317,8 @@ ALERTS{alertname="…", alertstate="pending|firing", severity="…"} = 0 或 1
 | `rate(...[1m])` 配 1 分钟抓取间隔 | 窗口里只有一两个样本，结果抖动或为空；窗口应 ≥ 2×`scrape_interval` |
 | 告警表达式写绝对值阈值 | 流量变化时误报/漏报；错误率类告警要先算比率 |
 | `for: 0s` 图快 | 抖动直接变成通知，长期下来没人再认真看告警 |
-| 规则改了不校验就上线 | 语法错误会让整组规则加载失败；用 `promtool check rules` 进 CI |
+| 规则改了不校验就上线 | 语法错误会让整组规则加载失败；用 `promtool check rules` 进 CI（实测三份坏规则都能被点名到行号） |
+| 只用 `check rules` 验语法 | 语法过 ≠ 算得对；用 `promtool test rules` 配合成序列做单元测试 |
 | 用「通知收到没」判断告警是否工作 | 通知链路上还有路由、分组、抑制、静默；先看 `ALERTS` |
 | 把复杂表达式直接写进告警规则 | 可读性与复用性都差；先做 recording rule，再做告警 |
 
@@ -217,16 +345,17 @@ ALERTS{alertname="…", alertstate="pending|firing", severity="…"} = 0 或 1
 > - **第一反应不要是什么**：不要为了「维度更全」往 label 里塞高基数字段。
 
 > [!question]- 怎么在不依赖通知渠道的情况下验证一条告警规则？
-> - **第一步 `promtool check rules`**：语法正确（本机实测 `SUCCESS: 2 rules found`）。
-> - **第二步看 `ALERTS`**：`ALERTS{alertname="…",alertstate="firing"}` 出现即说明规则触发（本机实测值为 `1`）。
-> - **第三步看 `/api/v1/rules`**：确认 `state` 与 `lastEvaluation`，判断是没算出来还是没触发。
+> - **第一步 `promtool check rules`**：语法正确（本机实测 `SUCCESS: 4 rules found`）。
+> - **第二步 `promtool test rules`**：用合成序列断言表达式求值与告警是否触发（本机实测改对合成序列后 `SUCCESS`，`eval_time: 16m` 时 `NodeCpuHigh` 如期触发）。
+> - **第三步看 `ALERTS`**：`ALERTS{alertname="…",alertstate="firing"}` 出现即说明规则触发（本机实测恒真规则值为 `1`）。
+> - **第四步看 `/api/v1/rules`**：确认 `state` 与 `lastEvaluation`，判断是没算出来还是没触发（本机实测 `NodeCpuHigh` 为 `state: inactive`）。
 > - **之后再查 Alertmanager**：路由、分组、抑制、静默（子笔记 11）。
 > - **第一反应不要是什么**：不要一上来就怀疑邮箱/钉钉/webhook。
 
 > [!question]- `for` 参数解决什么问题？该怎么取值？
 > - **作用**：表达式持续为真达到 `for` 的时长，告警才从 `pending` 进入 `firing`，用来过滤瞬时毛刺。
 > - **取值**：水位类告警常用几分钟；硬故障（`up == 0`）可以短一些；与 SLO 挂钩的慢速消耗可以更长（子笔记 12）。
-> - **实测提醒**：本文为了验证链路用了 `for: 0s`，这是**实验手段**，不是生产配置。
+> - **实测提醒**：本文为了验证链路用了一条**不写 `for`** 的恒真规则，这是**实验手段**，不是生产配置；真实规则（如 `NodeCpuHigh`）带 `for: 10m`，实测一直停在 `inactive`。
 > - **第一反应不要是什么**：不要用「调高阈值」代替「加持续时间」。
 
 > 上一篇：[[Linux/09_日志与监控/09_指标的计量_node_exporter与指标语义|09 指标的计量：exporter 与指标语义]] ｜ 下一篇：[[Linux/09_日志与监控/11_告警的降噪_路由分组抑制与探测|11 告警的降噪：路由、分组、抑制与探测]]

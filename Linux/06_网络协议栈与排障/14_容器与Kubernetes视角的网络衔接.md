@@ -14,7 +14,9 @@ created: 2026-09-18
 > [!cite] 参考资料
 > `man 8 ip-netns`、`man 8 ip-link`（`veth`、`bridge`）、`man 8 nsenter`、`man 8 ss`、`man 8 conntrack`、`man 8 nft`、`man 8 iptables`、`man 8 ip-route`、`man 5 resolv.conf`，内核文档 `Documentation/networking/veth.rst`、`Documentation/networking/bridge.rst`，以及 Kubernetes 官方文档的网络模型、Service 与 NetworkPolicy 章节。
 >
-> 本篇是**概念与观测命令**篇：不做需要权限的破坏性实验，所有命令在宿主机上以 root 执行为可读操作。**文中未在真实 Kubernetes 集群上实测**（本机为单机 WSL2 环境），涉及具体 CNI 实现（Calico/Cilium/Flannel）的规则细节请以该实现的官方文档为准。
+> **实测状态**：本篇是**概念与观测命令**篇：不做需要权限的破坏性实验，所有命令在宿主机上以 root 执行都是可读操作。实测环境：**Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 `6.8.0-139-generic` / 4 vCPU / root 可用**；本篇用到的 `ip netns`/`nsenter`/`bridge` 都在本机实测可用（与子笔记 02、13 的实验是同一套 namespace + veth 机制）。
+>
+> **未实测**：**本机不是 Kubernetes 节点**（没有容器运行时、没有 CNI、没有 kube-proxy），所以 Pod 的 `resolv.conf`（`ndots:5`）、Service 的 DNAT 规则、NetworkPolicy 的规则链**都没有在本机实测**——它们按 Kubernetes 官方文档与 CNI 实现文档撰写；涉及具体 CNI 实现（Calico/Cilium/Flannel）的规则细节请以该实现的官方文档为准。本机唯一实测到的相关事实是：`nf_conntrack` 模块**默认未加载**，而 Service 转发与 SNAT 恰恰依赖它（子笔记 09）。
 
 > **这篇讲什么**：宿主机上学到的每一件网络排障本事，在容器场景里都继续有效——**只是要先弄清「你在谁的命名空间里」**。这一篇把 namespace、veth、网桥、Service 转发与 NetworkPolicy 的宿主侧入口串起来，作为本章与容器/Kubernetes 主题的衔接。
 >
@@ -29,10 +31,13 @@ created: 2026-09-18
 > [!abstract] 这一篇只要记住六句话
 > - **Pod 网络 = 一个网络命名空间 + 一对 veth + 宿主机上的路由/网桥**。理解了这三件东西，容器网络就不神秘了。
 > - **每个命名空间是一套独立网络栈**：独立的接口、路由表、邻居表、socket、conntrack、`resolv.conf`。**宿主机能通 ≠ 容器能通。**
+>   - 怎么验证：本机实测 `ip netns add` + 一对 veth 之后，两个命名空间各有自己的 `ip -br addr`/`ip route`（子笔记 02、13 的实验拓扑就是这么建的）。
 > - **取证要「进对命名空间」**：`nsenter -t <pid> -n ss -lntp`（PID 是容器内进程在宿主机的 PID），或用运行时的 `exec` 进容器。
+>   - 证据：本机实测 `nsenter` 可用（`command -v nsenter` → `/usr/bin/nsenter`）；而本机没有容器运行时，所以真实 Pod 的取证**未实测**。
 > - **在宿主机抓包能看到 Pod 的流量**（从 veth 宿主侧或网桥侧），在 Pod 里抓则是容器视角——**两侧对照做二分**的套路完全一样。
 > - **Service 转发**多数实现由 `iptables`/`nftables` 或 IPVS 完成，**依赖 conntrack**：集群规模一大，`nf_conntrack_max` 与超时必须纳入基线。
-> - **NetworkPolicy 的排障入口在宿主机的规则链与 CNI 组件日志里**，不在应用侧；同时别忘了容器里的 `resolv.conf` 通常带 `ndots:5`（子笔记 04）。
+>   - 证据：本机实测 `nf_conntrack` **默认未加载**（没有 NAT/状态化规则时不注册钩子），所以「默认就有 conntrack 容量」这种假设在真机上不成立（子笔记 09）。
+> - **NetworkPolicy 的排障入口在宿主机的规则链与 CNI 组件日志里**，不在应用侧；同时别忘了容器里的 `resolv.conf` 通常带 `ndots:5`（子笔记 04）。**本机无集群，这一条按文档撰写。**
 
 ## 1. 前置：容器网络的三个积木
 

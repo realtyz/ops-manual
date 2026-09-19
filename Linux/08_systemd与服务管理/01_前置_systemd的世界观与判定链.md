@@ -12,7 +12,7 @@ created: 2026-09-19
 > [!cite] 参考资料
 > `man 1 systemd`、`man 1 systemctl`、`man 7 systemd.special`、`man 7 systemd.unit`、`man 5 systemd.unit`、`man 5 systemd.service`、`man 5 systemd.slice`、`man 5 systemd.scope`，以及 freedesktop.org 的 systemd 文档与 `systemd.io` 的「Writing Unit Files」。
 >
-> 本篇结论来自上述资料；涉及本机行为的部分标注了实测环境（Ubuntu 24.04.4（WSL2）/ 内核 6.6.87.2 / systemd 255 / cgroup v2），未实测的按「未实测」处理。
+> 本篇结论来自上述资料；涉及本机行为的部分标注了实测环境（Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 6.8.0-139-generic / systemd 255（`255.4-1ubuntu8.17`）/ cgroup v2 / 4 vCPU / `MemTotal` 7894 MiB / **root 的系统级 manager**），用户级 manager 作为对照另标；未实测的按「未实测」处理。
 
 > **这篇讲什么**：先把整章的世界观立起来——PID 1 是什么、systemd 为什么用「unit 文件 + 依赖图」而不是一串启动脚本、unit 家族有哪些成员、以及一条 `systemctl start` 命令背后 systemd 依次做了哪几件事。这一篇不教怎么改配置，只负责让你知道「系统在按什么逻辑工作」。
 >
@@ -54,9 +54,26 @@ systemd 除了当 PID 1，还兼任三件事：
 - **日志收集者（journald）**：接管服务的 stdout/stderr 与 syslog。
 
 > [!important] `systemd --user`：每个登录用户还有一个「小 systemd」
-> 除了系统级的 PID 1，systemd 还会为每个登录用户启动一个**用户级实例** `systemd --user`（本机实测 `systemctl --user is-system-running` 为 `running`）。它管的单元只影响这个用户，跑在 `user@<uid>.service` 这棵 cgroup 子树下。
+> 除了系统级的 PID 1，systemd 还会为每个登录用户启动一个**用户级实例** `systemd --user`。本机同时实测了两棵 manager：系统级 `systemctl is-system-running` = `running`，用户级（`realtyz` 登录期间，`Linger=no`）也是 `running`，两者**版本号完全相同**（`255.4-1ubuntu8.17`）。用户级实例管的单元只影响这个用户，跑在 `user@<uid>.service` 这棵 cgroup 子树下。
 >
-> 这条区别很实用：**改 unit 语法、`Type=`、依赖、资源、沙箱、timer、tmpfiles 这些实验，都可以在用户级完成，不需要 root**——本目录的动手实验大部分就是这么设计的。但用户级不能写 `User=`（实测报 `216/GROUP`）、不能挂系统级挂载点，这些只能进 system 单元。
+> 这条区别很实用：**用户级不是「小一号的 root」**——它没有特权，无法切换身份。实测在用户单元里写 `User=root`，启动直接失败：`Changing group credentials failed: Operation not permitted`、`status=216/GROUP`。所以本目录的实验**一律在系统级（root）做**：只有系统级才能真换用户（`User=`/`DynamicUser=`）、写系统挂载点、跑 `journalctl --vacuum-*`。反过来说，**用户级仍是很好的对照对象**：两边的 unit 语法、`Type=`、依赖、cgroup 上限完全一致，差别只在特权——这正是理解「哪些选项需要 root」的最佳实验设计。
+
+### 1.1 两棵 manager 的实测对照
+
+同一个 systemd 版本、同一台机器，两棵 manager 的差别集中在「特权」与「可见范围」，这张表是后面所有「为什么这个选项在这里不生效」的底稿（全部为本次系统级 + 用户级实测）：
+
+| 维度 | 系统级 `systemctl`（PID 1） | 用户级 `systemctl --user`（实测 `realtyz`） |
+| --- | --- | --- |
+| 版本 | `255.4-1ubuntu8.17` | `255.4-1ubuntu8.17`（同一个二进制） |
+| `is-system-running` | `running` | `running`（`realtyz` 登录期间；`Linger=no`，注销后实例消失） |
+| 服务 cgroup 落点 | `/system.slice/<unit>` | `/user.slice/user-1000.slice/user@1000.service/app.slice/<unit>`（`Slice=app.slice`） |
+| 能否换身份（`User=`） | 能，实测服务内 `id -u` = 1000 | 不能，写 `User=root` 报 `216/GROUP` |
+| `NoNewPrivileges`/`CapabilityBoundingSet` | 能收敛到 `CapBnd=0` | 同样能设，但本来就只有该用户的能力 |
+| 默认句柄上限 | 硬 `524288` / 软 `1024` | 硬 `1048576` / 软 `1024` |
+| `systemd-analyze` 开机分析 | `3.922s (kernel) + 2.439s (userspace) = 6.362s` | 只有 `68ms (userspace)`，没有 kernel/firmware 段 |
+| 运行前提 | PID 1 一定在跑 | 需要会话环境：`XDG_RUNTIME_DIR`（本机 `/run/user/1000`）与 `DBUS_SESSION_BUS_ADDRESS`；两者都缺时报 `Failed to connect to bus: No medium found` |
+
+最后一行值得记住：那条 `Failed to connect to bus` **不是 WSL2 专属故障**，任何「拿不到会话总线」的场合都会出现（`su` 到非登录会话、cron 里调 `systemctl --user`、容器里没有 `systemd --user`）。看到它先查环境变量与会话，不要怀疑 systemd。
 
 ## 2. 世界观：声明式管理 vs 脚本式启动
 
@@ -133,13 +150,19 @@ unit 有两种存在形态：
 
 ### 4.2 slice：cgroup 树的分组
 
-systemd 把每个服务放进一棵 **cgroup 树**，`slice` 就是这棵树上的中间节点。本机实测一个用户服务落在：
+systemd 把每个服务放进一棵 **cgroup 树**，`slice` 就是这棵树上的中间节点。本机实测同一个 unit 名在两棵 manager 下的落点：
 
 ```text
-/user.slice/user-1000.slice/user@1000.service/app.slice/lab-limit.service
+/system.slice/lab08-limit.service                                            ← 系统级（root 跑的 system 单元）
+/user.slice/user-1000.slice/user@1000.service/app.slice/lab08-u-plain.service ← 用户级（realtyz 的 user 单元）
 ```
 
-记忆锚点：**系统服务在 `system.slice`，用户服务在 `user.slice`，服务自己还能在 `Unit` 里用 `Slice=` 归到自定义分组**。这棵树的直接用途是「按组限资源、按组看占用」——`systemd-cgls` 打印树形结构，`systemd-cgtop` 按组显示 CPU/内存/IO 占用（子笔记 07 展开）。
+```bash
+systemctl show -p ControlGroup -p Slice myapp.service   # 验证：系统单元落在 /system.slice，Slice=system.slice
+systemctl --user show -p ControlGroup -p Slice myapp.service   # 验证：用户单元落在 user@<uid>.service 下的 app.slice
+```
+
+记忆锚点：**系统服务在 `system.slice`，用户服务在 `user.slice`，服务自己还能在 `Unit` 里用 `Slice=` 归到自定义分组**。注意用户单元默认 `Slice=app.slice`（不是 `system.slice`），这解释了「同一个 unit 名在两棵 manager 下互不干扰」。这棵树的直接用途是「按组限资源、按组看占用」——`systemd-cgls` 打印树形结构，`systemd-cgtop` 按组显示 CPU/内存/IO 占用（子笔记 07 展开）。
 
 ### 4.3 scope：systemd 只管收纳，不管启动
 
@@ -191,7 +214,7 @@ flowchart TD
 | 认为 `Wants=` 就等于「先起对方再起我」 | 依赖和顺序是两回事，还要写 `After=`（子笔记 05） |
 | 以为「顺序写好了就一定会等对方就绪」 | `After=` 只保证「对方启动动作完成」，不保证对方真的能提供服务；就绪要靠 `Type=` 与健康检查 |
 | 认为对 PID 1 `kill -9` 能重启系统 | PID 1 忽略未处理信号；正确做法是 `systemctl reboot` 或 `systemctl isolate` |
-| 用户级和系统级混用配置 | `User=` 等选项只在 system 单元可用；用户单元写 `User=root` 实测报 `216/GROUP` |
+| 用户级和系统级混用配置 | `User=` 等选项只在 system 单元真的生效（实测 system 单元里 `User=realtyz` 服务内 `id -u` = 1000）；用户单元写 `User=root` 实测报 `216/GROUP`，系统单元写不存在的用户报 `217/USER` |
 | 把 `blame` 排序第一名当成开机阻塞源 | `blame` 是「谁初始化花得久」，`critical-chain` 才是「谁挡住了开机」（子笔记 14） |
 
 ## 决策练习

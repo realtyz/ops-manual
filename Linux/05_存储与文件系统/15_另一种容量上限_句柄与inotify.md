@@ -81,7 +81,7 @@ sudo find /proc/*/fd -lname 'anon_inode:inotify' 2>/dev/null | wc -l
 | `fs.inotify.max_user_instances` | 每个用户能创建的 inotify 实例数 | 无法创建新的实例（`inotify_init` 失败） |
 | `fs.inotify.max_queued_events` | 单个实例的事件队列长度 | 队列溢出：应用收到 `IN_Q_OVERFLOW`，**静默丢事件** |
 
-内核默认值不是「小常数」：`max_user_watches` 由内核按**可寻址内存的 1%** 计算并夹在 `8192`~`1048576` 之间，`max_queued_events` 默认为 `16384`（源码值），`max_user_instances` 同样有按内存计算的上限——**具体值要 `sysctl` 实测**，RHEL 与 Debian 各版本差异很大。
+内核默认值不是「小常数」：`max_user_watches` 由内核按**可寻址内存的 1%** 计算并夹在 `8192`~`1048576` 之间，`max_queued_events` 默认为 `16384`（源码值）；但 `max_user_instances` 默认是**固定值 `128`**（本机实测 `sysctl fs.inotify.max_user_instances` = 128），**并非**按内存计算——三项一律 `sysctl` 现场实测，RHEL 与 Debian 各版本差异很大。
 
 ```bash
 sudo sysctl -w fs.inotify.max_user_watches=524288

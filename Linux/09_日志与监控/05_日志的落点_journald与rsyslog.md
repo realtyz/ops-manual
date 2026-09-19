@@ -13,7 +13,7 @@ created: 2026-09-19
 > [!cite] 参考资料
 > `man 1 journalctl`、`man 5 journald.conf`、`man 5 rsyslog.conf`、`man 1 systemd-analyze`（`cat-config`）、`man 5 systemd.exec`（`StandardOutput=`/`StandardError=`）、发行版文档「Journal and log files（Ubuntu Server Guide）」与「Configuring logging（RHEL 9，未在本机实测）」。
 >
-> 实测输出来自 Ubuntu 24.04.4（WSL2）/ systemd 255 / 非 root；`ForwardToSyslog=yes` 来自本机 `/usr/lib/systemd/journald.conf.d/syslog.conf`。RHEL 系的 rsyslog 默认配置与日志文件路径未实测。
+> **实测环境：Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 `6.8.0-139-generic` / systemd 255（`255.4-1ubuntu8.17`）/ root 可用。** `ForwardToSyslog=yes` 在本机来自 `/usr/lib/systemd/journald.conf.d/syslog.conf`（`/etc/systemd/journald.conf` 里对应的那一行是注释掉的 `#ForwardToSyslog=no`）；`rsyslog` 已安装、`active`、`enabled`，`/var/log/syslog`、`/var/log/auth.log`、`/var/log/kern.log` 都存在；本次落点验证用 `logger`、`systemd-cat` 与自建临时单元 `lab09a-log.service` 完成（实验后已删除），**全程没有 `systemctl restart systemd-journald`**。RHEL 系的 rsyslog 默认配置与日志文件路径未实测。
 
 > **这篇讲什么**：一条日志被写出来之后，**到底落在哪**。重点讲清 journald 与 rsyslog 的分工——为什么同一条日志两边都有、什么时候该用哪一边，以及 journald 的持久化与容量这两个最容易「默默失效」的旋钮。
 >
@@ -27,17 +27,17 @@ created: 2026-09-19
 
 > [!abstract] 这一篇只要记住六句话
 > - **同一条日志通常两边都有，journald 与 rsyslog 不是二选一。**
->   - 证据：实测 `logger -t labtest` 之后，`journalctl -o json` 给出 `SYSLOG_IDENTIFIER/_PID/_UID/_TRANSPORT`，`/var/log/syslog` 里是纯文本一行；原因是 `ForwardToSyslog=yes`（本机来自 `/usr/lib/systemd/journald.conf.d/syslog.conf`）。
+>   - 证据：实测 `logger -t labtest` 之后，`journalctl -o json` 给出 `SYSLOG_IDENTIFIER=labtest`、`_PID=15907`、`_UID=0`、`_TRANSPORT=syslog`，`/var/log/syslog` 里是纯文本一行；原因是 `ForwardToSyslog=yes`（本机来自 `/usr/lib/systemd/journald.conf.d/syslog.conf`）。
 > - **journald 是「带字段的收件箱」，这是它比纯文本强的地方。**
->   - 证据：实测 `journalctl -n 1 -o verbose` 给出 `_BOOT_ID`、`_HOSTNAME`、`PRIORITY`、`_UID` 等元数据，所以能按单元、按 boot、按优先级精确过滤。
+>   - 证据：实测 `journalctl -n 1 -o verbose` 给出 `_BOOT_ID`、`_MACHINE_ID`、`_HOSTNAME`、`PRIORITY`、`_UID`、`SYSLOG_FACILITY` 等元数据，所以能按单元、按 boot、按优先级精确过滤。
 > - **持久化取决于 `/var/log/journal` 在不在。**
->   - 证据：`Storage=auto`（默认）的语义是「有目录就写磁盘，没有就写 `/run/log/journal`（重启即丢）」；本机两个目录都存在。
+>   - 证据：`Storage=auto`（默认）的语义是「有目录就写磁盘，没有就写 `/run/log/journal`（重启即丢）」；本机 `/var/log/journal` 与 `/run/log/journal` 两个目录都存在，且 `/var/log/journal` 下已有 machine-id 子目录，所以是持久化。
 > - **journal 的容量有默认上限，不是无限的。**
->   - 证据：`SystemMaxUse=` 默认为空 = 占所在文件系统 10%、上限 4 GiB（见 `man 5 journald.conf`）；本机 `journalctl --disk-usage` 约 580MiB 且随系统活动增长。
+>   - 证据：`SystemMaxUse=` 默认为空 = 占所在文件系统 10%、上限 4 GiB（见 `man 5 journald.conf`）；本机 `/etc/systemd/journald.conf` 里这些项全是注释状态（即用默认值），`journalctl --disk-usage` 实测 20.7 MiB（写作期间做过一次 vacuum 后为 16.0 MiB）。
 > - **journald 有速率限制，高频日志会被丢。**
 >   - 证据：默认 `RateLimitIntervalSec=30s`、`RateLimitBurst=10000`（本机 `/etc/systemd/journald.conf` 里这两项是注释状态，即用默认值）；被丢的消息在 `journalctl -u` 里显示 `Suppressed N messages`。
 > - **分工：journald 管「本机 + 字段 + 按 unit/boot 查询」，rsyslog/采集器管「长期文件、集中转发、跨机检索」。**
->   - 怎么验证：同一条消息分别用 `journalctl -u` 和 `grep` 在 `/var/log/syslog` 里查一次，两种体验的差别就是分工的理由。
+>   - 怎么验证：同一条消息分别用 `journalctl -u` 和 `grep` 在 `/var/log/syslog` 里查一次，两种体验的差别就是分工的理由。本机实测同一个 `lab09a-log.service` 的输出在两边都找得到：journald 侧 `_TRANSPORT=stdout`，rsyslog 侧 `2026-09-19T08:07:02.152909+00:00 linux-lab echo[17994]: lab09a-from-unit-stdout`。
 
 ## 1. 为什么两边都有：一条日志的实测轨迹
 
@@ -56,13 +56,13 @@ flowchart TD
 ```text
 $ logger -t labtest "hello-from-logger"
 $ journalctl -t labtest -n 1 -o short-precise
-Sep 19 12:37:37.034494 realtyz labtest[698]: hello-from-logger
+Sep 19 08:06:27.428985 linux-lab labtest[15907]: hello-from-logger
 $ journalctl -t labtest -n 1 -o json | python3 -c "import json,sys; d=json.load(sys.stdin); print({k:d[k] for k in ['SYSLOG_IDENTIFIER','_PID','_UID','_TRANSPORT','MESSAGE']})"
-{'SYSLOG_IDENTIFIER': 'labtest', '_PID': '698', '_UID': '1000', '_TRANSPORT': 'syslog', 'MESSAGE': 'hello-from-logger'}
+{'SYSLOG_IDENTIFIER': 'labtest', '_PID': '15907', '_UID': '0', '_TRANSPORT': 'syslog', 'MESSAGE': 'hello-from-logger'}
 $ tail -1 /var/log/syslog
-2026-09-19T12:37:37.034681+08:00 realtyz labtest: hello-from-logger
+2026-09-19T08:06:27.429240+00:00 linux-lab labtest: hello-from-logger
 $ stat -c "%A %a %U:%G %s %n" /var/log/syslog
--rw-r----- 640 syslog:adm 707517 /var/log/syslog
+-rw-r----- 640 syslog:adm 1272007 /var/log/syslog
 ```
 
 再往前追一步——**是谁让 journald 转发的**：
@@ -80,8 +80,28 @@ systemd-analyze cat-config systemd/journald.conf | grep -nE "^# /(etc/systemd|us
 
 这里用 `grep -n` 是为了把 `cat-config` 输出的「来源标记行」（以 `# ` 开头的那些）与内容一起显示出来，前面的数字是行号。**`systemd-analyze cat-config` 会把所有可能生效的来源按优先级拼出来**：看到同样的键出现两次、一次被 `#` 注释、一次没有，就是**发行版用 drop-in 覆盖了上游默认值**——这也是「配置文件里明明写着 `no`，实际却是 `yes`」的答案。
 
+本机的 drop-in 目录现状（只读）：
+
+```text
+$ ls -la /etc/systemd/journald.conf.d/
+ls: cannot access '/etc/systemd/journald.conf.d/': No such file or directory
+$ ls -la /usr/lib/systemd/journald.conf.d/
+total 12
+-rw-r--r-- 1 root root 177 Mar 24 13:45 syslog.conf
+$ cat /usr/lib/systemd/journald.conf.d/syslog.conf
+# Undo upstream commit 46b131574fdd7d77 for now. For details see
+#  http://lists.freedesktop.org/archives/systemd-devel/2014-November/025550.html
+
+[Journal]
+ForwardToSyslog=yes
+```
+
+**`/etc/systemd/journald.conf.d/` 在本机并不存在**（要覆盖发行版设置时才有必要新建），生效的转发开关完全来自 `/usr/lib` 下那个 177 字节的 drop-in。
+
 > [!important] 「配置里写的」和「实际生效的」不是一个东西
-> 结论永远取自 `systemd-analyze cat-config`（合并后）或 `journalctl --header`/`journalctl --disk-usage` 这类运行时观察，而不是某一个配置文件。这条纪律与整个 Linux 学习路径一致：**先看生效值，再看文件**。
+> 结论永远取自 `systemd-analyze cat-config`（合并后）或 `journalctl --disk-usage`/`journalctl --header` 这类运行时观察，而不是某一个配置文件。这条纪律与整个 Linux 学习路径一致：**先看生效值，再看文件**。
+>
+> 一个实测的坑：**`systemctl show systemd-journald -p Storage -p SystemMaxUse -p ForwardToSyslog` 会返回空**（退出码仍是 0）。原因很直接——这些是 `journald.conf` 的配置项，**不是 systemd unit 属性**；`systemctl show` 只能回答 unit 层面的东西（`Id`/`MainPID`/`MemoryCurrent` 有值，`Storage`/`SystemMaxUse`/`ForwardToSyslog` 一律空）。要读生效值，用 `systemd-analyze cat-config systemd/journald.conf`；要看运行时状态，用 `journalctl --disk-usage` 和 `journalctl --header`。
 
 ## 2. journald：带字段的收件箱
 
@@ -101,14 +121,16 @@ journalctl -n 1 -o verbose | head -10
 ```
 
 ```text
-Sat 2026-09-19 12:42:09.122795 CST [s=f9e46537553c4a06b07bdd01ca2a8505;i=5ceba;b=651efbf99e1e4300b67eb87d15644f40;m=109211f9;t=65bcea3c309eb;x=d4e1b5f903c18b88]
-    _BOOT_ID=651efbf99e1e4300b67eb87d15644f40
-    _MACHINE_ID=f13b8ed5e9624ff88b5b5d13e6565764
-    _HOSTNAME=realtyz
-    _RUNTIME_SCOPE=system
+Sat 2026-09-19 08:07:02.163761 UTC [s=4b208d899f2b4c13b57929c865de75d5;i=3a0c;b=decad510b934454f9d61aef2aa2893fd;m=d1577b66;t=65bd1807bf54a;x=4ee6c06e5102eaeb]
     PRIORITY=6
     _UID=0
     _GID=0
+    _SELINUX_CONTEXT=unconfined
+    _BOOT_ID=decad510b934454f9d61aef2aa2893fd
+    _MACHINE_ID=bd821ce75df94970ad5b6d63b6a8f812
+    _HOSTNAME=linux-lab
+    _RUNTIME_SCOPE=system
+    SYSLOG_FACILITY=3
 ```
 
 几个值得记住的：
@@ -137,13 +159,24 @@ Storage=auto
 | `auto`（默认） | 有 `/var/log/journal` 就持久化，否则进内存 | 取决于目录是否存在 |
 | `none` | 不落盘，收到的日志被丢弃（是否转发取决于 `Forward*` 配置） | 不保存 |
 
-本机实测两个目录都存在：
+本机实测两个目录都存在，而且 `/var/log/journal` 下确实有按 machine-id 组织的持久化目录：
 
 ```text
-$ ls -d /var/log/journal /run/log/journal
-/run/log/journal
-/var/log/journal
+$ ls -ld /var/log/journal /run/log/journal
+drwxr-sr-x+ 2 root systemd-journal   40 Sep 19 07:08 /run/log/journal
+drwxr-sr-x+ 3 root systemd-journal 4096 Sep 19 06:05 /var/log/journal
+$ ls -l /var/log/journal/
+drwxr-sr-x+ 2 root systemd-journal 4096 Sep 19 08:04 bd821ce75df94970ad5b6d63b6a8f812
+$ journalctl --header | head -6
+File path: /var/log/journal/bd821ce75df94970ad5b6d63b6a8f812/system@4b208d899f2b4c13b57929c865de75d5-00000000000028ab-00065bd0af63ef5f.journal
+File ID: d95af1af7f83454ca2bd8bb541994120
+Machine ID: bd821ce75df94970ad5b6d63b6a8f812
+Boot ID: decad510b934454f9d61aef2aa2893fd
+Sequential number ID: 4b208d899f2b4c13b57929c865de75d5
+State: ARCHIVED
 ```
+
+注意 `journalctl --header` 里的 `State: ARCHIVED`：**journal 文件在写满一轮之后会被标记成 `ARCHIVED` 并封存，active 的是当前那一个。** 这个区分后面有用——`journalctl --vacuum-*` 只能回收 `ARCHIVED` 的文件（子笔记 08）。
 
 > [!warning] 「日志重启就没了」的根因通常在这里
 > 容器、精简镜像、临时实例上经常没有 `/var/log/journal`，于是 `Storage=auto` 就退化成内存存储——**日志重启即丢，而且不会报错**。交付前必须实测 `ls -ld /var/log/journal` 与 `journalctl --disk-usage`。
@@ -165,12 +198,28 @@ ls -ld /var/log/journal                                        # 验证：是否
 journalctl -u <unit> --since "1 hour ago" | grep -i suppres    # 验证：有没有被限流丢弃
 ```
 
-本机实测（写作过程中这个数字从 578.0M 长到 598.8M，**说明它是动态的**）：
+本机实测（`journalctl --disk-usage`，写作期间从 20.7 MiB 变到 16.0 MiB，**说明它是动态的**；量级在几十 MiB，脚本/采集器频繁写日志时会明显增长）：
 
 ```text
 $ journalctl --disk-usage
-Archived and active journals take up 578.0M in the file system.
+Archived and active journals take up 20.7M in the file system.
 ```
+
+容量与保留的**生效值**只能从 `cat-config` 读（`systemctl show` 读不到，见第 1 节的实测）：
+
+```bash
+systemd-analyze cat-config systemd/journald.conf | grep -nE "^# /(etc|usr/lib)/systemd|^[A-Za-z]"
+```
+
+```text
+1:# /etc/systemd/journald.conf
+20:[Journal]
+52:# /usr/lib/systemd/journald.conf.d/syslog.conf
+56:[Journal]
+57:ForwardToSyslog=yes
+```
+
+也就是说：**除了 `ForwardToSyslog`，本机 journald 的其余项（`Storage`、`SystemMaxUse`、`SystemKeepFree`、`MaxRetentionSec`、`RateLimit*`）全部落在注释区，即全部使用编译进去的默认值**——这正是「根分区只有 47 G、默认上限是文件系统的 10%」这件事需要被显式讨论的原因。
 
 ### 2.5 常用 `journalctl` 用法速查
 
@@ -185,13 +234,23 @@ journalctl --list-boots                                       # 有哪些 boot
 journalctl -k -b                                              # 内核消息（本次开机）
 ```
 
-本机实测的 `--list-boots`（**注意 boot 编号是相对的，0 是当前**）：
+本机实测的 `--list-boots`（**注意 boot 编号是相对的，0 是当前**；本机只保留了当前这一次开机，旧 boot 已被 journal 轮转回收）：
 
 ```text
-$ journalctl --list-boots | tail -3
- -2 5c9a5d725db54ad388bb00471e73fc55 Sat 2026-09-19 11:16:12 CST Sat 2026-09-19 11:20:03 CST
- -1 917b024b4d6846738b0f77dd0652c2cc Sat 2026-09-19 12:27:12 CST Sat 2026-09-19 12:27:28 CST
-  0 651efbf99e1e4300b67eb87d15644f40 Sat 2026-09-19 12:37:32 CST Sat 2026-09-19 12:42:09 CST
+$ journalctl --list-boots --no-pager
+IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY
+  0 decad510b934454f9d61aef2aa2893fd Sat 2026-09-19 07:08:34 UTC Sat 2026-09-19 08:08:26 UTC
+```
+
+同一时刻的另外三种输出格式（对照子笔记 02 的「同一时间四种写法」）：
+
+```text
+$ journalctl -n 1 -o short-iso
+2026-09-19T08:06:16+00:00 linux-lab systemd[1]: Started session-89.scope - Session 89 of User root.
+$ journalctl -n 1 -o short-precise
+Sep 19 08:06:16.318693 linux-lab systemd[1]: Started session-89.scope - Session 89 of User root.
+$ journalctl -n 1 -o cat
+Started session-89.scope - Session 89 of User root.
 ```
 
 ## 3. rsyslog：落盘与转发的那一侧
@@ -202,6 +261,28 @@ rsyslog 是传统 syslog 守护进程，负责两件事：
 2. **把消息转发出去**（`@` = UDP、`@@` = TCP、RELP、syslog over TLS）——子笔记 07 展开。
 
 它收到的东西来自两条路：journald 的转发（`ForwardToSyslog=yes`）、以及直接写 syslog 套接字的程序。**rsyslog 落盘的是纯文本**，字段化能力弱，但胜在简单、通用、所有采集器都认。
+
+本机实测的 rsyslog 现状（**旧笔记里「rsyslog 未安装」的说法在本机不成立**）：
+
+```text
+$ systemctl is-active rsyslog systemd-journald logrotate.timer systemd-tmpfiles-clean.timer
+active
+active
+active
+active
+$ systemctl is-enabled rsyslog
+enabled
+$ ls -l /var/log/syslog /var/log/auth.log /var/log/kern.log
+-rw-r----- 1 syslog adm  170756 Sep 19 08:06 /var/log/auth.log
+-rw-r----- 1 syslog adm  763335 Sep 19 08:06 /var/log/kern.log
+-rw-r----- 1 syslog adm 1272007 Sep 19 08:06 /var/log/syslog
+```
+
+三件事值得注意：
+
+1. **rsyslog 是发行版预装、开机自启的**，不需要额外安装——所以「日志会不会两条通道都有」在本机的默认答案就是「是」。
+2. **三个文件都由 `logrotate` 的 `/etc/logrotate.d/rsyslog` 规则统一管理**（`rotate 4`/`weekly`/`compress`/`delaycompress`/`sharedscripts`），见子笔记 06。
+3. **日志文件属主是 `syslog:adm`、权限 `640`**：普通用户读不到，但属于 `adm` 组的用户可以（本机的 `realtyz` 就在 `adm` 组里，实测 `tail -1 /var/log/syslog` 成功）。**这是「谁能看日志」这个权限问题的第一现场。**
 
 ## 4. 分工与取舍
 
@@ -222,8 +303,10 @@ rsyslog 是传统 syslog 守护进程，负责两件事：
 
 ```bash
 systemctl is-active systemd-journald rsyslog logrotate.timer systemd-tmpfiles-clean.timer
+systemctl is-enabled rsyslog systemd-journald
 systemd-analyze cat-config systemd/journald.conf | grep -E "^# /|^(Storage|SystemMaxUse|SystemKeepFree|MaxRetentionSec|RateLimit|ForwardToSyslog)"
 ls -ld /var/log/journal /run/log/journal 2>/dev/null
+ls -la /etc/systemd/journald.conf.d/ /usr/lib/systemd/journald.conf.d/ 2>/dev/null
 journalctl --disk-usage
 ls -l /var/log/syslog /var/log/auth.log /var/log/kern.log 2>/dev/null
 systemctl list-timers logrotate.timer systemd-tmpfiles-clean.timer --no-pager
@@ -233,11 +316,13 @@ grep -vE "^\s*(#|$)" /etc/logrotate.conf; ls /etc/logrotate.d/
 本机实测样张（对照格式）：
 
 ```text
-journald 持久化：/var/log/journal 存在；合计占用 578.0M（写作过程中增长到 598.8M）
-ForwardToSyslog=yes（来自 /usr/lib/systemd/journald.conf.d/syslog.conf）
-/var/log/syslog：640 syslog:adm，707517 字节
-logrotate.timer：每日 00:00；/var/lib/logrotate/status 记录上次轮转时间
-systemd-tmpfiles-clean.timer：约每 24 小时一次
+journald 持久化：/var/log/journal 存在（下含 machine-id 子目录 bd821ce75df94970ad5b6d63b6a8f812）；合计占用 20.7M
+journald 生效配置：只有 ForwardToSyslog=yes 是显式设置（来自 /usr/lib/systemd/journald.conf.d/syslog.conf），
+                  /etc/systemd/journald.conf.d/ 不存在，其余项全部走默认值
+rsyslog：active + enabled；/var/log/syslog 1272007 字节（640 syslog:adm）
+         /var/log/auth.log 170756 字节、/var/log/kern.log 763335 字节（同权限）
+logrotate.timer：active；NEXT 次日 00:00:00 UTC、LAST 本次开机时间（AccuracySec=1h、Persistent=true）
+systemd-tmpfiles-clean.timer：active
 ```
 
 ## 常见坑
@@ -249,7 +334,10 @@ systemd-tmpfiles-clean.timer：约每 24 小时一次
 | 「journal 会自己控制大小，不用管」 | 默认上限是文件系统的 10%（上限 4 GiB），在根分区上可能仍然过大或不够 |
 | 「日志重启就没了是我的错觉」 | 多半是 `/var/log/journal` 不存在，`Storage=auto` 退化成内存存储 |
 | 「`journalctl` 里没有就是应用的错」 | 先确认三件事：落点（写到哪里）、持久化（有没有存）、限流（有没有被丢） |
-| 「journald 会自动把 JSON 日志解析成字段」 | 不会：本机实测 `MESSAGE` 里是原文 JSON；字段化要靠采集端 |
+| 「journald 会自动把 JSON 日志解析成字段」 | 不会：本机实测 `MESSAGE` 里是原文 JSON（`{"level":"info","msg":"hi"}`），`PRIORITY`/`_TRANSPORT` 才是 journald 加的；字段化要靠采集端 |
+| 用 `systemctl show systemd-journald -p Storage -p SystemMaxUse` 查容量配置 | **返回空**（退出码 0 但没有任何内容）：这些是 `journald.conf` 的项，不是 unit 属性。改用 `systemd-analyze cat-config systemd/journald.conf` |
+| 「本机肯定没装 rsyslog，所以只有 journald」 | 本机 rsyslog 是预装且 `active`+`enabled` 的，`/var/log/syslog`/`auth.log`/`kern.log` 都在；判断依据是 `systemctl is-active rsyslog`，不是猜 |
+| 以为「日志文件谁都能读」 | `/var/log/syslog` 是 `640 syslog:adm`：要读得进 `adm` 组（本机 `realtyz` 在 `adm` 组，实测可读）。这也是为什么 `journalctl` 对普通用户默认只显示自己相关的记录 |
 
 ## 决策练习
 
@@ -275,15 +363,15 @@ systemd-tmpfiles-clean.timer：约每 24 小时一次
 
 > [!question]- journald 的持久化由什么决定？怎么验证？
 > - **机制**：`Storage=auto`（默认）时，看 `/var/log/journal` 是否存在——存在就持久化，不存在就写内存（`/run/log/journal`）。
-> - **验证**：`ls -ld /var/log/journal`、`journalctl --disk-usage`、`journalctl --list-boots`（能列出过去的 boot 说明持久化生效）。
+> - **验证**：`ls -ld /var/log/journal`（本机存在，下面还有 machine-id 子目录）、`journalctl --disk-usage`、`journalctl --header`（本机能看到 `File path: /var/log/journal/...` 与 `State: ARCHIVED`）、`journalctl --list-boots`。
 > - **风险场景**：容器、精简镜像、临时实例最容易「日志重启即丢」且不报错。
-> - **第一反应不要是什么**：不要以为重装/重启后日志还在，除非你验证过。
+> - **第一反应不要是什么**：不要以为重装/重启后日志还在，除非你验证过。**本机虽然是持久化的，但 `--list-boots` 只剩当前一次开机**——持久化不等于「历史都留着」，容量与保留策略同样是变量（子笔记 08）。
 
-> [!question]- journald 的容量与限流有哪些默认值？为什么必须确认？
-> - **容量**：`SystemMaxUse=` 默认空 → 占所在文件系统 10%（上限 4 GiB）；`SystemKeepFree=` 默认空 → 至少留 15% 空闲。
+> [!question]- journald 的容量与限流有哪些默认值？在本机怎么查？
+> - **容量**：`SystemMaxUse=` 默认空 → 占所在文件系统 10%（上限 4 GiB）；`SystemKeepFree=` 默认空 → 至少留 15% 空闲。本机根分区 47 G，所以上限量级是数 GiB。
 > - **保留**：`MaxRetentionSec=` 默认空 → 不按时间删，只按容量；要「留 30 天」必须显式设置。
 > - **限流**：`RateLimitIntervalSec=30s`、`RateLimitBurst=10000`；被丢的消息在 `journalctl -u` 里表现为 `Suppressed N messages`。
-> - **为什么要确认**：容量不足会丢历史，容量过大可能挤占根分区；限流在高频日志下会静默丢消息。
-> - **第一反应不要是什么**：不要假设「默认值一定安全」。
+> - **怎么查**：`systemd-analyze cat-config systemd/journald.conf`——本机输出显示**除了 `ForwardToSyslog=yes`，其余全部是注释掉的默认值**。`systemctl show` 查不到这些项。
+> - **第一反应不要是什么**：不要假设「默认值一定安全」，也不要用 `systemctl show` 去读 `journald.conf` 的项。
 
 > 上一篇：[[Linux/09_日志与监控/04_日志的诞生_格式与落点选择|04 日志的诞生：格式与落点选择]] ｜ 下一篇：[[Linux/09_日志与监控/06_日志的轮转_logrotate的两种切法|06 日志的轮转：logrotate 的两种切法]]

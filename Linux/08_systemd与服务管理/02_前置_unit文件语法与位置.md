@@ -12,7 +12,7 @@ created: 2026-09-19
 > [!cite] 参考资料
 > `man 5 systemd.unit`、`man 5 systemd.service`、`man 5 systemd.exec`、`man 5 systemd.kill`、`man 5 systemd.timer`、`man 5 systemd.socket`、`man 5 systemd.mount`、`man 1 systemctl`、`man 1 systemd-analyze`。
 >
-> 搜索路径、优先级与实测输出以本机为准（Ubuntu 24.04.4（WSL2）/ systemd 255 / 非 root `uid=1000`）；RHEL 系的路径与默认值差异按「未实测」标注。
+> 搜索路径、优先级与实测输出以本机为准（Ubuntu 24.04.5 LTS（VMware 虚拟机）/ 内核 6.8.0-139-generic / systemd `255.4-1ubuntu8.17` / **root 的系统级 manager**，用户级路径另标）；RHEL 系的路径与默认值差异按「未实测」标注。
 
 > **这篇讲什么**：unit 文件到底长什么样、每一段写什么、放在哪个目录才会生效、`drop-in` 是什么、模板单元怎么用。**这是全章的地基**：后面所有「配置写错却不报错」「改了文件不生效」的问题，根都在这一篇。
 >
@@ -27,10 +27,10 @@ created: 2026-09-19
 > [!abstract] 这一篇只要记住六句话
 > - **unit 文件是 INI 风格的「三段式」**：`[Unit]` 讲通用信息与依赖，`[Service]`（或 `[Timer]`/`[Socket]`…）讲这个类型特有的行为，`[Install]` 讲开机怎么挂上去。
 > - **段名是有类型的**：`StartLimitBurst=` 属于 `[Unit]`，写进 `[Service]` 会被 `systemd-analyze verify` 报 `Unknown key name ... ignoring`——**配置被静默丢弃**，这就是「明明写了却没生效」的头号来源。
-> - **同一份 unit 由多层文件叠加而成**：`/etc/systemd/system` > `/run/systemd/system` > `/usr/lib/systemd/system`（本机实测共 12 条搜索路径），靠后的只是默认值，靠前的覆盖它。正确改法是写 **drop-in**，不是改 `/usr/lib` 下的原文件。
+> - **同一份 unit 由多层文件叠加而成**：`/etc/systemd/system` > `/run/systemd/system` > `/usr/lib/systemd/system`（本机实测 system 级共 12 条搜索路径、user 级 16 条），同名 unit **取优先级最高的那一份，不合并**。实测 `/usr/lib/systemd/system/lab08-demo.service` 与 `/etc/systemd/system/lab08-demo.service` 同名时，`FragmentPath` 指向 `/etc` 那一份，`systemctl cat` 只列出它。正确改法是写 **drop-in**，不是改 `/usr/lib` 下的原文件。
 > - **`systemctl edit` 生成的就是 drop-in**（`/etc/systemd/system/<unit>.d/override.conf`），只写你要覆盖的那几行，不动原文件。
 > - **模板单元 `foo@.service` 用一个文件描述一族服务**：`systemctl start foo@abc` 里 `%i` 就是 `abc`，常用于「按网卡/按实例」批量拉起。
-> - **改完先 `systemd-analyze verify`**：它能抓未知键名、小节放错、重复 `ExecStart`、缺失依赖；**通过时静默且退出码为 0**。
+> - **改完先 `systemd-analyze verify`**：它能抓未知键名、小节放错、重复 `ExecStart`、缺失依赖。**但要看清它的退出码**：实测把 `StartLimitIntervalSec` 放进 `[Service]` 时它打印 `Unknown key name ... ignoring.` 却**仍然返回 0**（配置被丢弃、命令却「成功」）；只有「`Type=simple` 写了两条 `ExecStart=`」这类硬错误才返回 1。**所以不能只看 `$?`，要读它的输出**。
 
 ## 1. 三段式：`[Unit]` / `[Service]` / `[Install]`
 
@@ -177,11 +177,67 @@ systemd 在多个目录里按顺序找同名 unit，**靠前的优先，把靠�
 ```
 
 ```bash
-systemd-analyze unit-paths            # 验证：按优先级列出本机的 system 级搜索路径
+systemd-analyze unit-paths            # 验证：按优先级列出本机的 system 级搜索路径，本机实测 12 条
 systemctl show -p FragmentPath -p DropInPaths sshd.service   # 验证：某个 unit 到底从哪读的、有没有 drop-in
 ```
 
-记忆锚点只记三条：**`/etc/systemd/system` > `/run/systemd/system` > `/usr/lib/systemd/system`**。用户单元的搜索路径同理，记忆锚点是：**`~/.config/systemd/user` > `/etc/systemd/user` > `/run/systemd/user` > `/usr/lib/systemd/user`**（本机实测共 17 项，多出 `/etc/xdg/systemd/user`、`/usr/local/share/systemd/user` 等）。
+同名 unit 的覆盖关系必须用 `FragmentPath` 验证，不能看目录里有没有文件。实测把两份同名文件分别放到三个目录：
+
+```text
+$ systemctl show -p FragmentPath lab08-demo.service
+FragmentPath=/etc/systemd/system/lab08-demo.service          # /etc 与 /usr/lib 同名时取 /etc
+$ systemctl cat lab08-demo.service
+# /etc/systemd/system/lab08-demo.service                     # 只列出生效的那一份，不合并
+[Unit]
+Description=lab08 demo (from /etc)
+...
+$ journalctl -u lab08-demo.service -o cat
+etc-version                                                  # 运行时执行的也是 /etc 那一份
+
+$ 再把同名文件放进 /run/systemd/system 后 daemon-reload
+$ systemctl show -p FragmentPath -p Description lab08-demo.service
+Description=lab08 demo (from /etc)                           # ← /run 这一层并没有翻盘
+FragmentPath=/etc/systemd/system/lab08-demo.service
+```
+
+最后一段是本节最反直觉的一点：**`/etc/systemd/system` 的优先级高于 `/run/systemd/system`**（`unit-paths` 里 `/etc/systemd/system` 排在第 5 位、`/run/systemd/system` 排第 7 位）。「运行时生成的东西一定盖过 `/etc`」是错的——`/run` 只是「重启即消失」，不代表优先级更高。
+
+屏蔽（mask）也是靠这一层实现的，实测 `systemctl mask` 就是在 `/etc/systemd/system/` 下建一个指向 `/dev/null` 的软链：
+
+```text
+$ systemctl mask lab08-mask.service
+Created symlink /etc/systemd/system/lab08-mask.service → /dev/null.
+$ systemctl show -p LoadState -p UnitFileState -p FragmentPath lab08-mask.service
+LoadState=masked
+UnitFileState=masked
+FragmentPath=/etc/systemd/system/lab08-mask.service
+$ systemctl unmask lab08-mask.service && systemctl show -p LoadState -p UnitFileState lab08-mask.service
+LoadState=loaded
+UnitFileState=static
+```
+
+记忆锚点只记三条：**`/etc/systemd/system` > `/run/systemd/system` > `/usr/lib/systemd/system`**。用户单元的搜索路径同理，记忆锚点是：**`~/.config/systemd/user` > `/etc/systemd/user` > `/run/systemd/user` > `/usr/lib/systemd/user`**。本机实测（`realtyz`）共 **16 项**：
+
+```text
+/home/realtyz/.config/systemd/user.control
+/run/user/1000/systemd/user.control
+/run/user/1000/systemd/transient
+/run/user/1000/systemd/generator.early
+/home/realtyz/.config/systemd/user        ← 用户自己改这里（对应 system 的 /etc/systemd/system）
+/etc/xdg/systemd/user
+/etc/systemd/user
+/run/user/1000/systemd/user
+/run/systemd/user
+/run/user/1000/systemd/generator
+/home/realtyz/.local/share/systemd/user
+/usr/local/share/systemd/user
+/usr/share/systemd/user
+/usr/local/lib/systemd/user
+/usr/lib/systemd/user                    ← 软件包安装的原始文件
+/run/user/1000/systemd/generator.late
+```
+
+对照记住一句就够：**system 级「管理员目录」是 `/etc/systemd/system`，user 级对应的是 `~/.config/systemd/user`**；两边其余层级的相对次序完全一样。
 
 > [!important] 优先级的实用含义
 > 「同一份 unit 有不同版本」时，**生效的是优先级最高的那一份**，不是「合并」。而 drop-in 的语义不同——它是在同一份 unit 上**把同名键覆盖、把新键追加**。区分这两件事，是子笔记 04「改了配置没生效」的关键。
@@ -198,14 +254,30 @@ systemctl --user edit myapp.service   # 用户单元：~/.config/systemd/user/my
 systemctl edit --full nginx.service   # 复制整份 unit 到 /etc 再改（大改才用，会和发行版更新脱节）
 ```
 
-本机实测（用户单元）的 drop-in 效果：`systemctl --user cat lab-simple.service` 会把原文件与 drop-in **按文件分别列出**，`systemctl --user show -p DropInPaths` 显示：
+本机实测（system 单元）的 drop-in 效果：`systemctl cat lab08-simple.service` 会把原文件与 drop-in **按文件分别列出**，`systemctl show -p DropInPaths` 显示：
 
 ```text
-$ systemctl --user show -p DropInPaths -p Environment -p LimitNOFILE lab-simple.service
-Environment=RELOAD_TEST=1 EXTRA=from-dropin
+$ systemctl show -p DropInPaths -p Environment -p LimitNOFILE lab08-simple.service
+Environment=PHASE=2 EXTRA=from-dropin
 LimitNOFILE=256
-DropInPaths=/home/realtyz/.config/systemd/user/lab-simple.service.d/override.conf
+DropInPaths=/etc/systemd/system/lab08-simple.service.d/10-extra.conf
+
+$ systemctl cat lab08-simple.service
+# /etc/systemd/system/lab08-simple.service
+[Unit]
+Description=lab08 simple reload demo
+[Service]
+Type=simple
+Environment=PHASE=2
+ExecStart=/bin/bash -c 'exec sleep 300'
+
+# /etc/systemd/system/lab08-simple.service.d/10-extra.conf
+[Service]
+Environment=EXTRA=from-dropin
+LimitNOFILE=256
 ```
+
+`systemctl cat` 的输出把「哪一行来自哪个文件」摊开了，这正是它比 `vim` 更该先跑的原因。改完 drop-in 后进程里也真的拿到了新值：`tr '\0' '\n' < /proc/<MainPID>/environ | grep EXTRA=` 得到 `EXTRA=from-dropin`，`/proc/<MainPID>/limits` 里 `Max open files` 是 `256 256`。
 
 > [!tip] 为什么推荐 drop-in
 > ① 不动发行版文件，软件包升级不会和你的改动打架；② 一眼能看出「相对默认值，我改了什么」；③ 回滚就是删掉这个文件夹；④ 同一份 unit 可以被多个 drop-in 分层覆盖（如 `/etc/systemd/system/foo.service.d/10-base.conf`、`20-site.conf`），按文件名字典序生效。**注意：改完 drop-in 一样要 `daemon-reload`。**
@@ -285,7 +357,9 @@ systemd-analyze verify /etc/systemd/system/myapp.service   # 验证：语法与�
 | 常见做法或说法 | 后果或事实 |
 | --- | --- |
 | 改 `/usr/lib/systemd/system/*.service` | 软件包一升级就被覆盖；应该用 drop-in |
-| `StartLimitBurst=` 写进 `[Service]` | 实测 verify 报 `Unknown key name ... ignoring`，配置被静默忽略 |
+| 把 `/run/systemd/system` 当成最高优先级 | 实测 `/etc/systemd/system` 排在它前面：往 `/run` 放同名文件后 `FragmentPath` 仍指向 `/etc` |
+| `StartLimitBurst=` 写进 `[Service]` | 实测 verify 报 `Unknown key name 'StartLimitIntervalSec' in section 'Service', ignoring.`，而且**退出码仍是 0**——配置被丢弃、命令却「成功」 |
+| unit 文件里直接写 `date +%3N` 这类带 `%` 的命令 | `%` 是 systemd 说明符：实测报 `Failed to resolve unit specifiers in ...: Invalid slot` / `Unit configuration has fatal error, unit will not be started.`，要写成 `%%3N`；`$` 也会被展开（要字面 `$` 得写 `$$`） |
 | 只写 `Requires=` 就以为有顺序 | 依赖与顺序是两回事，还要 `After=` |
 | `EnvironmentFile=` 不带 `-`，文件又不存在 | 服务直接启动失败（`Result=resources`），不是「变量为空」 |
 | 在用户单元里写 `User=root` | 用户级实例无法切身份，实测报 `216/GROUP` |
@@ -314,7 +388,8 @@ systemd-analyze verify /etc/systemd/system/myapp.service   # 验证：语法与�
 > - **第一反应不要是什么**：不要以为「配置写了就一定生效」——先 `systemctl show` 看生效值，再 `systemd-analyze verify` 看有没有被忽略。
 
 > [!question]- 同一份 unit 在 `/etc` 与 `/usr/lib` 下各有一份，哪份生效？drop-in 又是什么关系？
-> - `/etc/systemd/system` 优先级高于 `/usr/lib/systemd/system`，**同名 unit 取优先级最高的那一份**（不是合并）。
+> - `/etc/systemd/system` 优先级高于 `/usr/lib/systemd/system`，**同名 unit 取优先级最高的那一份**（不是合并）。实测两份同名文件的 `FragmentPath` 指向 `/etc/systemd/system/...`，`systemctl cat` 只列出生效的那一份。
+> - **`/etc/systemd/system` 也高于 `/run/systemd/system`**（实测把同名文件放进 `/run` 后 `FragmentPath` 不变）；「`/run` 是运行时目录所以优先级最高」是错的。
 > - drop-in 是在**同一份** unit 上做增量覆盖：同名键被后出现的覆盖、新键被追加，`systemctl cat` 会按文件列出全部来源。
 > - 验证：`systemctl show -p FragmentPath -p DropInPaths <unit>`。
 > - **第一反应不要是什么**：不要用「看到文件里有这行」判断生效——要 `systemctl cat` 看完整生效内容。
