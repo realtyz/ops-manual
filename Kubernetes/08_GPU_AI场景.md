@@ -27,7 +27,7 @@ created: 2026-09-13
 > - **GPU 监控别只看利用率**：DCGM Exporter 的 `DCGM_FI_DEV_GPU_UTIL`、`FB_USED`、`GPU_TEMP`、`POWER_USAGE`、`XID_ERRORS` 要一起看；**XID 错误与温度/ECC 才是硬件故障的第一现场**。
 
 > [!tip] 怎么用这篇笔记
-> 首学按 1→2→3→4→5 的顺序读；如果时间紧，至少把第 0、1、2 节读懂——面试和设计题绝大多数问题都落在这里。
+> 首学按 1→2→3→4→5 的顺序读；如果时间紧，至少把第 0、1、2 节读懂——现场和设计题绝大多数问题都落在这里。
 > 第 1.1 节的 Device Plugin 机制建议自己在一个单机集群上装一次 NVIDIA device plugin，亲眼看到 `nvidia.com/gpu` 出现在 Node 的 allocatable 里。
 
 ## 1. GPU 如何变成可调度资源
@@ -446,9 +446,9 @@ DCGM Exporter 以 DaemonSet 形式跑在每个 GPU 节点上，把 DCGM 采集�
 - 定期输出"GPU 利用率分布 + 排队时长 + 闲置卡"报告，用数据驱动扩容与回收；
 - 开发/测试环境的 GPU 用队列与自动回收（夜间缩容）控制成本。
 
-### 6.5 面试 / 设计题怎么讲：把 CUDA、RDMA 与 K8s 串成一条线
+### 6.5 现场 / 设计题怎么讲：把 CUDA、RDMA 与 K8s 串成一条线
 
-一个能让面试官记住的版本是（30 秒讲完主干，再按追问展开）：
+一个能让听众记住的版本是（30 秒讲完主干，再按追问展开）：
 
 1. **资源可见性**：GPU 通过 device plugin 上报成扩展资源 `nvidia.com/gpu`，调度器按 requests 分配，kubelet 建容器时调 `Allocate` 把设备注入（新方向是 DRA，1.35 起稳定）；
 2. **放置质量**：节点内用 `nvidia-smi topo -m` 看清 NVLink/PCIe/NUMA，用 Topology Manager + CPU Manager + 支持 `TopologyInfo` 的 device plugin 把 GPU、CPU、网卡对齐到同一 NUMA；
@@ -517,7 +517,7 @@ DCGM Exporter 以 DaemonSet 形式跑在每个 GPU 节点上，把 DCGM 采集�
 - [ ] 能解释 gang 调度为什么是分布式训练的必需品，并对比 Volcano 与 Kueue
 - [ ] 能画出"默认 CNI + Multus + SR-IOV + RDMA CNI"的两张网卡架构，并知道 RDMA 要单独验证
 - [ ] 能说出 DCGM 的关键指标与告警项，以及时间切片下的归因限制
-- [ ] 能把 CUDA / RDMA / 调度 / 可观测串成一段完整叙述，用于面试或方案评审
+- [ ] 能把 CUDA / RDMA / 调度 / 可观测串成一段完整叙述，用于现场或方案评审
 
 > 推荐扩展阅读：Kubernetes 官方文档中的 [Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)、[Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)、[Manage Resources for Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)（扩展资源）、[Resource Quotas](https://kubernetes.io/docs/concepts/policy/resource-quotas/)（`requests.nvidia.com/gpu`）、[Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/) 与 [RuntimeClass](https://kubernetes.io/docs/concepts/containers/runtime-class/)。
 >
