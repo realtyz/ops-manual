@@ -295,4 +295,3 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 - `man 1 systemctl`、`man 1 systemd-analyze`：动作语义与 `verify`/`exit-status`/`cat-config`/`calendar`/`critical-chain`。
 - 内核文档 `Documentation/admin-guide/cgroup-v2.rst`：资源控制器接口文件的语义。
 
-上一篇：约束与隔离 ｜ 下一篇：观测与基线

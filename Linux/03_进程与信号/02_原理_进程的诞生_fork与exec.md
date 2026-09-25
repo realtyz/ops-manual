@@ -188,4 +188,3 @@ flowchart TD
 - `man 2 setrlimit`、`man 5 proc_pid_limits`：`RLIMIT_NPROC`/`RLIMIT_AS`/`RLIMIT_DATA` 的口径。
 - 本节引用的 man 页与内核文档按**与目标机器同一主版本（当前基线 6.x）**取；路径与语义在版本间会变，所以凡涉及默认值与版本门控，以现场 `man`、`sysctl`、`systemctl show` 的实际输出为准。
 
-上一篇：进程与线程 ｜ 下一篇：信号与优雅退出

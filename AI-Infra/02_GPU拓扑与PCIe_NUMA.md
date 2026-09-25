@@ -405,7 +405,7 @@ FM 的职责（官方原文归纳）：配置 NVSwitch 端口路由、设置 GPU
 
 主机侧做完上面这些，只是把"事实"准备好了；能不能让任务落到正确的位置，还要看编排层。两者的关系是**单向供给**：Device Plugin 通过 TopologyInfo 的 `NUMANode` 字段把"这张卡挂在哪个 NUMA"告诉 kubelet，kubelet 的 Topology Manager 才有依据做对齐——**而它报出的那个 NUMANode，源头就是本文 1.5 里读的那个 `numa_node`**。
 
-调度侧的策略、`topologyManagerScope`、CPU Manager `static`、Memory Manager、以及 Kueue/Volcano 的拓扑感知调度，见 [[Kubernetes/08_GPU_AI场景|08_GPU_AI场景]]；本文不重复。这里只强调一句：
+调度侧的策略、`topologyManagerScope`、CPU Manager `static`、Memory Manager、以及 Kueue/Volcano 的拓扑感知调度，见 `Kubernetes/` 的 GPU / AI 编排章；本文不重复。这里只强调一句：
 
 > [!important] 主机侧拓扑信息不准，调度层再"拓扑感知"也是错的
 > 如果 BIOS/BMC 报的 `_PXM` 有误（见 1.5 里对 `numa_node` 的说明），Topology Manager 拿到的 hint 就是错的，最终表现是「策略配置看起来完全正确，但 Pod 就是被放到了跨 NUMA 的位置」。**排查顺序永远是先从主机侧取证，再怀疑调度器。**

@@ -107,4 +107,3 @@ created: 2026-09-20
 - `man 2 madvise`：`MADV_HUGEPAGE`、`MADV_NOHUGEPAGE`、`MADV_COLLAPSE` 等提示的语义。
 - 处理器厂商手册中关于大页（2 MiB/1 GiB 页）与 TLB 层级的章节：大页尺寸与 TLB 覆盖量级属于文档值，随型号变化。
 
-上一篇：缺页与写时复制 ｜ 下一篇：一次内存分配的旅程
