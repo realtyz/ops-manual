@@ -17,11 +17,11 @@ created: 2026-09-26
 
 ### 1.1 生效配置的三个来源与它们的优先级
 
-| 来源 | 位置（系统单元） | 特点 |
+| 来源 | 它在系统单元下的位置 | 它的特点 |
 | --- | --- | --- |
-| 管理员配置 | `/etc/systemd/system/` | 优先级最高的常规位置；本地改动都在这里 |
-| 运行时配置 | `/run/systemd/system/` | **优先级低于 `/etc`**；重启即消失，适合临时覆盖与生成物 |
-| 发行版自带 | `/usr/lib/systemd/system/` | 软件包安装的原始文件，升级会被覆盖，不要直接改 |
+| 管理员配置 | `/etc/systemd/system/` | 它是优先级最高的常规位置，因此本地改动都应当放在这里 |
+| 运行时配置 | `/run/systemd/system/` | 它的**优先级低于 `/etc`**，而且重启即消失，因此适合放临时覆盖与生成物 |
+| 发行版自带 | `/usr/lib/systemd/system/` | 它是软件包安装的原始文件，升级时会被覆盖，因此不要直接改 |
 
 drop-in 是另一条线：`/etc/systemd/system/<unit>.d/*.conf`，同名键覆盖、新键追加，按文件名排序生效。它和同名文件覆盖是两种不同的机制——**同名取一份，drop-in 做叠加**。
 
@@ -31,11 +31,11 @@ drop-in 是另一条线：`/etc/systemd/system/<unit>.d/*.conf`，同名键覆�
 
 unit 文件分小节，写错小节是被静默忽略的头号原因：
 
-| 小节 | 放什么 | 典型键 |
+| 小节 | 它放什么 | 典型键 |
 | --- | --- | --- |
-| `[Unit]` | 与其它单元的关系、启动限流、条件 | `Description=`、`Wants=`/`Requires=`、`After=`/`Before=`、`StartLimitIntervalSec=`、`StartLimitBurst=` |
-| `[Service]` | 这个服务本身怎么跑 | `Type=`、`ExecStart=`、`Environment=`、`Restart=`、`Limit*=`/`MemoryMax=`/`CPUQuota=`、沙箱项 |
-| `[Install]` | 只在 `enable`/`disable` 时读 | `WantedBy=`、`RequiredBy=`、`Alias=`、`Also=` |
+| `[Unit]` | 它放与其它单元的关系、启动限流与条件 | `Description=`、`Wants=`/`Requires=`、`After=`/`Before=`、`StartLimitIntervalSec=`、`StartLimitBurst=` |
+| `[Service]` | 它放这个服务本身怎么跑 | `Type=`、`ExecStart=`、`Environment=`、`Restart=`、`Limit*=`/`MemoryMax=`/`CPUQuota=`、沙箱项 |
+| `[Install]` | 它只在执行 `enable`/`disable` 时被读取 | `WantedBy=`、`RequiredBy=`、`Alias=`、`Also=` |
 
 「找不到键」的后果分两档：结构性错误会让 `systemd-analyze verify` 报错并非零退出；**键名拼错或写错小节只打印一行 `ignoring` 提示，退出码仍是 0，配置被静静丢弃**。这就是为什么 verify 要读输出而不是读退出码。
 
@@ -43,10 +43,10 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 
 ### 1.3 装载之后的两种「刷新」
 
-| 动作 | 做了什么 | 做成之后 |
+| 动作 | 它做了什么 | 做成之后 |
 | --- | --- | --- |
-| `daemon-reload` | PID 1 重读全部 unit 与 drop-in、重跑 generator、重建依赖图 | manager 的认知更新；**运行中的进程毫无变化** |
-| `daemon-reexec` | PID 1 重新执行自身，重读 manager 自身的配置 | manager 的配置更新；**unit 文件不重读** |
+| `daemon-reload` | 它让 PID 1 重读全部 unit 与 drop-in、重跑 generator 并重建依赖图 | manager 的认知随之更新，而**运行中的进程毫无变化** |
+| `daemon-reexec` | 它让 PID 1 重新执行自身，因此 manager 自身的配置被重读 | manager 的配置随之更新，而 **unit 文件不会被重读** |
 
 ## 二、编队：它被放进一个事务里
 
@@ -54,20 +54,20 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 
 编队要同时回答两个问题，写配置时必须分别回答：
 
-- **要不要拉起对方**：`Wants=`（尽力，失败不牵连自己）、`Requires=`（强关联，对方停/重启会带上自己，配合排序时对方启动失败会阻止自己）、`Requisite=`（只要求在跑，不拉起）、`BindsTo=`（对方消失自己也停）；
-- **谁先谁后**：`After=`/`Before=`，只排序，不产生依赖。
+- **要不要拉起对方**：`Wants=` 会尽力拉起对方，而对方的失败不牵连自己；`Requires=` 是强关联，对方停止或重启会带上自己，并且配合排序时对方的启动失败会阻止自己；`Requisite=` 只要求对方已经在运行，自己不拉起它；`BindsTo=` 会在对方消失时让自己也停；
+- **谁先谁后**：`After=` 与 `Before=` 只表达顺序，因此不产生依赖。
 
-两层之外还有两个方向性容易搞错的键：`PartOf=` 表达「**对方**启停时带上**我**」（方向与依赖相反，且不拉起对方），`Conflicts=` 表达互斥（不是顺序）。此外 `Condition...=` 不满足时单元被**跳过**——跳过不是失败，`status` 与 `--failed` 都不把它算作故障。
+两层之外还有两个方向性容易搞错的键：`PartOf=` 表达「**对方**启停时带上**我**」，它的方向与依赖相反，并且不拉起对方；`Conflicts=` 表达互斥，因此它不是顺序。此外 `Condition...=` 不满足时单元会被**跳过**——跳过不是失败，因此 `status` 与 `--failed` 都不把它算作故障。
 
-缺省还有一层保底：普通 service 单元的 `DefaultDependencies=yes` 会自动补上「挂在 `sysinit.target`/`basic.target` 之下、与 `shutdown.target` 冲突、排在 `systemd-journald.socket` 与 `system.slice` 之后」。这层保底解释了为什么最简单的单元也能正确参与开机与关机。关掉它（`DefaultDependencies=no`）只适合必须在 `sysinit.target` 之前完成的早期单元。
+缺省还有一组默认依赖与排序：普通 service 单元的 `DefaultDependencies=yes` 会自动补上「挂在 `sysinit.target`/`basic.target` 之下、与 `shutdown.target` 冲突、排在 `systemd-journald.socket` 与 `system.slice` 之后」。这组默认值解释了为什么最简单的单元也能正确参与开机与关机。若把它关掉（`DefaultDependencies=no`），就只剩「必须在 `sysinit.target` 之前完成的早期单元」这一个适用场景。
 
-**编队阶段的证据**：`systemctl show -p Requires -p Wants -p After -p Before` 读关系，`list-dependencies [--reverse]` 读树（注意符号只表示当前激活状态，`oneshot` 跑完显示 `○` 是正常的），实际时序只能用 `journalctl -u A -u B -o short-precise` 的微秒级时间戳核实。
+**编队阶段的证据从三个入口读**：`systemctl show -p Requires -p Wants -p After -p Before` 给出关系，`list-dependencies [--reverse]` 给出树（注意符号只表示当前激活状态，`oneshot` 跑完显示 `○` 是正常的），而实际时序只能用 `journalctl -u A -u B -o short-precise` 的微秒级时间戳核实。
 
 ### 2.1 编队阶段的坑：把「启动动作完成」当成「已就绪」
 
-`After=B` 等到的时刻取决于 **B 的 `Type=`**：`simple` 等到 `fork` 出来、`exec` 等到 `execve` 成功、`forking` 等到父进程退出、`notify` 等到 `READY=1`、`oneshot` 等到脚本结束。因此「依赖写了、顺序也写了」仍可能连不上对方。
+`After=B` 等到的时刻取决于 **B 的 `Type=`**：若 B 是 `simple`，它就等到 B 的进程被 `fork` 出来；若是 `exec`，它就等到 `execve` 成功；若是 `forking`，它就等到父进程退出；若是 `notify`，它就等到 `READY=1`；若是 `oneshot`，它就等到脚本结束。因此「依赖写了、顺序也写了」仍可能连不上对方。
 
-三种正解按优先级：等一个真正代表就绪的目标（`notify`、或带实际判据的 `network-online.target`）；在 `ExecStartPre=` 里做带重试与超时的探测（注意它返回非 0 会让整个启动失败）；应用自己重试（`Restart=on-failure` + `RestartSec=`）。**不要用 `sleep`**——它把确定性等待换成赌博。
+三种正解按优先级排列：第一种是等一个真正代表就绪的目标，例如让 B 写成 `notify`，或等一个带实际判据的 `network-online.target`；第二种是在 `ExecStartPre=` 里做带重试与超时的探测，但要注意它返回非 0 会让整个启动失败；第三种是让应用自己重试，用 `Restart=on-failure` 与 `RestartSec=` 让它自己重连。**不要用 `sleep` 掩盖依赖未就绪**：它并不等待任何就绪信号，只是让启动固定延迟一段时间，而这段时间在负载高时不够长、在负载低时又是白等。
 
 ## 三、判定：什么算启动完成
 
@@ -75,16 +75,16 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 
 ### 3.1 `Type=` 决定判定点
 
-| `Type=` | 何时算完成 | 常见误用 |
+| `Type=` | 它何时算完成 | 常见误用 |
 | --- | --- | --- |
-| `simple` | 主进程被 `fork` 出来（缺省） | 配给会自行后台化的程序 → 立刻 `inactive (dead)` |
-| `exec` | 二进制真正 `execve` 成功 | ——（长跑服务推荐） |
-| `forking` | 父进程退出、子进程留下 | 配给不 `fork` 的程序 → 等到超时 |
-| `oneshot` | 命令跑完且退出码 0 | 忘记 `RemainAfterExit=`，或以为它会超时 |
-| `notify` | 收到有资格的 `READY=1` | 通知由子进程或包装器发出 → 归属被拒 |
-| `notify-reload` | 同 `notify`，重载另报 | （systemd ≥ 253） |
-| `dbus` | 取得 `BusName=` | 总线策略未放行 |
-| `idle` | 其它启动任务跑完之后 | —— |
+| `simple` | 它等到主进程被 `fork` 出来就算完成，这也是缺省值 | 若把它配给会自行后台化的程序，服务会立刻变成 `inactive (dead)` |
+| `exec` | 它等到二进制真正 `execve` 成功 | 它没有常见误用，因此长跑服务推荐用它 |
+| `forking` | 它等到父进程退出、子进程留下 | 若把它配给不会 `fork` 的程序，启动会一直等到超时 |
+| `oneshot` | 它等到命令跑完且退出码为 0 | 忘记写 `RemainAfterExit=`，或者以为它也会超时 |
+| `notify` | 它等到收到有资格的 `READY=1` | 若通知由子进程或包装器发出，通知的归属就会被拒 |
+| `notify-reload` | 它同 `notify` 一样等 `READY=1`，重载另外报告 | 它需要 systemd ≥ 253 |
+| `dbus` | 它等到单元取得 `BusName=` 指定的名字 | 若总线策略未放行，它就取不到这个名字 |
+| `idle` | 它等到其它启动任务都跑完之后才执行 | 它没有常见误用 |
 
 三处细节：`Type=oneshot` 的启动超时缺省是 `infinity`（卡住时永远停在 `activating`）；`oneshot` 允许写多条 `ExecStart=`，其他类型不允许，且 `Restart=always`/`on-success` 对 `oneshot` 不被接受；需要「跑完仍保持 active」时用 `RemainAfterExit=yes`，状态变成 `active (exited)`。
 
@@ -96,16 +96,16 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 
 ### 3.3 判定失败的两种形态
 
-- **进程侧的失败**：主命令返回非 0，或以信号结束 → `Result=exit-code`/`signal`，`ExecMainStatus` 是进程自己的码。
-- **systemd 侧的失败**：它没能按你写的样子把服务起起来 → `Result=exit-code` 而 `ExecMainStatus` 落在 200 段（`200/CHDIR`、`203/EXEC`、`216/GROUP`、`217/USER`、`226/NAMESPACE`…），此时 **`ExecMainStatus` 是 systemd 自报的，不是应用的**。判断依据是 `systemd-analyze exit-status <码>` 给出的 `CLASS`。
+- **进程侧的失败**：若主命令返回非 0 或以信号结束，则 `Result` 是 `exit-code` 或 `signal`，而 `ExecMainStatus` 是进程自己的码。
+- **systemd 侧的失败**：若 systemd 没能按你写的样子把服务起起来，则 `Result=exit-code` 而 `ExecMainStatus` 落在 200 段（`200/CHDIR`、`203/EXEC`、`216/GROUP`、`217/USER`、`226/NAMESPACE`…），此时 **`ExecMainStatus` 是 systemd 自报的，不是应用的**。判断依据是 `systemd-analyze exit-status <码>` 给出的 `CLASS`。
 
-还有一类特殊失败：`ExecStartPre=` 失败也会让启动失败；`EnvironmentFile=` 指向的文件缺失且没写前导 `-` 时，失败发生在更早的位置，`Result=resources` 而 `ExecMainStatus=0`——**进程根本没进入 `ExecStart`**。
+还有一类特殊失败：`ExecStartPre=` 失败也会让启动失败；而 `EnvironmentFile=` 指向的文件缺失且没写前导 `-` 时，失败发生在更早的位置，`Result=resources` 而 `ExecMainStatus=0`——**进程根本没有进入 `ExecStart`**。
 
-**判定阶段的证据**：`show -p Type -p NotifyAccess -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p MainPID -p TimeoutStartUSec`。
+**判定阶段要读的证据都在这一组属性里**：`show -p Type -p NotifyAccess -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p MainPID -p TimeoutStartUSec`。
 
-## 四、约束与隔离：把它关进笼子，换个视野
+## 四、约束与隔离：限定它能消耗多少，并改变它看到的世界
 
-### 4.1 cgroup：账本与上限的落点
+### 4.1 cgroup：上限与计数字段的落点
 
 每个服务在启动时获得一个 cgroup 节点：系统单元在 `/system.slice/<unit>`，用户单元在 `user.slice/user-<uid>.slice/user@<uid>.service/app.slice/<unit>`（用户单元缺省 `Slice=app.slice`）。unit 与 slice 都能挂上限，**子节点仍受父节点约束**，所以「上限没生效」的排查要看整棵树。
 
@@ -120,9 +120,9 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 | CPU 配额 | `CPUQuota=` | `cpu.max`（`quota period`） |
 | CPU 权重 | `CPUWeight=` | `cpu.weight` |
 
-三条读数纪律：**`show` 是 systemd 视图、cgroup 文件是内核事实，两者都要看**；计数类文件（`memory.events`、`cpu.stat`）必须取差值；cgroup 目录随单元结束被回收，**账本只在存活期间存在**。
+三条读数纪律：**`show` 给出的是 systemd 视图，cgroup 文件给出的是内核事实，两者都要看**；计数类文件（`memory.events`、`cpu.stat`）必须取差值；cgroup 目录随单元结束被回收，因此**这些计数字段只在单元存活期间存在**。
 
-内存撞限的定性有独立证据：内核日志的 `constraint=CONSTRAINT_MEMCG` 与 `oom_memcg=<路径>`、单元的 `Result=oom-kill`、`ExecMainStatus=9`。这与「整机内存不足」是两码事。还有一条容易漏的：服务单元的 `OOMPolicy=` 缺省是 `stop`——单元内进程被杀会把整个单元停掉，账本随之消失；设成 `continue` 时单元继续运行，**「少了几个 worker」只能从 `memory.events` 的 `oom_kill` 看出来**。
+内存撞限的定性有独立证据：内核日志的 `constraint=CONSTRAINT_MEMCG` 与 `oom_memcg=<路径>`、单元的 `Result=oom-kill`、`ExecMainStatus=9`。它与「整机内存不足」的判定依据不同，因为撞的是它自己那一格的上限。还有一条容易漏的：服务单元的 `OOMPolicy=` 缺省是 `stop`，因此单元内进程被杀会把整个单元停掉，这些计数字段随之消失；设成 `continue` 时单元继续运行，而**「少了几个 worker」只能从 `memory.events` 的 `oom_kill` 看出来**。
 
 ### 4.2 沙箱：改变服务看到的世界
 
@@ -157,32 +157,32 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 
 `timedatectl` 的两行要分开看：`NTP service: active` 只说客户端在跑，`System clock synchronized` 才是「时间准了」。更细的证据是 `timedatectl timesync-status` 的 `Packet count` 与 `Offset`。同一台机器上只应有一个 NTP 客户端（Ubuntu 缺省 `systemd-timesyncd`，RHEL 系缺省 `chrony`）；两个同时跑会互相打架。`journalctl` 按本地时区显示，跨机对账统一换算成 UTC。
 
-### 5.3 旁挂的 unit：定时与临时文件
+### 5.3 由 timer 与 tmpfiles 维护的 unit：定时与临时文件
 
 运行期还有两类不常驻但同样属于「unit 的一生」的对象：
 
-- **`.timer` 与 `.service` 配对**：timer 触发，真正干活的是它触发的 service——**查日志要去那个 service**。`OnCalendar=` 的表达式用 `systemd-analyze calendar` 离线验证（注意按本机时区解释）；`OnBootSec=`/`OnUnitActiveSec=` 是相对式，会随开机时刻漂移；`AccuracySec=` 允许抖动（缺省 1 分钟）；`Persistent=` 让关机期间错过的日历式触发在开机后补跑一次，时间戳落在 `/var/lib/systemd/timers/`——**卸载 timer 前先 `systemctl clean --what=state`**，否则下次启用可能立刻补跑，看起来像「任务莫名跑两次」。
-- **tmpfiles 与目录托管**：`tmpfiles.d` 规则声明「怎么维护这些易失路径」，`systemd-tmpfiles-clean.timer` 负责按节奏执行（缺省开机 15 分钟后第一次、之后每 24 小时）。`age` 的缺省判据是**多个时间戳里任一较新就不清**，所以要精确控制得写前缀（如 `m:30d`）。服务自己的数据不该放在 `/tmp`：跨重启用 `StateDirectory=`、运行期共享用 `RuntimeDirectory=`、日志与缓存各有对应选项，由 systemd 建、也由 `systemctl clean` 收（**该动作会删掉这些目录里的数据，属于破坏性操作**，只在可快照的实验机上先演练）。
+- **`.timer` 与 `.service` 配对**：timer 只负责触发，真正干活的是它触发的那一个 service，因此**查日志要去那个 service**。`OnCalendar=` 的表达式用 `systemd-analyze calendar` 离线验证，但要注意它按本机时区解释；`OnBootSec=` 与 `OnUnitActiveSec=` 是相对式，会随开机时刻漂移；`AccuracySec=` 允许触发时间抖动，缺省 1 分钟；`Persistent=` 让关机期间错过的日历式触发在开机后补跑一次，它的时间戳落在 `/var/lib/systemd/timers/`，因此**卸载 timer 前先执行 `systemctl clean --what=state`**，否则下次启用可能立刻补跑，看起来像「任务莫名跑两次」。
+- **tmpfiles 与目录托管**：`tmpfiles.d` 的规则声明「这些易失路径怎么维护」，而 `systemd-tmpfiles-clean.timer` 负责按节奏执行它，缺省是开机 15 分钟后第一次、之后每 24 小时。`age` 的缺省判据是**多个时间戳里任一较新就不清**，因此要精确控制得写前缀（如 `m:30d`）。服务自己的数据不该放在 `/tmp`：跨重启用 `StateDirectory=`，运行期共享用 `RuntimeDirectory=`，日志与缓存各有对应选项，这些目录由 systemd 建、也由 `systemctl clean` 收（**该动作会删掉这些目录里的数据，属于破坏性操作**，只在可快照的实验机上先演练）。
 
 ## 六、退场与重来：怎么结束、要不要再来
 
-### 6.1 停止流程是「先礼后兵」
+### 6.1 停止流程先请求进程自己退出，超时之后才强制结束
 
-一次 `stop` 的顺序是：执行 `ExecStop=`（如果写了）→ 向控制组发 `KillSignal=`（缺省 SIGTERM，即 15 号信号，请进程自己收尾）→ 等待 `TimeoutStopSec=`（缺省 `1min 30s`）→ 仍未退出就补 SIGKILL（9 号信号，进程无法捕获或忽略；由 `SendSIGKILL=yes` 控制，缺省开启）→ 执行 `ExecStopPost=`。**`ExecStop=` 不会取消默认的信号行为**；需要「无论怎么退出都要跑」的收尾（清 pid、回收临时目录）应该写在 `ExecStopPost=`，因为 `ExecStop=` 在启动失败或被 SIGKILL 时不会执行。
+一次 `stop` 依次做五件事：先执行 `ExecStop=`（如果单元写了它），再向控制组发送 `KillSignal=`（缺省是 SIGTERM，即 15 号信号，请进程自己收尾），然后等待 `TimeoutStopSec=`（缺省 `1min 30s`），若仍未退出就补发 SIGKILL（9 号信号，进程无法捕获或忽略；由 `SendSIGKILL=yes` 控制，缺省开启），最后执行 `ExecStopPost=`。**`ExecStop=` 不会取消默认的信号行为**；需要「无论怎么退出都要跑」的收尾（清 pid、回收临时目录）应该写在 `ExecStopPost=`，因为 `ExecStop=` 在启动失败或被 SIGKILL 时不会执行。
 
-**判据**：一次 `stop` 的实际耗时接近 `TimeoutStopSec=`，就说明应用没在窗口内响应 SIGTERM——这正是「关机卡在 `A stop job is running`」的来源。处置是让应用优雅退出，或把超时调到略大于真实收尾时间（保留 SIGKILL 兜底）；**不要改成 `KillMode=none`**。
+**判据**：若一次 `stop` 的实际耗时接近 `TimeoutStopSec=`，就说明应用没在窗口内响应 SIGTERM——这正是「关机卡在 `A stop job is running`」的来源。处置是让应用优雅退出，或把超时调到略大于真实收尾时间，并把 `SendSIGKILL=yes` 留在原位作为超时之后强制结束的回退路径；**不要改成 `KillMode=none`**。
 
 `KillMode=` 决定杀谁：`control-group`（缺省）收掉整个控制组，不留孤儿；`mixed` 对主进程用 SIGTERM、其余用 SIGKILL；`process` 只杀主进程（子进程会变成 `PPID=1` 的孤儿，而单元看起来「干净」）；`none` 只执行 `ExecStop=`。发行版里有不少单元显式写 `KillMode=process`，看到它要分清是文件里的还是缺省值。
 
 ### 6.2 退出定性
 
-| 结局 | `Result=` | 影响 |
+| 结局 | `Result=` | 它的影响 |
 | --- | --- | --- |
-| 退出码 0 | `success` | 不触发 `on-failure` |
-| 退出码非 0 | `exit-code` | 触发 `on-failure` |
-| 被信号杀死 | `signal` | 触发 `on-failure`；`ExecMainStatus` 是信号号 |
-| 启动/停止/重载超时 | `timeout` | 单元进 `failed` |
-| 被 cgroup OOM 杀 | `oom-kill` | `ExecMainStatus=9` |
+| 退出码为 0 | `success` | 它不触发 `on-failure` |
+| 退出码非 0 | `exit-code` | 它触发 `on-failure` |
+| 进程被信号杀死 | `signal` | 它触发 `on-failure`，并且 `ExecMainStatus` 是信号号 |
+| 启动、停止或重载超时 | `timeout` | 单元因此进入 `failed` |
+| 进程被 cgroup OOM 杀死 | `oom-kill` | 它的 `ExecMainStatus` 是 `9` |
 
 三个改判开关：`SuccessExitStatus=`（把某些退出码/信号改判为成功）、`RestartPreventExitStatus=`（指定码不触发重启）、`RestartForceExitStatus=`（指定码强制重启）。
 
@@ -198,62 +198,62 @@ unit 文件分小节，写错小节是被静默忽略的头号原因：
 
 `[Install]` 只在 `enable`/`disable` 时被读：`WantedBy=multi-user.target` 的含义是「该 target 被拉起时也希望拉起我」，`enable` 把这句话落成 `/etc/systemd/system/multi-user.target.wants/<unit>` 的软链。`.timer`/`.socket` 对应落在 `timers.target.wants/`、`sockets.target.wants/`。
 
-三处必须分清：**`enable` 不启动服务**（要立刻启动加 `--now`）；**`disable` 只删软链、不停止进程**，而且服务仍可被手动 `start`、被别的单元 `Wants=` 拉起、被触发器拉起；**`mask` 才是「不许启动」**——它借用同名覆盖机制，因此单元文件本身就在 `/etc/systemd/system/` 时 `mask` 会失败（文件已在那），并且被 `.socket`/`.path`/`.timer` 触发的服务在 `mask` 之后触发链仍在（systemd 会明确提示触发单元仍 active，端口还在听、连接被推给一个起不来的服务）。
+三处必须分清：**`enable` 不启动服务**（要立刻启动加 `--now`）；**`disable` 只删软链、不停止进程**，而且服务仍可被手动 `start`、被别的单元 `Wants=` 拉起、被触发器拉起；**`mask` 才是「不许启动」**——它借用同名覆盖机制，因此单元文件本身就在 `/etc/systemd/system/` 时 `mask` 会失败（文件已在那），并且被 `.socket`/`.path`/`.timer` 触发的服务在 `mask` 之后仍然会被触发（systemd 会明确提示触发单元仍 active，端口还在听，连接被推给一个起不来的服务）。
 
 **没有 `[Install]` 的单元是 `static`**，`enable` 会被直接拒绝并说明原因（它不是设计来被启停的，只能靠依赖或触发器参与）。
 
 ### 7.2 target 与启动路径
 
-`default.target` 是开机默认到达的目标，本机实测是 `graphical.target` 而不是常说的 `multi-user.target`——但 `multi-user.target` 是它的依赖之一，所以 `WantedBy=multi-user.target` 的单元照样参与开机。判断「一个单元会不会开机自启」，顺序是：有没有 `[Install]` → 它 `WantedBy=` 的 target 在不在启动路径（`list-dependencies <target>`）→ 是否有 `Condition...=` 把它跳过 → `is-enabled` 与 `list-unit-files` 的 `STATE`/`PRESET`。发行版对「新装包默认是否 enable」的规定由 preset 文件给出，这解释了「装完软件包有的服务自己就起来了」。`systemctl isolate` 会立刻切换并停掉不在目标里的服务，**属于高危动作**。
+`default.target` 是开机默认到达的目标，本机实测是 `graphical.target` 而不是常说的 `multi-user.target`——但 `multi-user.target` 是它的依赖之一，所以 `WantedBy=multi-user.target` 的单元照样参与开机。判断「一个单元会不会开机自启」，顺序是：先看它有没有 `[Install]`，再看它 `WantedBy=` 的那个 target 在不在启动路径上（用 `list-dependencies <target>`），然后看有没有 `Condition...=` 把它跳过，最后用 `is-enabled` 与 `list-unit-files` 的 `STATE`/`PRESET` 互相印证。发行版对「新装包默认是否 enable」的规定由 preset 文件给出，这解释了「装完软件包有的服务自己就起来了」。`systemctl isolate` 会立刻切换并停掉不在目标里的服务，因此**属于高危动作**。
 
-## 八、四条横切线
+## 八、四个跨阶段的核对对象
 
-七站是时间线，另外四件事横穿多站，把它们串起来才能形成判断力。
+前面七节按时间顺序讲的是一个 unit 的七个阶段；下面四项各自贯穿其中多个阶段，因此把它们串起来才能形成判断力。每一项都写明它贯穿哪几个阶段，以及在每一处读什么字段。
 
-### 8.1 生效链：文件 → manager → 进程
+### 8.1 配置的生效层级：磁盘文件、manager 的认知与进程的实际状态
 
-同一个属性有三个可能的取值，分处三个地方：磁盘上的文件（`cat`）、manager 的认知（`show`）、进程的实际状态（`/proc/<pid>/...`）。**`daemon-reload` 只走第二段，`restart` 才走到第三段**。「改了没生效」的定位树就是沿着这三段往回找：
+同一个属性有三个可能的取值，分处三个地方：磁盘上的文件（用 `systemctl cat` 读）、manager 的认知（用 `show` 读）、进程的实际状态（读 `/proc/<pid>/...`）。**`daemon-reload` 只改动第二处，`restart` 才把第三处一起换掉**。因此「改了没生效」的定位顺序就是沿着这三处往回找：
 
-1. `cat` 与 `FragmentPath`/`DropInPaths`：是不是这个文件、有没有被覆盖；
-2. `verify` 的输出：有没有被静默忽略的键；
-3. `show -p <属性>`：manager 是否更新；
-4. `/proc/<MainPID>/environ`、`/proc/<MainPID>/limits`、`MainPID`：进程是否换过。
+1. 读 `systemctl cat` 与 `show -p FragmentPath -p DropInPaths`，确认改动落在的是不是这个文件，以及有没有被更高优先级的同名文件或 drop-in 覆盖；
+2. 读 `systemd-analyze verify` 的输出，确认没有键被静默忽略；
+3. 读 `show -p <属性>`，确认 manager 是否已经更新到新值；
+4. 读 `/proc/<MainPID>/environ` 与 `/proc/<MainPID>/limits`，并核对 `MainPID` 是否换过，确认新配置有没有真正落到进程上。
 
-### 8.2 判据链：什么算完成、什么算失败
+### 8.2 启动、运行与退出的判据：什么算完成、什么算失败、此刻算什么
 
-`Type=` 管「开始」，`Result` 与退出码管「结束」，`ActiveState`/`SubState` 管「此刻」。三者合起来才能回答「它现在到底算什么」。关键边界是**「没起来」与「没就绪」是两件事**：前者卡在装载、判定或沙箱，后者是 `active (running)` 但依赖未就绪、端口未监听。
+`Type=` 负责回答「开始」，`Result` 与退出码负责回答「结束」，`ActiveState`/`SubState` 负责回答「此刻」，三者合起来才能回答「它现在到底算什么」。这一项的关键边界是**「没起来」与「没就绪」是两件事**：前者卡在装载、判定或沙箱，后者是 `active (running)` 但依赖未就绪、端口未监听。
 
-### 8.3 边界线：上限与视野配在哪一层
+### 8.3 上限与沙箱的作用点：约束配在哪一层
 
-资源上限与沙箱是两件不同的治理动作：**上限管「能消耗多少」**（cgroup 与 rlimit），**沙箱管「能看到什么、能持有什么特权」**。它们都配在 unit 上，但作用点不同：上限在 cgroup 节点上，沙箱在进程的命名空间与凭证上。`User=` 只改身份不收敛特权，是这条线上最常被混淆的一点。
+资源上限与沙箱是两件不同的治理动作：**上限约束的是「能消耗多少」**，它的载体是 cgroup 节点与 rlimit；**沙箱约束的是「能看到什么、能持有什么特权」**，它的载体是进程的命名空间与凭证。两者的配置都写在 unit 上，但作用点不同，因此排查时 `show` 给出的属性和 `/sys/fs/cgroup` 下的内核文件要同时读。`User=` 只改身份而不收敛特权，是这一项上最常被混淆的一点。
 
-### 8.4 留痕线：证据在哪、还能留多久
+### 8.4 证据的落点与时效：证据在哪、还能留多久
 
-`Result`/`NRestarts`/`ExecMainStatus` 会被 `restart` 与 `reset-failed` 覆盖；cgroup 目录随单元结束被回收；未持久化的日志随重启消失；`--vacuum-*` 会删掉历史启动的证据。**这条线的唯一纪律是：先取证，再动手。**
+`Result`/`NRestarts`/`ExecMainStatus` 会被 `restart` 与 `reset-failed` 覆盖，cgroup 目录随单元结束被回收，未持久化的日志随重启消失，而 `--vacuum-*` 会删掉历史启动的记录。因此这一项只有一条纪律：**先取证，再动手。**
 
 ## 九、常见坑
 
 | 常见做法或说法 | 后果或事实 |
 | --- | --- |
-| 改完文件只 `restart` | manager 里还是旧配置；`daemon-reload` 不是重启的替代品 |
-| 只看编辑器的文件就宣布生效 | 生效配置由 `FragmentPath` 与 drop-in 共同决定 |
-| 只跑 `verify` 看退出码 | 被忽略的键退出码仍是 0；要读输出 |
-| 给会自行后台化的程序配 `Type=simple` | 立刻 `inactive (dead)`，后台进程被控制组清掉 |
-| 给不 `fork` 的程序配 `Type=forking` | 等到超时 |
-| 以为日志打印 ready 就是通知 | 通知要 `sd_notify`，且发送者身份要符合 `NotifyAccess=` |
-| 以为 `After=` 保证了对方可用 | 它只等「启动动作完成」，含义随对方 `Type=` 而变 |
-| 只写 `Requires=` 不写 `After=` | 没有顺序，也可能并行 |
-| 在 `limits.conf` 里调服务上限 | 服务不经过登录会话，永远不生效 |
-| 只看 `show -p LimitNOFILE` | 那是硬值；实际可用是软值 |
-| 把 `CPUQuota=` 当绑核 | 它是每周期的算力配额；绑核用 `CPUAffinity=`/`AllowedCPUs=` |
-| 以为 `User=` 收敛了特权 | bounding set 仍是满集、`NoNewPrivileges` 仍是关的 |
-| 以为 `ProtectSystem=strict` 全盘只读 | `/home`/`/root` 归 `ProtectHome=` 管 |
-| 把 `--vacuum-*` 当只读操作 | 它删掉历史启动的证据，不可回滚 |
-| 以为 `stop` 也会触发 `Restart=` | 主动停止不触发；要验证就让它自己失败 |
-| 密集重启后直接调大 `StartLimitBurst=` | 只是让风暴继续；`reset-failed` 也不是修复 |
-| 以为 `disable` 就彻底停用 | 它只删自启软链；彻底停用要 `mask`，还要处理触发器 |
+| 改完文件只 `restart` | manager 里还是旧配置，因为 `daemon-reload` 不是重启的替代品 |
+| 只看编辑器的文件就宣布生效 | 生效配置由 `FragmentPath` 与 drop-in 共同决定，因此编辑器里那一份不等于生效值 |
+| 只跑 `verify` 看退出码 | 被忽略的键不会改变退出码，因此要读它的输出 |
+| 给会自行后台化的程序配 `Type=simple` | 服务会立刻变成 `inactive (dead)`，而留在控制组里的后台进程会被一起清掉 |
+| 给不 `fork` 的程序配 `Type=forking` | 启动会一直等到超时 |
+| 以为日志打印 ready 就是通知 | 通知必须走 `sd_notify`，而且发送者的身份要符合 `NotifyAccess=` 的资格 |
+| 以为 `After=` 保证了对方可用 | 它只等「对方的启动动作完成」，因此这个时刻的含义随对方 `Type=` 而变 |
+| 只写 `Requires=` 不写 `After=` | 两者之间没有顺序，因此仍可能并行启动 |
+| 在 `limits.conf` 里调服务上限 | 服务不经过登录会话，因此这种改法永远不生效 |
+| 只看 `show -p LimitNOFILE` | 那是硬值，因此实际可用要读软值 `LimitNOFILESoft=` 与 `/proc/<pid>/limits` |
+| 把 `CPUQuota=` 当绑核 | 它是每周期的算力配额，因此绑核要用 `CPUAffinity=` 或 `AllowedCPUs=` |
+| 以为 `User=` 收敛了特权 | bounding set 仍是满集，而 `NoNewPrivileges` 仍是关的 |
+| 以为 `ProtectSystem=strict` 全盘只读 | `/home` 与 `/root` 归 `ProtectHome=` 管，因此不写它时它们仍然可写 |
+| 把 `--vacuum-*` 当只读操作 | 它会删掉历史启动的记录，因此不可回滚 |
+| 以为 `stop` 也会触发 `Restart=` | systemd 主动发起的停止不触发它，因此要验证就得让服务自己失败 |
+| 密集重启后直接调大 `StartLimitBurst=` | 那只是让重启风暴继续，而且 `reset-failed` 也不是修复 |
+| 以为 `disable` 就彻底停用 | 它只删自启软链，因此彻底停用要 `mask`，还要处理触发器 |
 | 以为 `mask` 完触发器也停了 | `.socket`/`.path`/`.timer` 仍会活跃并触发它 |
-| 用 `systemctl restart` 当「看一眼」 | 覆盖 `Result`/`NRestarts`/上一进程输出，现场消失 |
+| 用 `systemctl restart` 当「看一眼」 | 它会覆盖 `Result`/`NRestarts` 与上一进程的输出，因此现场随之消失 |
 
 ## 要点自测
 

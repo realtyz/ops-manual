@@ -703,6 +703,6 @@ $ nvidia-smi nvlink -s                        # 逐链路状态（是否有链�
 > - **NCCL 用户指南 · Performance and tuning**：CPU and memory affinity（交集规则、`NCCL_IGNORE_CPU_AFFINITY`、Slurm/MPI 绑定、`ncclTopoGetCpuAffinity` 日志）
 > - **Linux 内核 ABI（sysfs-bus-pci）**：`numa_node` 的语义与写入后果；`drivers/pci/pci-sysfs.c` 中的 `max_link_speed` / `max_link_width` / `current_link_speed` / `current_link_width`
 > - **pciutils**：`lspci -vv` 的 LnkCap / LnkSta 与 `(downgraded)` 标注逻辑（源码 `ls-caps.c`）
-> - **[[00_学习大纲|Linux 大纲]]**：通用主机侧内容（IRQ 亲和、软中断、PCIe 基础）见对应笔记
+> - **[[Linux/00_引言|Linux 引言]]**：通用主机侧内容（IRQ 亲和、软中断、PCIe 基础）见对应笔记
 
 > 下一步：[[03_RDMA与RoCE无损网络]]（本篇讲的是"GPU 与设备在机器内部隔了多远"，下一篇讲"跨机器的那一跳"——RoCE/IB 的无损网络与 GID/优先级映射）。
