@@ -68,6 +68,22 @@ Pod 的状态由三层信息共同描述，它们的粒度与用途不同：
 
 `Ready` 与 `ContainersReady` 的区别是现场最容易用错的一处：前者表示"这个 Pod 可以被放进服务端点集合"，后者表示"容器自身通过了就绪判定"。当 Pod 处于终止过程中，`ContainersReady` 可能仍为真，而 `Ready` 已经为假。
 
+**就绪判定由探针提供**，因此判据必须落到探针字段上。三类探针的声明位置都在容器级（`spec.containers[]` 或 `spec.initContainers[]` 之下），作用与失败后果各不相同：
+
+| 探针字段 | 回答什么 | 关键默认值 | 失败后果 |
+| --- | --- | --- | --- |
+| `startupProbe` | 容器是否已经启动完成 | `periodSeconds` 10 秒、`failureThreshold` 3、`successThreshold` 1 | 连续失败达到阈值即杀掉容器，随后按 Pod 的重启策略处理；它是**只在启动阶段执行**的探针 |
+| `readinessProbe` | 容器是否可以接收流量 | `periodSeconds` 10 秒、`timeoutSeconds` 1 秒、`successThreshold` 1 | 只把容器标记为未就绪，并把实例地址从匹配服务的端点集合里摘除；**容器继续运行，探针继续执行** |
+| `livenessProbe` | 容器是否还活着 | 同就绪探针，另有 `initialDelaySeconds` 0 秒 | 连续失败达到阈值即重启容器；它**不等待就绪探针成功** |
+
+三条判据决定了现场读法：
+
+- **启动探针的预算是 `failureThreshold × periodSeconds`**，超过预算的表现是**容器被杀掉后按重启策略重启**，而不是"就绪失败"。因此它对应的是实例反复重启，方向应查应用启动耗时与预算设置，而不是先改就绪探针。
+- **配置了启动探针时，就绪与存活探针都要等它成功之后才开始执行**。因此"容器启动很慢"这类问题应当用启动探针给预算，而不是把存活探针的 `initialDelaySeconds` 一味调大。
+- **没有声明某一类探针时，该类探针的结果一律按成功处理**；但就绪探针有一个例外：**在初始延迟结束之前，未声明的就绪探针结果按失败处理**。这解释了"没有就绪探针的实例却迟迟不被计入可用"这一类现场，也说明"没有探针就立刻被视为可用"的推断并不完整。
+
+需要自己确认探针是否真的作用到了实例上时，可以取容器状态的等待原因与重启计数：`kubectl get pod <实例> -o jsonpath='{.status.containerStatuses[*].restartCount}{" "}{.status.containerStatuses[*].state.waiting.reason}{"\n"}'`，并在同口径下取两次以区分"一次性"与"持续"。
+
 `PodReadyToStartContainers` 条件在 v1.28 引入（alpha，门控默认关闭）→ v1.29 进入 beta（默认开启）→ v1.37 稳定。它的价值在于把"沙箱与网络已经建好"从"容器已经就绪"里分离出来，因此镜像拉取慢与网络建立慢可以被区分开。
 
 重启策略决定同一个 Pod 里的容器退出后发生什么：
@@ -100,6 +116,7 @@ Pod 的状态由三层信息共同描述，它们的粒度与用途不同：
 | 看什么 | 是什么 | 单位 | 判据 | 与谁同看 | 看到它转向哪一步 |
 | --- | --- | --- | --- | --- | --- |
 | `spec.containers` 与 `spec.initContainers` | 两类容器声明 | 容器数组 | 同一 Pod 内的容器共享网络；端口冲突与卷共享都由这里决定 | 容器级 `restartPolicy` | 出现 `restartPolicy: Always` 的初始化容器 → 它按边车处理 |
+| `spec.containers[].readinessProbe` / `livenessProbe` / `startupProbe` | 三类探针的声明 | 结构体，各自独立 | 未声明即按成功处理（就绪探针在初始延迟前除外）；启动探针的预算是 `failureThreshold × periodSeconds` | 容器状态的等待原因与重启计数 | 实例长期不就绪 → 先确认声明了哪几类探针，再按其失败后果分流 |
 | `status.phase` | 阶段概括 | 枚举 | 五个取值；它只是概括，不等于完整判定 | `conditions[]` 与容器状态 | 阶段与条件矛盾 → 以更细的条件与容器状态为准 |
 | `status.conditions[]` | 带时间戳的判定 | 结构数组 | 看 `type`、`status`、`reason`、`lastTransitionTime` 四项 | 容器状态与事件时间线 | `Ready` 为假而 `ContainersReady` 为真 → 处于终止流程或端点摘除阶段 |
 | `status.containerStatuses[].restartCount` | 单个容器的重启次数 | 计数 | 单调递增；退避重启会让增长间隔变长 | `lastState` 与上一次运行的日志 | 持续增长 → 先取退出码与原因，再看退避间隔 |
