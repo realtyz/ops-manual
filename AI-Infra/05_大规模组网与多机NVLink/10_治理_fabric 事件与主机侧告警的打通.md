@@ -88,7 +88,7 @@ fabric UUID / clique / GPU fabric state / IMEX channel state / node list
 | MNNVL 域不一致 | UUID、clique、状态或 IMEX 通道异常 | 先修域，再启动 MNNVL 作业 |
 | rail 影响面扩大 | 同一 rail 上多节点或多作业异常 | 评估是否隔离该 rail 或相关节点 |
 
-告警阈值的标定与看板组织归可观测性章负责；本篇只规定 fabric 事件必须携带的字段与联动对象。
+本篇只规定 fabric 事件必须携带的字段与联动对象；告警阈值的标定与看板组织不属于本篇负责的内容。
 
 ## 值班处置口径
 

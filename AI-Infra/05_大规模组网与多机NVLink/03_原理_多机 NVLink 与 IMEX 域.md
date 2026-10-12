@@ -72,7 +72,7 @@ MNNVL 1 cliqueId ... cliqueSize ... cliqueRank ... nvlDomainSize ...
 | `cliqueSize` | 当前通信中同 clique 的 rank 数 | 应与预期的 MNNVL 分组一致 |
 | `nvlDomainSize` | 同一 UUID 域内的 rank 数 | 大于 cliqueSize 时说明存在同域但不同 clique 的 rank |
 
-当 MNNVL 能力存在但 IMEX 通道不可用时，NCCL 的告警会指向两类对象：`/dev/nvidia-caps-imex-channels` 与 `nvidia-imex-ctl -N` 一类的 IMEX 配置检查入口。这条告警的价值不是给出最终根因，而是把诊断对象从「网卡」转移到「跨节点内存句柄通道」。
+当 MNNVL 能力存在但 IMEX 通道不可用时，NCCL 的告警会指向两类对象：`/dev/nvidia-caps-imex-channels` 与 `nvidia-imex-ctl` 一类的 IMEX 配置入口。这条告警的价值不是给出最终根因，而是把诊断对象从「网卡」转移到「跨节点内存句柄通道」。
 
 ## MNNVL、RDMA 与 NVLS 的分工
 

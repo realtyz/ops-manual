@@ -126,14 +126,13 @@ perfquery
 
 ## 第五步：核对多机 NVLink 域
 
-对 MNNVL 参与节点，先读 GPU fabric 与域信息。NCCL 的告警会把 IMEX 问题指向 `/dev/nvidia-caps-imex-channels` 与 `nvidia-imex-ctl -N` 一类检查入口：
+对 MNNVL 参与节点，先读 GPU fabric 与域信息。NCCL 的告警会把 IMEX 问题指向 `/dev/nvidia-caps-imex-channels` 与 `nvidia-imex-ctl` 一类 IMEX 配置入口：
 
 ```bash
 nvidia-smi -q
-nvidia-imex-ctl -N
 ```
 
-`nvidia-smi -q` 在支持的机型上会给出 GPU fabric 相关状态；`nvidia-imex-ctl -N` 用于检查 IMEX 通道配置。命令输出形态与平台版本相关，但核对对象不变：
+`nvidia-smi -q` 在支持的机型上会给出 GPU fabric 相关状态；IMEX 通道的检查与配置由 `nvidia-imex-ctl` 承担，其子命令以现场工具版本的帮助信息为准。两类工具的输出形态与平台版本相关，但核对对象不变：
 
 | 对象 | 判据 | 与谁同看 |
 | --- | --- | --- |
