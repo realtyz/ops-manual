@@ -1,98 +1,116 @@
-# 一个 CUDA 进程怎样开始计算
+# 一个 CUDA 进程怎样到达第一次计算
 
-## 先让主机程序装载成功
+一张 GPU 在 `nvidia-smi` 里可见，CUDA 进程仍可能找不到设备。进程也可能顺利选卡，却在第一次使用 Kernel 时失败。以单进程、单张 NVIDIA GPU 和 CUDA 13.2.1 的 API 语义为例，沿库装载、枚举、选卡、装入设备代码和完成计算逐步检查。每一步成功都为下一步建立了不同的条件。
 
-运行 `./vector-check` 时，首先启动的是 Linux 主机进程。它的 CPU 代码需要由 Linux 装载；本例动态链接的 `libcudart.so.12` 等共享库也要找到。若缺少启动必需的共享库，动态装载器就可能在进入应用 `main` 前终止，GPU 尚未接到请求。
+## ELF 进程先装入主机代码
 
-可执行文件中的 `DT_NEEDED` 记录所需共享库名称；`RPATH` / `RUNPATH` 是文件内记录的搜索路径信息，`LD_LIBRARY_PATH` 是启动环境中的搜索目录。它们与动态装载器缓存、默认目录一起影响实际选择。`PATH` 用于 shell 查找命令，改变 `PATH` 不会自动解决共享库搜索。
+对于动态链接的 Linux ELF 程序，动态链接器解析 `DT_NEEDED` 记录的共享库依赖。若程序动态链接 `libcudart`，找不到相应共享库时，应用可能连 `main` 都进不去。静态 Runtime 已编入产物。无论 Runtime 如何链接，进程仍可能在框架导入或初始化 CUDA 时才通过 `dlopen` 装入额外的库。先确定失败发生在进程启动还是某次库调用，取证范围就会不同。主机动态链接器装载的是 ELF 共享库，CUDA 驱动随后装载的 module 包含 GPU 设备代码。 [Linux man-pages · ld.so(8)](https://man7.org/linux/man-pages/man8/ld-linux.8.html) · [dlopen(3)](https://man7.org/linux/man-pages/man3/dlopen.3.html) · [CUDA 13.2.1 · Cubins and Fatbins](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/cuda-platform.html)
 
-在普通 glibc 进程中，对不带斜杠的依赖名，若没有 `DT_RUNPATH`，先考虑 `DT_RPATH`；再考虑 `LD_LIBRARY_PATH`，随后是 `DT_RUNPATH`、装载器缓存与默认目录。带斜杠的依赖、运行中 `dlopen` 的调用环境、安全执行模式和间接依赖还有细节，不能把这一顺序机械套到所有程序。本章的路径推演明确限定无 `DT_RPATH`、无安全执行模式；完整规则见 [Linux man-pages：ld.so 的 DESCRIPTION](https://www.man7.org/linux/man-pages/man8/ld.so.8.html)。
+## 从进程内枚举到上下文建立
 
-ELF 是 Linux 常见的可执行文件与共享对象格式。下面为**自拟、删节的 ELF 元数据教学输出**，只保留当前需要的动态项；它说明本例应用如何找到随包交付的 Runtime：
+`cudaGetDeviceCount` 报告该进程可用的 CUDA 设备数量，先检查它的返回值，再读数量。比如在启动时给 `CUDA_VISIBLE_DEVICES` 赋空值，该进程的可见列表为空，主机的 NVML 查询仍可列出 GPU。给变量提供一组设备也会改变枚举顺序，因此应用里的 `device 0` 只表示可见列表的第一个设备。需要与管理侧对齐时，记录应用取到的 PCI BDF 或 GPU UUID，再和管理工具的字段比较。 [CUDA 13.2.1 · CUDA Environment Variables](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/05-appendices/environment-variables.html) · [Runtime API · Device Management](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__DEVICE.html)
 
-```bash
-readelf -d /opt/apps/vector/bin/vector-check
-```
+在常见的纯 Runtime 程序中，`cudaSetDevice(0)` 为调用它的主机线程选择设备。CUDA 12.0 起，此调用会初始化 Runtime 及选中设备的 primary context。更早的版本会将初始化推迟到后续需要它的调用。primary context 按进程和设备建立。同一进程的不同线程可以使用同一设备的 primary context，内存分配和 Stream 等资源归属于相应的上下文。调用 Driver API 的程序可以显式执行 `cuInit(0)`、`cuDeviceGetCount`、`cuDeviceGet`，然后用 `cuDevicePrimaryCtxRetain` 取得上下文、用 `cuCtxSetCurrent` 将其绑定到当前线程，结束时释放 retain 引用。若混用两套 API，Runtime 可使用该线程已经设为当前的 Driver API 上下文。 [CUDA 13.2.1 · Runtime Initialization](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/intro-to-cuda-cpp.html) · [Driver vs Runtime APIs](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-driver-api/driver-vs-runtime-api.html) · [Driver API Initialization](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-driver-api/group__CUDA__INITIALIZE.html)
 
-```text
-0x0000000000000001 (NEEDED)  Shared library: [libcudart.so.12]
-0x000000000000001d (RUNPATH) Library runpath: [$ORIGIN/../lib]
-```
+## 第一次使用 Kernel 时还要找到设备代码
 
-`$ORIGIN` 在这里由装载器解释为包含该动态项的可执行文件所在目录，因而候选目录为 `/opt/apps/vector/lib/`。输出没有给出驱动库的最终落点。程序或库还可以在运行中通过 `dlopen` 装载其他库，Runtime 访问驱动也不能只看应用的直接 `DT_NEEDED`。要知道本次进程实际使用的路径，需要结合装载调试记录，或在库已装载后查看 `/proc/<PID>/maps`。
+对于本例的预编译程序，驱动从产物中的 fatbin 选取可用 cubin，也可以把兼容的 PTX 即时编译为设备代码。选卡成功说明已能进入该设备的上下文，某个 Kernel 所需的代码可能到第一次使用才装载。CUDA 的 lazy loading 要求 Runtime 11.7 或更新以及 R515 或更新的驱动。Linux 从 CUDA 12.2 开始默认启用，可通过 `CUDA_MODULE_LOADING` 控制。含 managed variables 的 CUDA module 等对象仍可能提前装载。首次报错的位置因此取决于实际调用、模块和装载模式。 [CUDA 13.2.1 · Lazy Loading](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/04-special-topics/lazy-loading.html) · [Cubins and Fatbins](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/cuda-platform.html)
 
-例如，`LD_DEBUG=libs,versions /opt/apps/vector/bin/vector-check` 会在启动应用的同时记录库搜索和版本依赖检查；`/proc/<PID>/maps` 则给出该进程当时已映射文件的路径。前者解释“怎样选到”，后者核对“现在用了谁”。后文的 `loaded.*` 是从这类材料人工汇总的字段；无需读者运行应用来补齐证据。
-
-“库名能找到”之后还要检查它能否满足所需符号和版本。ABI（应用二进制接口）规定已编译代码如何相互调用；相同文件名不是全部 ABI 兼容性的证明。后面的兼容性判断要同时看库来源与应用要求。
-
-## 设备发现与上下文建立
-
-主机程序进入自身逻辑后，才开始选择 GPU。直接使用 Driver API 的程序先用 `cuInit` 初始化接口，再枚举设备，建立或取得上下文；Runtime 路径替应用管理其中一部分工作。**CUDA Context（上下文）**保存进程使用某设备所需的执行状态，关联地址空间、装载代码、内存分配与执行对象等。发现一张 GPU 与建立可用于计算的 Context 是两个阶段。
-
-在本章基线中，`cudaGetDeviceCount` 返回进程能发现的 CUDA 设备数量；设备发现也可能触发驱动或 Runtime 的内部初始化，不能将它理解成只读一个静态列表。随后 `cudaSetDevice(0)` 为当前主机线程选择进程可见的设备 0。在 **CUDA 12.0 及以后**，`cudaSetDevice` 还会初始化 Runtime 和该设备的 Primary Context；因此必须检查它的返回值，不能把初始化错误一概推到后续 `cudaMalloc`。Primary Context 是驱动为一个进程中的某设备提供、可供 Runtime 与 Driver API 互操作的主要上下文；本例中该进程的多个主机线程共享它，不代表不同进程共用一个上下文。行为依据见 [CUDA 12.8.1：Initialization](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#initialization)。
-
-设备编号属于当前观察范围。`CUDA_VISIBLE_DEVICES` 可以筛选并重排进程能看到的 CUDA 设备。例如，在已明确 CUDA 原始枚举顺序为 A、B 的双卡主机上，设置 `CUDA_VISIBLE_DEVICES=1` 后，应用只看到 B，并将它编号为 0。这个例子没有假定 CUDA 原始枚举顺序必然等于另一进程的 `nvidia-smi` 顺序。真实对应应核对 UUID 或 PCI 地址；变量规则见 [CUDA 12.8.1：CUDA Environment Variables](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#env-vars)。
-
-设备文件的访问权限、进程隔离或设备状态也会影响初始化。若 `nvidia-smi` 与应用由不同用户、不同环境启动，它们的结果不能直接互相代替。容器中如何注入和限制设备留给第 10 章，本章先始终对齐同一宿主机与进程环境。
-
-## 装载设备代码，再提交工作
-
-主机可执行文件被 CPU 装载，不代表里面的 GPU 代码已适用于当前设备。CUDA 应用可以携带针对具体 GPU 架构的机器码，也可以携带由驱动在运行时编译的中间表示；下一篇分别解释 cubin 和 PTX。
-
-驱动需要为将要执行的 Kernel 找到适合当前 GPU 的代码，必要时进行 JIT（Just-In-Time，即运行时即时编译）。代码装载与 JIT 的实际时间点受应用调用和延迟装载策略影响，可以发生在初始化或第一次使用附近，不能断言全部 Kernel 一定在进程启动时编译完。
-
-下面是**单次运行的逻辑阶段图**。箭头表示依赖先后；设备发现阶段可以包含底层初始化，上下文框表示目标设备的 Context 可用。代码准备框表示相应 Kernel 使用前必须满足的条件，不指定它一定早于首次内存分配。各阶段的失败表现再与后文故障材料对照。
+Kernel 启动后，用 `cudaGetLastError` 读取并清除当前线程在该 Runtime 实例中的最近错误，再用 `cudaDeviceSynchronize` 等当前上下文此前提交的工作完成。CUDA 调用也可能报告先前异步工作的错误，所以一般应用要结合前序调用定位。在只有一个 Kernel 的干净进程里，启动检查、同步和拷回校验可以把失败窗口缩小到一次提交。 [CUDA 13.2.1 · Runtime API Error Handling](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__ERROR.html) · [Runtime API · Device Management](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__DEVICE.html)
 
 ```mermaid
-flowchart TB
-    L[装载程序和库]
-    E[发现与选择设备]
-    C[目标上下文就绪]
-    B[准备设备代码]
-    Q[提交复制与计算]
-    W[同步与结果检查]
-    L --> E --> C --> B --> Q --> W
+sequenceDiagram
+    participant L as 主机装载器
+    participant A as 应用
+    participant R as CUDA Runtime
+    participant D as CUDA Driver API
+    participant G as GPU
+    L->>L: 解析 ELF 声明的共享库
+    L-->>A: 进入 main
+    A->>R: cudaGetDeviceCount
+    R->>D: 初始化所需驱动状态并枚举进程可见设备
+    D-->>R: 枚举结果
+    R-->>A: 返回值与可见设备数
+    A->>R: cudaSetDevice(0)
+    R->>D: 取得或初始化所选设备的 primary context
+    D-->>R: 上下文可用
+    R-->>A: 选卡返回值
+    A->>R: 首次提交 Kernel
+    R->>D: 获取可执行设备代码并提交
+    D->>G: 下发计算
+    R-->>A: 主机继续执行
+    A->>R: 检查启动错误并同步
+    R->>D: 等待当前上下文已提交的工作
+    G-->>D: 完成或报告执行错误
+    D-->>R: 返回同步结果
+    R-->>A: 同步返回值
 ```
 
-在调用层面，读者可以把本例理解成下列**省略类型和清理代码的伪代码**。`CHECK` 表示当场检查该调用返回值；尖括号写法只表示第 02 章的 Kernel 启动，不要求掌握 CUDA 编程：
+图示为动态链接的纯 Runtime 程序在 lazy loading 下的一条成功路径，省略中间的内存分配。若装载、枚举或选卡失败，先记录该步结果并停止后续测试。
 
-```text
-CHECK(cudaGetDeviceCount(&count))
-若 count == 0，报告当前进程未发现可用设备并退出
-CHECK(cudaSetDevice(0))             // 本章 CUDA 12.8 基线在此完成相应初始化
-CHECK(cudaMalloc(&device_buffer, bytes))
-CHECK(cudaMemcpy(device_buffer, host_input, bytes, HostToDevice))
-vector_kernel<<<grid, block>>>(device_buffer)
-CHECK(cudaGetLastError())           // 检查启动提交阶段可报告的问题
-CHECK(cudaDeviceSynchronize())      // 等待此前设备工作完成，检查执行结果状态
-CHECK(cudaMemcpy(host_output, device_buffer, bytes, DeviceToHost))
-检查 host_output 与预期结果
+## 用一个 Kernel 分别记录枚举、启动和完成
+
+下面的 `probe.cu` 让一个 GPU 线程写出整数 7。它在每个关键调用后记录符号和数值错误码，并读取进程内设备 0 的 PCI BDF。若枚举失败或没有设备，程序不会继续选卡。需要 GPU 才能运行，后面的对照材料可离线阅读。
+
+```cpp
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+
+static void check(const char* stage, cudaError_t status) {
+    std::fprintf(stderr, "%s: %s (%d)\n",
+                 stage, cudaGetErrorName(status), static_cast<int>(status));
+    if (status != cudaSuccess) {
+        std::exit(1);
+    }
+}
+
+__global__ void write_value(int* output) {
+    *output = 7;
+}
+
+int main() {
+    int count = 0;
+    check("enumerate", cudaGetDeviceCount(&count));
+    std::printf("visible_devices=%d\n", count);
+    if (count == 0) {
+        return 2;
+    }
+
+    check("select", cudaSetDevice(0));
+    char bus_id[32];
+    check("device_id", cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), 0));
+    std::printf("device_ordinal=0 pci_bus_id=%s\n", bus_id);
+
+    int* device_output = nullptr;
+    check("allocate", cudaMalloc(&device_output, sizeof(int)));
+    write_value<<<1, 1>>>(device_output);
+    check("launch", cudaGetLastError());
+    check("synchronize", cudaDeviceSynchronize());
+
+    int output = 0;
+    check("copy_back", cudaMemcpy(&output, device_output, sizeof(output),
+                                  cudaMemcpyDeviceToHost));
+    check("release", cudaFree(device_output));
+    std::printf("output=%d\n", output);
+    return output == 7 ? 0 : 3;
+}
 ```
 
-`cudaGetLastError` 成功仍不等于 Kernel 已完成。异步执行错误可能在之后的同步调用才被观察到，这承接第 02 章的提交与完成区别。定位时应记录哪个调用首次报告错误、之前提交过什么；不能只按报错行把根因归到同步函数。
+构建 H100（计算能力 9.0）版本时，可用 CUDA Toolkit 13.2 GA 显式生成 `sm_90` cubin。下例假设构建侧已配置 `nvcc` 和受支持的主机编译器，运行侧驱动支持 H100 和此产物，并能解析 `libcudart.so.13`。用 `nvidia-smi` 登记管理侧 UUID 和 BDF，再从应用输出读 BDF。对单张未切分的裸机 GPU，可以按 BDF 将二者对齐。 [NVIDIA GPU Compute Capability](https://developer.nvidia.com/cuda/gpus) · [CUDA 13.2 GA · Linux Installation Guide](https://docs.nvidia.com/cuda/archive/13.2.0/cuda-installation-guide-linux/index.html) · [NVIDIA SMI](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
 
-## 用一份完整记录说明已经走过哪些环节
-
-以下为**自拟应用探针记录**，由本章 `vector-check` 按阶段输出，字段不是 NVIDIA 工具的原生格式。应用使用导读基线，驱动路径是在初始化后按进程映射汇总的；省略无关主机库：
-
-```text
-build.toolkit = 12.8.1
-build.nvcc_component = 12.8.93
-loaded.cudart = /opt/apps/vector/lib/libcudart.so.12.8.90
-loaded.libcuda = /usr/lib/x86_64-linux-gnu/libcuda.so.570.124.06
-cudaGetDeviceCount = cudaSuccess, count = 1
-selected.ordinal = 0, pci_bus_id = 0000:41:00.0, uuid = GPU-<A>
-selected.compute_capability = 8.0
-cudaSetDevice = cudaSuccess
-allocation_and_input_copy = cudaSuccess
-kernel_launch_check = cudaSuccess
-cudaDeviceSynchronize = cudaSuccess
-output_copy = cudaSuccess
-result_check = PASS
+```bash
+nvcc --cudart=shared -gencode=arch=compute_90,code=sm_90 probe.cu -o probe-sm90
+nvidia-smi --query-gpu=name,uuid,pci.bus_id --format=csv,noheader
+env -u CUDA_VISIBLE_DEVICES ./probe-sm90
+env CUDA_VISIBLE_DEVICES= ./probe-sm90
 ```
 
-沿记录可以逐步得出肯定结论：本次启动找到了指定 Runtime；计算路径实际装载 `.06` 的 `libcuda`；进程发现一张设备并将 ordinal 0 映射到 GPU-A；选择与初始化成功；本次输入规模的分配、复制、Kernel、同步和结果检查都已通过。
+下表按上面的 H100 场景推演。假设该主机只有一张可用 GPU，库与驱动均满足运行条件。示例用 `0000:65:00.0` 表示这张卡的 BDF，两次启动只改变应用进程的 `CUDA_VISIBLE_DEVICES`。
 
-这比“`nvidia-smi` 看到了卡”多覆盖了应用计算链，也比“启动函数返回成功”多覆盖了完成与结果。它的范围仍是这个二进制、这份输入、这张 GPU 和此次运行，没有包含显存压力、多卡互联、持续负载或性能验收。下一篇说明：要在运行前预测这些阶段能否通过，需要哪些版本与设备代码信息。
+| 启动方式 | 预期枚举结果 | 选卡与计算 |
+| --- | --- | --- |
+| `env -u CUDA_VISIBLE_DEVICES ./probe-sm90` | 枚举成功，可见设备数为 1 | 选中设备 0，按 BDF 与管理侧记录对齐。检查启动和同步的返回值，再验证拷回的值为 7。 |
+| `env CUDA_VISIBLE_DEVICES= ./probe-sm90` | 进程没有可见设备 | 记录枚举返回值，程序在选卡前退出。主机的 NVML 查询仍可看到这张卡。 |
 
-[上一篇：软件地图](01_把驱动_Runtime与Toolkit放回软件地图.md) · [下一篇：从版本号与设备代码判断兼容性](03_从版本号与设备代码判断兼容性.md)
+对照中首先改变的是应用的枚举结果。若管理查询仍能看到同一张卡，先检查应用的设备可见性设置。若枚举和选卡均成功，再根据启动检查、同步和结果校验判断计算是否完成。

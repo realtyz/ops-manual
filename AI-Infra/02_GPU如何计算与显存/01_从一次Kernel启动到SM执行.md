@@ -1,99 +1,37 @@
 # 从一次 Kernel 启动到 SM 执行
 
-## 先把一项计算拆成许多工作
+假设 CPU 已把两个数组 `x` 和 `y` 传入显存，接下来要更新 1,000 个元素。每个位置都做同一件事，`y[i] ← a × x[i] + y[i]`，其中 `a` 是一个标量，各位置之间没有依赖。CPU 可以发起一次 **Kernel（核函数）**启动，让 GPU 上的线程各自取一个位置来处理。要理解这些线程如何执行，先看它们将在哪些硬件上运行。 [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
 
-假设有两组数组 A、B，需要逐元素相加得到 C。CPU 可以组织输入和分配空间，再让 GPU 执行大量相似的加法。这里把在 GPU 上执行的函数称为 **Kernel（核函数）**；一次启动会指定它要启动多少 GPU 线程，以及怎样分组。框架中的一个算子可以调用一个或多个 Kernel，也可以与其他算子融合进同一个 Kernel，算子名和 Kernel 名不必一一对应。
+## 先在 GPU 上找到执行的位置
 
-GPU 线程是一次 Kernel 中带有自身编号、寄存器状态和控制流的执行实例。它不是 Linux 调度器管理的一个主机线程。CPU 侧可以只有少量提交线程，GPU 侧却有大量线程实例处理不同的数据。
+GPU 芯片里有许多重复的 **SM**（Streaming Multiprocessor，流式多处理器）。以 H100 SXM 80 GB 为例，一张卡有 132 个 SM。多个 SM 可以各自执行不同的工作，并经芯片内共享的 L2 访问显存。图中放大的是其中一个 SM。 [NVIDIA H100 架构白皮书 V1.04 · H100 GPU Architecture](https://resources.nvidia.com/en-us-hopper-architecture)
 
-CUDA 把一次启动的线程组织成 **Grid（线程块网格）**，Grid 包含 **Thread Block（线程块，后文简称 Block）**，Block 再包含线程。线程用组内编号和 Block 编号决定处理哪项数据。下面仅用一维编号说明分工，不需要阅读 CUDA 代码：
+![NVIDIA GH100 的单个 SM 结构。图中重复排列的处理分区各有 Warp 调度器、寄存器文件和执行单元，底部是 L1 数据缓存与共享内存。](images/fig-02-01-02-gh100-sm-architecture.png)
 
-```text
-任务：C[i] = A[i] + B[i]，i 从 0 到 999
-一次启动：4 个 Block，每个 256 个线程
-全局编号：i = Block 编号 × 256 + Block 内线程编号
-只有 i < 1000 的线程进行这次数组读写
-```
+**GH100 的单个 SM**　先找 `Warp Scheduler`，它从就绪的 Warp 中选择下一条要发射的指令。再看旁边的 `Register File`，它保存线程的操作数和中间值。`FP32`、`Tensor Core` 和 `LD/ST` 分别是图中执行浮点运算、矩阵乘加和访存指令的几类单元。底部的 `L1 Data Cache / Shared Memory` 是片上存储，其中共享内存可以由程序显式用作同一 Block 内线程的暂存区。整颗芯片与单个 SM 的原图分别见 NVIDIA 的图 3 和图 4。 [NVIDIA · Hopper Architecture In-Depth](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/#h100_sm_architecture)
 
-因此启动了 `4 × 256 = 1,024` 个线程实例，其中 1,000 个处理有效元素，末尾 24 个只完成边界判断。这个例子把“要计算多少数据”和“启动多少线程”建立了映射。真实 Kernel 也可以让一个线程循环处理多项数据；不能看到元素数就直接认定线程数。
+## 先派整个 Block，再按 Warp 发射
 
-线程块内部可以使用块内同步与共享内存协作。普通 Block 的执行不应依赖其他 Block 按某个先后顺序完成；Grid 很大时，硬件可能分批执行它们。这里的基本层次见 [CUDA 12.8.1 Programming Guide：Thread Hierarchy](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#thread-hierarchy)。
+回到 1,000 个元素。程序按每段 128 个位置划分工作，一段交给一个 **Block**。Block 内的每个 **Thread（线程）** 用 Block 编号和自己的编号算出要处理的位置。一次启动的所有 Block 组成 **Grid**。本例向上取整需要 8 个 Block，实际给出 `8 × 128 = 1,024` 个线程位置。Block 7 的线程对应编号 896–1023，其中 896–999 有数据可更新。 [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
 
-## SM 是承接线程块的硬件范围
+设备以 Block 为单位分派工作。假设 Block 7 被派给下图的 SM B，整组线程就在这个 SM 上执行。同一个 SM 有足够资源时也可以容纳别的 Block。Block 编号用来确定处理哪段数据，具体派到哪个 SM 和何时开始由设备决定。 [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
 
-**SM（Streaming Multiprocessor，流式多处理器）**是 GPU 中承接线程块、调度指令并提供执行资源的一组硬件。一个普通 Block 分配到一个 SM，该 Block 的线程不会分散到多个 SM 执行；一个 SM 可以同时驻留多个 Block。SM 内的寄存器保存各线程的执行数据，共享内存则供块内线程协作；下一篇再展开它们的访问方式。这里的“驻留”是指为线程分配了寄存器等资源、保持执行状态，并不表示它们每个周期都在发出指令。
+进入 SM 后，128 个线程按连续编号每 32 个分成一组，每组称为一个 **Warp**。Block 7 因此有 4 个 Warp，整个 Grid 有 32 个。最后一组的范围是 992–1023。越界检查决定哪些线程参与接下来的读写和乘加，只有前 8 个位置有对应元素。类似地，如果同一个 Warp 中有线程分别走两个分支，执行各路径的指令时只有走该路径的线程参与。两条路径都很长时，执行单元就会有更多时间只为一部分线程做有效工作。 [CUDA 13.2.1 · SIMT Architecture](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-c-programming-guide/index.html#simt-architecture)
 
-下面的软件划分框表达工作分组，GPU 计算芯片框表达硬件包含关系；虚线箭头仅示意 Block 的一次放置。图中只展开两个 SM，省略其余 SM 与许多执行管线。
+![Grid 包含 Block 0 到 Block 7，图中分别将 Block 0 和 Block 7 分派到两个示意 SM。右侧放大 Block 7 的最后一个 Warp，32 个线程位置中有 8 个高亮、24 个用斜线标为跳过。](images/fig-02-01-01-grid-to-warp.png)
 
-```mermaid
-flowchart TB
-    subgraph Work[一次 Kernel 启动的软件划分]
-        direction TB
-        B0[Block 0：线程与 Warp]
-        B1[Block 1：线程与 Warp]
-        BN[另一个 Block]
-    end
-    subgraph Chip[GPU 计算芯片：只展开两个 SM]
-        direction TB
-        subgraph S0[SM 0]
-            Q0[Warp 调度与发射]
-            R0[寄存器与共享内存]
-            E0[CUDA Core 等标量管线]
-            T0[Tensor Core 矩阵单元]
-            Q0 ~~~ R0
-            R0 ~~~ E0
-            E0 ~~~ T0
-        end
-        subgraph S1[SM 1]
-            Q1[调度与执行资源：省略]
-        end
-    end
-    B0 -. 分配到 .-> Q0
-    B1 -. 分配到 .-> Q0
-    BN -. 分配到 .-> Q1
-```
+**图 02-01-01**　一次 Grid 启动包含 8 个 Block，每个 Block 有 128 个线程。图中展示两个代表性 SM 和一组可能的分派。Block 7 的最后一个 Warp 有 8 个线程更新元素 992–999，其余 24 个跳过更新。
 
-框中的寄存器和执行单元属于 SM；图中没有把寄存器画成指令必须经过的中间处理器，也没有表达具体芯片的内部布线。Block 到 SM 的分配由执行系统进行，Block 编号不等于 SM 编号。对应机制见 [CUDA 12.8.1：Hardware Implementation](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#hardware-implementation)。
+## 跟着一个 Warp 看它如何用到硬件
 
-## Warp 把线程组织为可调度的执行组
+假设这些数组使用 FP32。一个 Warp 做逐元素更新时，先通过访存指令读取 `x[i]` 和旧的 `y[i]`。如果数据还没到，下一条使用这些数据的乘加指令就不能发射。此时 SM 的 Warp 调度器可以选择另一个已就绪的 Warp。原来的 Warp 保留自己的执行状态，等操作数就绪后再继续。对于这里的标量 FP32 乘加，发射的是常规 FP32 运算指令，由 CUDA Core 对应的执行单元完成，之后再把结果写回。 [CUDA 13.2.1 · Hardware Multithreading](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-c-programming-guide/index.html#hardware-multithreading) · [NVIDIA H100 架构白皮书 V1.04 · H100 SM Architecture](https://resources.nvidia.com/en-us-hopper-architecture)
 
-NVIDIA 的 **Warp** 由同一 Block 内连续编号的 32 个线程位置组成。线程数不是 32 的整数倍时，最后一个 Warp 仍占用一个组，只是部分位置没有线程。Warp 不跨 Block 拼接。
+如果换成矩阵乘法，库可能选择使用矩阵乘加指令的实现。某个 SM 发射这类指令时，相应运算由该 SM 内的 Tensor Core 执行。能否走这条路径取决于硬件、运算格式、输入的形状和布局，以及库实际选择的实现。规格表里的 CUDA Core 与 Tensor Core 数量分别描述两类硬件资源。一次启动有多少线程，看的是应用给出的 Grid 和 Block。 [NVIDIA · H100 Tensor Core Architecture](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/#h100_tensor_core_architecture) · [cuBLAS 13.2 · Tensor Core Usage](https://docs.nvidia.com/cuda/archive/13.2.1/cublas/index.html)
 
-刚才的例子中，每个 Block 有 `256 ÷ 32 = 8` 个 Warp，四个 Block 共 32 个 Warp。最后一个 Block 的最后一个 Warp 对应全局编号 992—1023，其中 992—999 的 8 个线程做有效加法，其余 24 个跳过读写。整个启动的有效元素比例是 `1,000 / 1,024`，但这不意味着整段 Kernel 的每条指令都以这个比例利用执行资源。
+## 为什么 SM 有时还能接下一个 Block
 
-SM 的 Warp 调度器从已经驻留、且下一条指令所需条件已满足的 Warp 中选择工作。某个 Warp 等待数据时，另一个就绪 Warp 可以发出指令，用其他工作覆盖等待时间。GPU 的高吞吐依赖足够多的就绪工作；“把一次访问变快”和“用其他工作遮住访问延迟”是两种机制。
+调度器要在一个 Warp 等数据时找到别的工作，前提是有其他 Warp 已经**驻留**在 SM 上，而且其中有 Warp 就绪。Block 驻留需要给线程分配寄存器，并为该 Block 按需分配共享内存。只要其中一项资源或硬件的 Block、Warp 数量上限先用尽，后续 Block 就要等已有工作完成并释放资源。 [CUDA 13.2.1 · Hardware Multithreading](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-c-programming-guide/index.html#hardware-multithreading)
 
-这种执行方式称为 **SIMT（Single Instruction, Multiple Threads，单指令多线程）**：共同发出的指令作用于参与该指令的线程，各线程可以使用不同数据。不能把一个 Warp 理解成“32 个 Linux 线程”，也不能把它理解成“永久绑定 32 个 CUDA Core”。指令类型、架构管线和发射能力共同决定执行节奏。基本机制见 [CUDA 12.8.1：SIMT Architecture](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#simt-architecture)。
+以 H100 为例，单个 SM 有 65,536 个 32 位寄存器，最多驻留 64 个 Warp。另假设一个规模足够大的 Grid，每 Block 仍有 128 个线程，每线程使用 64 个寄存器。忽略分配粒度，先只看寄存器，一个 Block 需要 `128 × 64 = 8,192` 个寄存器，所以最多同时放 `65,536 ÷ 8,192 = 8` 个 Block。每 Block 有 4 个 Warp，这一项给出 32 个 Warp 的上限，即 `32 ÷ 64 = 50%` 的理论驻留率（occupancy）。若共享内存只够 4 个 Block，则上限变为 16 个 Warp，也就是 25%。 [Hopper Tuning Guide 13.2 · Occupancy](https://docs.nvidia.com/cuda/archive/13.2.1/hopper-tuning-guide/index.html#occupancy)
 
-如果同一 Warp 中一部分线程走分支 A，另一部分走分支 B，执行系统需要用相应的活动线程集合推进不同路径，降低共同执行的机会；这叫 Warp 内分支分歧。Volta 起的独立线程调度改变了执行与重汇合的细节，不能假设 Warp 中所有线程始终逐指令锁步。对本章而言，关键是：**线程可以有各自的控制流，但不规则工作仍可能减少有效并行执行。**
-
-## CUDA Core 与 Tensor Core 各承接什么指令
-
-CUDA Core 是 NVIDIA 对部分标量算术执行单元的称呼；SM 还包含加载/存储、整数、特殊函数等不同管线。它与能够独立运行复杂程序的 CPU 核不处于相同层次，所以“几万个 CUDA Core”不能直接和“几十个 CPU 核”计算性能倍数。
-
-Tensor Core 是用于矩阵乘加等受支持操作的专用执行单元，可以把一小块矩阵的乘法与累加作为硬件操作推进。线程通过相应指令组织这些工作；Tensor Core 不是与 CUDA 线程体系分离的另一套作业调度器。
-
-普通逐元素加法不会因为数组叫 Tensor 就自动获得矩阵乘加峰值。是否使用 Tensor Core，取决于硬件代际、数据类型、操作形式、数据布局和库实际选择的实现。后文讨论精度时，再把“输入存什么格式”和“指令使用什么计算路径”连接起来。两类单元的职责可对照 [NVIDIA GPU Performance Background：GPU Architecture Fundamentals](https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html#gpu-arch)。
-
-## 为什么线程很多，仍然可能没有足够工作
-
-Block 的数量决定有多少组工作可被放置，Block 的资源需求则决定同一个 SM 能同时容纳多少组。寄存器和共享内存的物理含义将在下一篇展开，这里先把它们视作 SM 内有限的两种资源。
-
-对 GPU-T 再给出一组**专用于驻留计算的教学限制**：每个 SM 最多 64 个驻留 Warp、8 个驻留 Block、65,536 个 32 位寄存器和 96 KiB 共享内存。某 Kernel 每个 Block 有 256 个线程，每线程需 128 个寄存器，每 Block 需 48 KiB 共享内存。本题忽略分配粒度等附加限制，且 Grid 足够大。
-
-| 约束 | 最多同时容纳的 Block |
-| --- | --- |
-| Warp 数 | `64 ÷ 8 = 8` |
-| Block 数 | `8` |
-| 寄存器 | `65,536 ÷ (256 × 128) = 2` |
-| 共享内存 | `96 ÷ 48 = 2` |
-
-取各项的最小值，得到每 SM 最多驻留 2 个 Block，即 16 个 Warp。相对 64 个 Warp 的硬件上限，理论 **Occupancy（占用率）**为 `16 / 64 = 25%`。实际硬件的寄存器分配粒度、其他限制和实际调度还要分别核对；上面的数字没有借用某个真实型号的规格。
-
-Occupancy 衡量驻留 Warp 的比例。驻留 Warp 中又可能有人在等待数据，只有满足条件的 Warp 才是就绪的；就绪之后还要获得发射机会。因此，占用率不能直接换算成算术吞吐百分比。提高占用率有助于提供更多可选工作，但如果代价是寄存器溢出、更多内存访问或其他争用，Kernel 仍可能变慢。工具中的相关定义见 [Nsight Compute Profiling Guide：Occupancy 与 Scheduler Statistics](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#sections-and-rules)。
-
-现在只改变 Grid：如果一次启动仅有 4 个普通 Block，即使每个 Block 的线程很多，也至多同时用到 GPU-T 的 4 个 SM；80 个 SM 中其余部分没有这次启动的 Block。反过来，Grid 足够大也不保证每个 SM 持续满负载：Block 耗时不均、最后一批工作数量不足或所有 Warp 都等待数据，都可能留下空档。
-
-至此，可以区分四个数量：启动的线程数、组成的 Warp 数、当前驻留的 Warp 数、当前能够发出指令的工作数。下一篇继续解释限制驻留的片上资源，以及这些工作从哪里取得数据。
-
-[上一篇：本章导读](00_导读.md) · [下一篇：数据放在哪里与显存容量预算](02_数据放在哪里与显存容量预算.md)
+最初的例子总共只有 8 个 Block，每个只能分给一个 SM，因此一次启动最多让 8 个 SM 承担这批计算。读性能记录时，可以先数 Grid 给了多少 Block，判断多少个 SM 有机会分到工作。再看每个 SM 能容纳多少 Warp，以及调度器能从中找到多少就绪的 Warp。 [CUDA Best Practices Guide 13.2 · Occupancy](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-c-best-practices-guide/index.html#occupancy)

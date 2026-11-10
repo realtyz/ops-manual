@@ -1,106 +1,67 @@
-# Stream 与异步执行的时间线
+# 在时间线上读懂 Stream、异步与同步
 
-## CPU 返回，只说明提交过程到了哪里
+CPU 调用一次 Kernel 启动后可以继续执行主机代码，GPU 可能还在处理之前的工作。排查「CPU 已经返回但结果没到」时，要把三个时刻分开看。主机提交请求，GPU 实际开始执行，GPU 完成操作。提交与执行之间可以隔着队列或依赖。以下用单张独立 GPU 和 CUDA 13.2.1 的普通 Stream 语义推演。 [CUDA 13.2.1 · Asynchronous Execution](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html)
 
-CPU 调用一次 Kernel 启动接口后，通常在 GPU 完成计算之前就可以继续执行主机代码。这叫相对于主机的**异步执行**。于是，CPU 线程可能正在准备下一批数据，GPU 才刚开始处理本批；CPU 也可能阻塞在等待完成的位置，而 GPU 正在持续计算。
+## 单个 Stream 内的先后顺序
 
-要分清至少四个时刻：主机开始调用接口、接口把控制权交还主机、GPU 开始执行对应操作、GPU 完成该操作。只用 CPU 时钟包住一次异步启动，量到的主要是调用与提交耗时，不能把这个间隔当成 Kernel 执行时间。
+Stream 是一组按序执行的设备操作。以单批输入为例，CPU 可以先入队主机到设备拷贝（H2D），再入队处理这批输入的 Kernel，最后按需入队把结果拷回主机（D2H）。放在同一个 Stream 时，Kernel 在 H2D 完成后才读取输入，D2H 在 Kernel 完成后才取结果。需要让 CPU 读回结果时，等 D2H 完成再读主机缓冲区。GPU 上的下一步如果也在这个 Stream，可以按序消费结果。 [CUDA 13.2.1 · Stream Ordering](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html#cuda-stream-ordering)
 
-异步并不承诺接口在任何条件下都立即返回。尤其是内存复制，带 `Async` 的名称并不足以确定主机是否会阻塞：主机缓冲的类型、传输方向及内部资源状态都可能影响行为。这里以 [CUDA 12.8.1 Runtime API：API Synchronization Behavior](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-runtime-api/api-sync-behavior.html) 为准；后面的时间模型明确排除这些额外开销。
+| 操作 | 等待的范围 |
+| --- | --- |
+| `cudaEventSynchronize(event)` | 主机等待事件最近一次记录所捕获的工作。把事件记录在 D2H 后，就可等这一份结果 |
+| `cudaStreamSynchronize(stream)` | 主机等待该流此前提交的工作 |
+| `cudaDeviceSynchronize()` | 主机等待当前设备上该上下文此前提交的工作，覆盖各流 |
+| `cudaStreamWaitEvent(stream, event, 0)` | 让目标流随后入队的工作等待事件。跨流依赖由设备端顺序表达，主机可以继续提交 |
 
-## Stream 记录操作顺序，不是专属执行硬件
+在 CPU 上用时钟包住一次 Kernel 启动，量到的是主机提交一侧的耗时。若想量流内一段设备工作，在同一 Stream 前后记录可计时的 CUDA Event，等结束事件完成后读 `cudaEventElapsedTime`。区间可能包含等待或并发造成的影响。复测要固定区间、输入、预热和并发条件。端到端耗时另用主机时钟覆盖从准备输入到结果可用的完整过程。Nsight Systems 的 CPU CUDA API 行显示调用区间，GPU 的 Stream 行显示 Kernel 与拷贝活动，二者对齐后可定位提交和执行之间的空档。 [Runtime API 13.2.1 · Event Management](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__EVENT.html) · [Nsight Systems · CUDA Trace](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cuda-trace)
 
-**Stream（流）**是按顺序提交设备操作的序列。在本章普通执行模型下，同一 Stream 中的前序复制完成后，依赖它的 Kernel 才开始；后续复制又等待前序 Kernel 完成。Stream 不等于 GPU 卡，也不等于一个 SM、一个主机线程或一台固定复制引擎。
+## 两个 Stream 如何共享两块缓冲区
 
-把两批互不依赖的数据放入不同 Stream，会给系统留下重叠执行的机会。机会能否兑现，还取决于数据依赖、硬件复制/计算能力、资源可用性与竞争。多开一个 Stream 不会把计算单元或带宽翻倍。基本约定见 [CUDA 12.8.1：Streams 与 Overlapping Behavior](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#streams)。
+一条拷贝流搬下一批，另一条计算流消费上一批。要让两项操作重叠，先给两批输入不同的设备缓冲区。用 `ready[n]` 表示第 n 批拷贝完成，计算流等它之后才读。用 `done[n]` 表示 Kernel 已结束对这一块输入缓冲区的使用，拷贝流等它之后才覆盖该槽位。下面是 CPU 提交顺序的伪代码。两流用 `cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)` 创建，各批次使用独立事件。结果写入单独的设备输出区。
 
-下面表达的是依赖关系，不是实际耗时或物理连线。框表示操作所属的 Stream；实线箭头表示同流顺序，虚线箭头表示通过 Event 建立的跨流依赖。
-
-```mermaid
-flowchart TB
-    subgraph SA[Stream A]
-        A1[输入 H2D 复制] --> A2[Kernel A]
-        A2 --> AE[记录 Event E]
-        AE --> A3[后续独立操作]
-    end
-    subgraph SB[Stream B]
-        B1[与 A 无关的工作] --> BW[等待 Event E]
-        BW --> B2[使用 Kernel A 结果]
-    end
-    AE -. E 完成后放行 .-> BW
+```text
+for n in 1..3:
+    slot = (n - 1) mod 2
+    if n > 2:
+        cudaStreamWaitEvent(copy, done[n-2], 0)
+    cudaMemcpyAsync(device_in[slot], pinned_input[n], bytes, cudaMemcpyHostToDevice, copy)
+    cudaEventRecord(ready[n], copy)
+    cudaStreamWaitEvent(compute, ready[n], 0)
+    enqueue_kernel(compute, device_in[slot], device_out[n])
+    cudaEventRecord(done[n], compute)
 ```
 
-**H2D** 是 Host to Device，即主机到设备复制；**D2H** 是反方向复制。**Event（事件）**是插入 Stream 的进度标记：当执行推进到标记时，它可用于判断此前的工作已完成。`cudaStreamWaitEvent` 在另一个 Stream 中加入等待依赖，主机可以继续提交；`cudaEventSynchronize` 则让调用它的主机线程等到事件完成。
+两类等待分别保护生产和复用。若遗漏 `ready[n]`，Kernel 可能在本批拷贝完成前读取。若遗漏 `done[n-2]`，第 3 批可能覆盖第 1 批仍在读的缓冲区。主机页锁定输入也要在本批 H2D 完成前保持有效且内容稳定。这里用 `cudaEventRecord` 捕获生产流中已经入队的工作，再用 `cudaStreamWaitEvent` 将捕获的完成条件交给消费流。 [CUDA 13.2.1 · Explicit Synchronization](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html#explicit-synchronization) · [Runtime API 13.2.1 · Stream Management](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__STREAM.html)
 
-图中 B 的结果使用必须等 E，A 的后续独立操作没有被这条依赖强制要求先于 B 完成。真正开始时仍要有硬件资源。反过来，如果从两个不同 Stream 读写同一缓冲，却没有保证先写后读的依赖，就可能产生错误，不能把“跨流无默认顺序”当作自动正确的并发。
+```mermaid
+flowchart
+    CPU["CPU 提交拷贝、Kernel 和事件等待"]
+    subgraph C["拷贝流 H2D"]
+        H1["H2D 1 写槽 0"] --> H2["H2D 2 写槽 1"] --> H3["H2D 3 复用槽 0"]
+    end
+    subgraph K["计算流 Kernel"]
+        K1["Kernel 1 读槽 0"] --> K2["Kernel 2 读槽 1"] --> K3["Kernel 3 读槽 0"]
+    end
+    CPU -.-> C
+    CPU -.-> K
+    H1 -->|ready 1| K1
+    H2 -->|ready 2| K2
+    H3 -->|ready 3| K3
+    K1 -->|done 1| H3
+```
 
-## 一次明确的串行时间预算
+虚线表示主机提交，实线表示设备执行依赖。按 **教学算例**，三批输入均已备好，H2D 每批 2 ms，Kernel 每批 6 ms，结果留在设备上。假设设备支持所需重叠，忽略提交开销和资源争用。各区间为从本轮开始计的毫秒数。
 
-对 GPU-T 假设两批相互独立的输入已经准备好，输出只在两批都结束后由 CPU 使用。为便于手算，本题给出固定耗时，不从 HBM 带宽推导主机复制时间：
+| 批次 | 串行 H2D | 串行 Kernel | 双缓冲 H2D | 双缓冲 Kernel |
+| --- | --- | --- | --- | --- |
+| 1 | 0–2 | 2–8 | 0–2 | 2–8 |
+| 2 | 8–10 | 10–16 | 2–4 | 8–14 |
+| 3 | 16–18 | 18–24 | 8–10 | 14–20 |
 
-| 单批操作 | 时间 | 必要条件 |
-| --- | --- | --- |
-| H2D 复制 | 4 ms | 主机缓冲已就绪 |
-| Kernel | 10 ms | 本批 H2D 已完成 |
-| D2H 复制 | 2 ms | 本批 Kernel 已完成 |
+第一批都在 8 ms 完成。双缓冲把下一批的一部分搬运放进前一批的计算窗口，三批完成时间从 24 ms 降到 `2 + 3 × 6 = 20 ms`。能否得到这些重叠区间，还取决于设备的拷贝能力与方向、两项工作对资源的争用，以及 CPU 能否及时提交。`cudaDeviceProp.asyncEngineCount` 提供拷贝引擎信息。若要判断两个 Kernel 是否能并发，再看 `concurrentKernels` 和可用 SM 资源。实际发生的重叠以设备时间线为准。 [CUDA Best Practices Guide 13.2 · Asynchronous and Overlapping Transfers](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation) · [Runtime API 13.2.1 · cudaDeviceProp](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/structcudaDeviceProp.html)
 
-先把两批放进同一 Stream，严格依次执行：
+## 有多个 Stream 仍然排成一串时
 
-| 操作 | 开始—结束（ms） |
-| --- | --- |
-| 批次 0 H2D | 0—4 |
-| 批次 0 Kernel | 4—14 |
-| 批次 0 D2H | 14—16 |
-| 批次 1 H2D | 16—20 |
-| 批次 1 Kernel | 20—30 |
-| 批次 1 D2H | 30—32 |
+先找有没有同一缓冲区上的真实依赖，再查默认流。Legacy 默认流与同一 CUDA 上下文里的 blocking 流有隐式顺序。提交给 legacy 流的操作要等此前的 blocking 流工作，随后这些流的工作也要等 legacy 流中的操作完成。`cudaStreamCreate()` 创建的流默认参与这一关系，`cudaStreamNonBlocking` 标志可将显式流排除在这组隐式同步之外。通过 `nvcc --default-stream per-thread` 可按编译单元启用 per-thread 默认流，它归属于主机线程和上下文，通常与其他显式流独立。若程序混用了 per-thread 和 legacy 默认流，两者之间仍会同步。 [Runtime API 13.2.1 · Stream Synchronization Behavior](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/stream-sync-behavior.html)
 
-总时间为 `2 × (4 + 10 + 2) = 32 ms`。CPU 即使在最初很短的时间内把这些请求全部提交完，也仍需等到 32 ms 才能安全使用全部输出。
-
-## 用两组缓冲形成一次有效重叠
-
-现在给出重叠所需的额外条件：两批使用不同主机和设备缓冲；主机复制缓冲已经页锁定；GPU 支持复制与计算重叠，并支持本题的双向复制并发；两个显式 Stream 不引入默认流的额外同步；资源争用不改变各操作的给定耗时；启动、提交和 Event 开销在本题忽略。Kernel 阶段按最多一批计算占用计算资源安排。
-
-**页锁定主机内存（Pinned Memory）**是保持物理页面稳定、可用于相应异步传输的主机缓冲。它仍然占主机内存，不会变成 HBM。过量页锁定也会给系统带来压力。复制与计算重叠的条件可核对 [CUDA 12.8.1 Best Practices：Asynchronous and Overlapping Transfers with Computation](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation)。
-
-将批次 0 放入 Stream A，批次 1 放入 Stream B，可以安排出下面这条符合依赖的时间线：
-
-| 操作 | 开始—结束（ms） | 为什么此时可以开始 |
-| --- | --- | --- |
-| 批次 0 H2D | 0—4 | 输入已就绪 |
-| 批次 1 H2D | 4—8 | 上一项同方向复制结束；使用另一组缓冲 |
-| 批次 0 Kernel | 4—14 | 批次 0 H2D 完成，可与批次 1 H2D 重叠 |
-| 批次 0 D2H | 14—16 | 批次 0 Kernel 完成 |
-| 批次 1 Kernel | 14—24 | 本批 H2D 已在 8 ms 完成，计算资源此时可用 |
-| 批次 1 D2H | 24—26 | 批次 1 Kernel 完成 |
-
-这条安排的总时间为 **26 ms**：填充 4 ms，两个 Kernel 合计 20 ms，最后排空 2 ms；中间复制被计算覆盖。它是在题设下构造出的可行安排，不是“有两个 Stream 就必然获得 26 ms”的实机承诺。
-
-如果持续处理 n 批，且一直满足同样条件，理想流水线可按 `4 + 10n + 2 ms` 完成，稳态每 10 ms 完成一批。单批从其 H2D 开始到 D2H 完成的时间仍是至少 16 ms；这里改善的是多批的吞吐与总完成时间，不能直接说单批延迟降为 10 ms。
-
-## 更高并发会反过来占用显存
-
-两组缓冲必须有存储空间。[第二篇的容量题](02_数据放在哪里与显存容量预算.md)中，当前计算占应用预算 72 GiB，只有 4 GiB 余量；想完整预取 8 GiB 下一批时，峰值会超预算 4 GiB。所以那项作业不能直接采用需要 8 GiB 额外设备缓冲的重叠方案。
-
-可以缩小分块到不超过 4 GiB，或者调整数据生存期、减少其他占用，再重新计算时间线。分块之后复制次数和 Kernel 数量也可能变化，不能原封不动沿用这里的 26 ms。容量预算与重叠时序必须使用同一套缓冲安排。
-
-本篇 4/10/2 ms 的流水练习是另一组操作时序条件；它并未声称复制量就是容量题的 8 GiB，也没有使用 1,500 GB/s 的 HBM 上界估计 H2D。
-
-## 同步既建立正确性，也改变可观察的时间
-
-| 方式 | 谁等待什么 | 如何解释观察结果 |
-| --- | --- | --- |
-| `cudaStreamSynchronize(s)` | 调用它的主机线程等待 s 中此前提交的工作 | 等待时间可以是前面一批工作的剩余耗时 |
-| `cudaEventSynchronize(e)` | 主机等待事件 e 完成 | 可以把等待范围定位到插入的标记 |
-| `cudaStreamWaitEvent(s, e)` | s 中后续工作等待 e；主机通常继续提交 | 在设备执行序列中建立跨流依赖 |
-| `cudaDeviceSynchronize()` | 主机等待当前设备上该应用执行上下文中此前提交的工作 | 范围较大，不代表整台服务器其他进程都被等待 |
-
-表中的执行上下文可先理解为应用管理一组 GPU 执行状态的范围，第 03 章会继续解释。同步接口的语义见 [CUDA 12.8.1：Explicit Synchronization](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#explicit-synchronization)。若 CPU 记录显示 9 ms 花在同步调用中，而它刚提交了一个尚未完成的 Kernel，这 9 ms 很可能包含等待设备的时间；不能把它再当成独立的 9 ms 开销与同一段 GPU 时间相加。
-
-测单个 Kernel 时，可以在同一 Stream 中依次放置开始 Event、Kernel、结束 Event，等待结束 Event 后读两者时间差。这个区间仍可能受其他并发工作影响；如果 CPU 迟迟不提交 Kernel，也可能包含设备空档。测端到端耗时则应在开始前排除不希望计入的历史工作，并在结束时等待目标输出完成。启动开销、初始化和热身是否计入，要由问题决定并明确记录。
-
-默认 Stream 还有 legacy default stream 与 per-thread default stream 等不同语义，可能带来额外的同步关系。`cudaStreamNonBlocking` 中的“NonBlocking”主要描述与 legacy default stream 的关系，不能推出所有主机调用都不会阻塞。本章采用显式 Stream 和明确依赖，避免把未知默认流语义当作计算依据。相关规则见 [CUDA 12.8.1：Default Stream](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#default-stream)。
-
-现在已经能把“CPU 在等”“GPU 在算”“复制正在进行”和“输入尚未准备好”放到同一张图上。最后一篇将用实际字段定义和教学记录完成整章判断。
-
-[上一篇：精度、带宽与性能上界](03_精度_带宽与性能上界.md) · [下一篇：从指标和作业记录判断瓶颈](05_从指标和作业记录判断瓶颈.md)
+再查拷贝方向、主机缓冲区类型和 API 的同步语义。上述常规 H2D 流水线使用页锁定主机内存，比如由 `cudaMallocHost` 分配。`cudaMemcpyAsync` 对 pageable 主机内存的传输可能阻塞主机，需要先暂存到页锁定内存时也可能同步该流。读 trace 时，CPU 调用区间很长和 GPU 活动排成一串是两种观测，分别沿主机阻塞和流间依赖去查。 [Runtime API 13.2.1 · API Synchronization Behavior](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/api-sync-behavior.html) · [CUDA 13.2.1 · Page-Locked Host Memory](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/understanding-memory.html)
