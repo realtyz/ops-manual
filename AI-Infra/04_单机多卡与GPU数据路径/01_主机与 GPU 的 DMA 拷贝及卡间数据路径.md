@@ -1,5 +1,5 @@
 
-一批输入已经放进主机内存，GPU 上的计算要等输入进入自己的显存。CPU 线程调用 CUDA 复制接口，CUDA Runtime 和驱动安排设备工作。本例由 GPU 的复制引擎搬运。**DMA（Direct Memory Access，直接内存访问）**是设备按已建立的地址映射访问内存的机制。CPU 负责准备数据、提交和检查结果，复制引擎负责逐块搬运有效载荷。 [CUDA 13.2.1 · 系统内存与显存](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/understanding-memory.html) · [异步执行](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html)
+一批输入已经放进主机内存，GPU 上的计算要等输入进入自己的显存。CPU 线程调用 CUDA 复制接口，CUDA Runtime 和驱动安排设备工作。本例由 GPU 的复制引擎搬运。**DMA（Direct Memory Access，直接内存访问）** 是设备按已建立的地址映射访问内存的机制。CPU 负责准备数据、提交和检查结果，复制引擎负责逐块搬运有效载荷。 [CUDA 13.2.1 · 系统内存与显存](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/understanding-memory.html) · [异步执行](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html)
 
 ## 本地 H2D 的读取请求、回包与完成
 
