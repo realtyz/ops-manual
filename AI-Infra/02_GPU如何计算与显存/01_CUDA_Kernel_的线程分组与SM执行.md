@@ -2,7 +2,7 @@
 
 第 01 章把 GPU 放回了服务器的设备拓扑。现在只看其中一张 NVIDIA GPU。CPU 上的程序要更新两个数组中的 1,000 个位置，每个位置各做一次 `y[i] ← a × x[i] + y[i]`。`i` 是从 0 开始的下标，`a` 是事先给定的一个数。更新位置 6 不需要等待位置 5，GPU 因此可以把很多位置交给不同线程处理。
 
-CUDA 是 NVIDIA 的 GPU 计算平台和编程模型。框架、数学库或应用借助 CUDA 软件接口管理设备内存、搬运数据、提交 GPU 工作。下面的程序运行在主机一侧，CUDA 运行时和驱动把请求交给设备。**Kernel（核函数）**是此次提交给 GPU 运行的函数。主机和设备各有自己的执行和存储资源。 [CUDA 13.2.1 · The CUDA platform](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/cuda-platform.html) · [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
+CUDA 是 NVIDIA 的 GPU 计算平台和编程模型。框架、数学库或应用借助 CUDA 软件接口管理设备内存、搬运数据、提交 GPU 工作。下面的程序运行在主机一侧，CUDA 运行时和驱动把请求交给设备。**Kernel（核函数）** 是此次提交给 GPU 运行的函数。主机和设备各有自己的执行和存储资源。 [CUDA 13.2.1 · The CUDA platform](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/cuda-platform.html) · [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
 
 1. CPU 在主机内存准备 `x` 和旧的 `y`，程序把它们复制到这张 GPU 的两个设备缓冲区。一块缓冲区是一段用来存数据的内存。
 2. 主机启动 Kernel，给出两个设备缓冲区的位置、元素数量和线程分组形状。拷贝和 Kernel 可提交到同一个 CUDA Stream，也就是一条有执行顺序的工作队列。这样设备先完成拷贝，再读取输入。
@@ -21,7 +21,7 @@ Block 也划定了普通 Kernel 中线程协作的范围。同一 Block 的线�
 
 ## SM 分派与 Warp 发射
 
-**SM（Streaming Multiprocessor，流式多处理器）**是 GPU 芯片上重复布置的执行模块，自带调度器、执行单元和片上存储。整张 H100 SXM 80 GB 有 132 个 SM。普通 Block 作为整体派到一个 SM，资源允许时，同一 SM 可以驻留多个 Block。驻留指线程已在 SM 上占有保持执行状态所需的硬件资源。 [NVIDIA H100 架构白皮书 · H100 GPU Architecture](https://dam-cdn.nvd.orangelogic.com/AssetLink/705n6ur546g0uk43w0117r17n8042d73.pdf#page=18) · [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
+**SM（Streaming Multiprocessor，流式多处理器）** 是 GPU 芯片上重复布置的执行模块，自带调度器、执行单元和片上存储。整张 H100 SXM 80 GB 有 132 个 SM。普通 Block 作为整体派到一个 SM，资源允许时，同一 SM 可以驻留多个 Block。驻留指线程已在 SM 上占有保持执行状态所需的硬件资源。 [NVIDIA H100 架构白皮书 · H100 GPU Architecture](https://dam-cdn.nvd.orangelogic.com/AssetLink/705n6ur546g0uk43w0117r17n8042d73.pdf#page=18) · [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
 
 在 SM 上，块内线程按连续编号每 32 个编成一组，称为 **Warp（线程束）**。本例每个 Block 有 4 个 Warp，整个 Grid 有 32 个 Warp。Block 7 的最后一个 Warp 对应 992–1023，其中前 8 个线程参与更新。NVIDIA 把这种执行方式称为 SIMT（Single Instruction, Multiple Threads，单指令多线程）。发射一条 Warp 指令时，参与的线程执行相同的指令，各自操作自己的数据。如果一个 Warp 的线程进入不同的分支，发射某一路径的指令时只有走该路径的线程参与，部分运算槽位因此可能闲置。尾部越界检查就是一个简单的例子。 [CUDA 13.2.1 · Writing CUDA SIMT Kernels](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/writing-cuda-kernels.html#basics-of-simt) · [CUDA 13.2.1 · SIMT Execution Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/05-appendices/cuda-cpp-execution-model.html)
 
@@ -41,7 +41,7 @@ Block 也划定了普通 Kernel 中线程协作的范围。同一 Block 的线�
 
 ## 寄存器、共享内存与驻留率
 
-只要寄存器、共享内存、Block 或 Warp 槽位中有一项放不下新的 Block，待派发的 Block 就需要等待资源释放。**驻留率（occupancy）**以每 SM 能驻留的最大 Warp 数为分母。驻留率高时可能有更多 Warp 可供选择，能否发射还取决于操作数、执行单元和依赖是否就绪。 [Hopper Tuning Guide 13.2 · Occupancy](https://docs.nvidia.com/cuda/archive/13.2.1/hopper-tuning-guide/index.html#occupancy)
+只要寄存器、共享内存、Block 或 Warp 槽位中有一项放不下新的 Block，待派发的 Block 就需要等待资源释放。**驻留率（occupancy）** 以每 SM 能驻留的最大 Warp 数为分母。驻留率高时可能有更多 Warp 可供选择，能否发射还取决于操作数、执行单元和依赖是否就绪。 [Hopper Tuning Guide 13.2 · Occupancy](https://docs.nvidia.com/cuda/archive/13.2.1/hopper-tuning-guide/index.html#occupancy)
 
 设 Grid 足够大，每 Block 仍有 128 个线程，每线程使用 64 个 32 位寄存器。H100 每 SM 有 65,536 个 32 位寄存器，最多驻留 64 个 Warp。先忽略具体分配粒度，一个 Block 要 `128 × 64 = 8,192` 个寄存器，单看寄存器最多容纳 8 个 Block，即 32 个 Warp（50%）。若每个 Block 还要用 32 KiB 共享内存，而该 SM 划给共享内存的容量为 132 KiB，按这两项资源估算最多只容纳 4 个 Block，即 16 个 Warp（25%）。实际驻留还受编译结果、分配粒度及其他上限约束。 [Hopper Tuning Guide 13.2 · Occupancy 与 L1/Shared Memory](https://docs.nvidia.com/cuda/archive/13.2.1/hopper-tuning-guide/index.html#unified-shared-memory-l1-texture-cache) · [CUDA 13.2.1 · Hardware Limits](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/05-appendices/compute-capabilities.html)
 

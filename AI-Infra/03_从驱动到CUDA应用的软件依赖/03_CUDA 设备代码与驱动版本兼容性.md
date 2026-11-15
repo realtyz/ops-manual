@@ -51,7 +51,7 @@ cuobjdump --dump-ptx probe-ptx80
 
 ## Linux CUDA 前向兼容包
 
-若驱动降到 `570.124.06`，它属于 R570，低于 13.x 次版本兼容下限。NVIDIA 的 **前向兼容（forward compatibility）**适用于符合条件的 Linux 系统和 GPU。兼容包提供较新的 CUDA 用户态驱动库（包括 `libcuda` 与 PTX JIT 等指定组件），应用进程加载后仍经基础驱动的内核模块访问 GPU。它与次版本兼容作用在不同接口上。前者让新版 CUDA 用户态驱动与较早内核驱动在支持的组合内工作，后者让较新的 Runtime 使用较早的 CUDA 驱动。 [NVIDIA CUDA 前向兼容 · 包内容和功能例外](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html)
+若驱动降到 `570.124.06`，它属于 R570，低于 13.x 次版本兼容下限。NVIDIA 的 **前向兼容（forward compatibility）** 适用于符合条件的 Linux 系统和 GPU。兼容包提供较新的 CUDA 用户态驱动库（包括 `libcuda` 与 PTX JIT 等指定组件），应用进程加载后仍经基础驱动的内核模块访问 GPU。它与次版本兼容作用在不同接口上。前者让新版 CUDA 用户态驱动与较早内核驱动在支持的组合内工作，后者让较新的 Runtime 使用较早的 CUDA 驱动。 [NVIDIA CUDA 前向兼容 · 包内容和功能例外](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html)
 
 继续查官方前向兼容矩阵，`cuda-compat-13-2` 行与 `570+ (CUDA 12.8)` 列交叉为 `C`，表示该表支持这个兼容包与基础分支的组合。对 H100 教学场景，接下来仍要确认平台条件、进程是否实际加载兼容包中的库，以及应用所需功能是否要求更新内核驱动。安装包只放置这些 CUDA 用户态文件，具体启动环境还要能解析到它们。也要照常核对 Runtime 和 Kernel 的设备代码。 [NVIDIA CUDA 前向兼容 · 支持矩阵](https://docs.nvidia.com/deploy/cuda-compatibility/latest/forward-compatibility.html#deployment-considerations-for-forward-compatibility)
 

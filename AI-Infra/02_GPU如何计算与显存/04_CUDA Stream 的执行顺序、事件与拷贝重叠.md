@@ -5,7 +5,7 @@
 
 把一批数据的 H2D 拷贝、Kernel 和设备到主机拷贝（Device to Host，D2H）都放进同一个 Stream。主机可以连续提交这三项工作。设备完成 H2D 后，Kernel 才读取设备缓冲区。Kernel 完成后，D2H 才把结果写到主机缓冲区。主机如果要读取结果，需要确认 D2H 已完成，即使三项调用都已返回。若下一次计算也在同一流中且直接用设备结果，就可以接着提交，由流内顺序保证读取时机。 [CUDA 13.2.1 · CUDA Stream Ordering](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html#cuda-stream-ordering)
 
-**CUDA Event（事件）**可以记录某条流上已经提交的工作。当这些工作完成，事件对应的完成条件也就满足。把事件放在 D2H 后面，可以用它确认这份主机结果什么时候可读。不同的同步调用控制不同范围。 [Runtime API 13.2.1 · Event Management](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__EVENT.html) · [CUDA 13.2.1 · Explicit Synchronization](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html#explicit-synchronization)
+**CUDA Event（事件）** 可以记录某条流上已经提交的工作。当这些工作完成，事件对应的完成条件也就满足。把事件放在 D2H 后面，可以用它确认这份主机结果什么时候可读。不同的同步调用控制不同范围。 [Runtime API 13.2.1 · Event Management](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__EVENT.html) · [CUDA 13.2.1 · Explicit Synchronization](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/02-basics/asynchronous-execution.html#explicit-synchronization)
 
 | 操作 | 何处等待，等待什么 |
 | --- | --- |

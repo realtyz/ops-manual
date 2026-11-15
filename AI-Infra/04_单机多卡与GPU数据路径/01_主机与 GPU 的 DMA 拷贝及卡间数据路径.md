@@ -39,7 +39,7 @@
 
 ## GPU 间直达与主机内存中转
 
-把源缓冲区改为 GPU 0 的显存，目的改为 GPU 1 的显存。两张卡有一条经 Switch A 的候选直达路径。**P2P（Peer-to-Peer，对等访问）**在这里指 GPU 可以经设备互联直接访问另一张卡的显存。若所需设备对和方向可用，应用使用直达传输，且 PCIe 事务在 Switch A 内转发，载荷便从 GPU 0 的下行转到 GPU 1 的下行。两张卡仍各自拥有自己的显存。 [CUDA 13.2.1 · 多 GPU 对等传输](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-peer-to-peer-transfers-and-memory-access)
+把源缓冲区改为 GPU 0 的显存，目的改为 GPU 1 的显存。两张卡有一条经 Switch A 的候选直达路径。**P2P（Peer-to-Peer，对等访问）** 在这里指 GPU 可以经设备互联直接访问另一张卡的显存。若所需设备对和方向可用，应用使用直达传输，且 PCIe 事务在 Switch A 内转发，载荷便从 GPU 0 的下行转到 GPU 1 的下行。两张卡仍各自拥有自己的显存。 [CUDA 13.2.1 · 多 GPU 对等传输](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/03-advanced/multi-gpu-systems.html#multi-device-peer-to-peer-transfers-and-memory-access)
 
 同一份数据也可以经 M0 显式中转。应用安排 GPU 0 的 D2H，将数据写入中转缓冲区。数据到达后，GPU 1 才能从同一缓冲区做 H2D。每个字节先经过上行 A 的 Switch→主机方向，再经过主机→Switch 方向。两段的先后依赖来自它们读写同一批字节。
 
