@@ -1,6 +1,6 @@
 # 从一次 Kernel 启动到 SM 执行
 
-假设 CPU 已把两个数组 `x` 和 `y` 传入显存，接下来要更新 1,000 个元素。每个位置都做同一件事，`y[i] ← a × x[i] + y[i]`，其中 `a` 是一个标量，各位置之间没有依赖。CPU 可以发起一次 **Kernel（核函数）**启动，让 GPU 上的线程各自取一个位置来处理。要理解这些线程如何执行，先看它们将在哪些硬件上运行。 [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
+假设 CPU 已把两个数组 `x` 和 `y` 传入显存，接下来要更新 1,000 个元素。每个位置都做同一件事，`y[i] ← a × x[i] + y[i]`，其中 `a` 是一个标量，各位置之间没有依赖。CPU 可以发起一次 **Kernel（核函数）** 启动，让 GPU 上的线程各自取一个位置来处理。要理解这些线程如何执行，先看它们将在哪些硬件上运行。 [CUDA 13.2.1 · Programming Model](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/01-introduction/programming-model.html)
 
 ## 先在 GPU 上找到执行的位置
 
