@@ -1,0 +1,21 @@
+# 行尾策略：文本统一按 LF 存储与检出。
+# 覆盖 Windows 上 core.autocrlf=true 的 CRLF 转换，避免每次 add 出现
+# "LF will be replaced by CRLF" 提示，也保证跨平台检出内容一致。
+* text=auto eol=lf
+
+# Markdown 笔记显式声明为文本，并按 LF 检出。
+*.md text eol=lf
+*.markdown text eol=lf
+
+# 二进制资源：不做行尾转换，也不按文本比较。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.zip binary
+*.7z binary
