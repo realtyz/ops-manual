@@ -1,52 +1,80 @@
+# RC 建连、RDMA 操作与完成通知
 
-节点 A 和节点 B 各有一个可靠连接（RC）类型的队列对（QP）。两端要先配置连接，再准备本次操作用到的内存，最后才能传输载荷。对于前篇的 Write，连接使 A 的请求到达指定的 B 端 QP，B 发布的地址和远程密钥 `rkey` 则决定数据可以写到哪里。
+两端各自创建好 QP 和 MR 后，它们还只是两部没拨号的座机。要让数据真正跨过网络流动，必须先完成两件准备：把一对 RC QP 逐级推进到可收发状态，再根据业务诉求选对通信原语并约定好“写完了如何通知对方消费”。
 
-## 从本地 QP 到可靠连接
+## 从孤立 QP 到可靠连接（RC）：两条建连路径
 
-使用 Verbs 手工配置时，应用可以先用普通 TCP Socket 交换对端 QP 编号、包序号以及与链路类型有关的地址参数。每端的状态从 `RESET` 进入 `INIT`，设置本地端口及 QP 访问标志，再进入可接收的 `RTR`（Ready to Receive），配置到对端 QP 的路径和路径 MTU（Maximum Transmission Unit，最大传输单元）。进入可发送的 `RTS`（Ready to Send）时，配置发送序号和重试等参数。两端要满足启动传输的条件才开始投递。控制 Socket 连通时，应用已能交换参数，RDMA 端口和 QP 的载荷路径还需要单独验证。 [rdma-core v57.0 的 RC QP 状态与必要属性](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_modify_qp.3) · [perftest 26.07.8 的连接选项](https://github.com/linux-rdma/perftest/blob/a31f9ea9df720ee68f941e55f75fec31349fcd35/README)
+在 Verbs 中，刚创建出来的 QP 处于 `RESET` 状态，无法收发任何流量。手工建连时，两端通常会先借助一条普通 TCP 控制连接（例如集群管理网）交换各自的 QP 编号（QPN）、初始包序号（PSN）以及链路层地址参数，然后按严格顺序调用 `ibv_modify_qp()` 推进状态机：
 
-另一种做法是用 **RDMA CM（RDMA Connection Manager，RDMA 连接管理器）** 及其用户态库 `librdmacm`。在本例的异步流程中，A 解析地址、选择本地 RDMA 设备，创建与 CM 标识关联的 QP，并解析路由。B 监听，收到连接请求后准备对应 QP 并接受。双方按各自的 `ESTABLISHED` 事件识别连接阶段完成。若第一条业务操作是 Send，B 可在接受连接前预投递接收项。若要发起 Read 或 Write，应用还须约定如何交付目标缓冲区的地址、长度和 `rkey`，下图使用已有的控制通道。 [rdma-core v57.0 的 RDMA CM 流程](https://github.com/linux-rdma/rdma-core/blob/v57.0/librdmacm/man/rdma_cm.7) · [RDMA CM 事件](https://github.com/linux-rdma/rdma-core/blob/v57.0/librdmacm/man/rdma_get_cm_event.3)
+| QP 状态跃迁 | 关键配置内容 | 本阶段完成后能做什么 |
+| --- | --- | --- |
+| `RESET` → `INIT` | 绑定本地物理端口、设置允许的远程访问权限（如远程读/写） | 可以提前向接收队列（RQ）预投递 Receive 工作项 |
+| `INIT` → `RTR` | 填入对端 QPN、链路地址、对端初始包序号与路径 MTU | **Ready to Receive**：具备接收对端数据包的能力 |
+| `RTR` → `RTS` | 配置本地发送包序号、超时与重试次数（含 RNR 重试） | **Ready to Send**：双向可靠通道就绪，可正式投递发送请求 |
+
+如果不想自己维护带外 TCP 交换和手工状态机，可以使用 **RDMA CM（RDMA Connection Manager，连接管理器）** 及其用户态库 `librdmacm`。它的用法类似大家熟悉的 Socket 流程：发起端按 IP 解析目标地址与路由并创建关联 QP，远端监听并接受连接请求，双方收到各自的 `ESTABLISHED` 事件即表明 RC 通道建立完成。
+
+> [!warning] 常见误区：控制通道通 ≠ RDMA 通道通
+> 手工建连中用于交换参数的普通 TCP Socket 往往走管理网或内核协议栈。TCP 握手成功只能证明两端应用能交换元数据，**绝不代表高速 RDMA 端口或 QP 载荷路径已经联通**。若第一条业务操作是 Send，远端应在接受连接或通知就绪前预投递 Receive；若要做 Read/Write，建连之后仍需通过控制通道或首次 Send 交换目标缓冲区的地址、长度与 `rkey`。
+
+## 单边 vs 双边：四种核心 RDMA 操作怎么选
+
+建连完成后，RDMA 提供两类风格截然不同的传输原语：**双边操作（Send / Receive）** 要求远端 CPU 预先配合准备接收项，而**单边操作（RDMA Write / RDMA Read）** 只需发起端单方面驱动，远端 CPU 全程“无感知”。
+
+- **双边操作（Send）**：远端必须提前调用 `ibv_post_recv()` 在 RQ 中摆好接收缓冲区。发起端发出的字节落到哪里由远端决定，收完后两端 CQ 都会收到完成记录。
+- **单边操作（RDMA Read / Write）**：远端只需提前注册 MR 并开放授权；传输时由发起端直接指定远端地址与 `rkey`，**不消耗远端 RQ，也不会在远端 CQ 产生完成记录**。注意执行 RDMA Read 时，数据最终写入发起端本地内存，因此发起端自己的目标 MR 必须开启 `IBV_ACCESS_LOCAL_WRITE`。
+- **混合利器（RDMA Write with Immediate）**：载荷像普通 Write 一样直接写入发起端指定的远端目标 MR，同时额外附带一个 `32 bit` 立即数（例如槽位号、梯度桶编号或 KV 块批次号）。这会消耗远端 RQ 中的一个空接收项并在远端 CQ 产生一条携带立即数的接收 WC——既享受单边指定目标地址的灵活，又自带原子级“到货通知”。
+
+| 发起端执行的操作 | 载荷流向 | 远端载荷缓冲区由谁决定 | 是否消耗远端 Receive | 成功完成记录（WC）落点 |
+| --- | --- | --- | --- | --- |
+| **Send** | 发起端 → 远端 | 远端在预投递的 Receive 中指定 | 是 | 发起端发送 WC + 远端接收 WC |
+| **RDMA Read** | 远端 → 发起端 | 发起端指定远端源地址与 `rkey` | 否 | 仅发起端 Read WC |
+| **RDMA Write** | 发起端 → 远端 | 发起端指定远端目标地址与 `rkey` | 否 | 仅发起端 Write WC |
+| **RDMA Write with Immediate** | 发起端 → 远端 | 发起端指定远端目标地址与 `rkey` | 是（仅用于收通知） | 发起端发送 WC + 远端带立即数的接收 WC |
+
+> [!tip] 训推通信选型直觉
+> 为什么 AI 基础设施格外偏爱单边操作？
+> - **分布式训练（NCCL）**：批量传输大块梯度时常采用 `RDMA Write with Immediate`，一步完成“直写目标显存 + 通知对端分片到达”，免去远端逐块管理接收缓冲区地址的麻烦。
+> - **PD 分离推理（Prefill → Decode KV Cache 迁移）**：Decode 节点正忙于逐 token 生成并严守 P99 TPOT 尾延迟，最怕被突发网络中断打断。采用单边 **RDMA Write（Prefill 推送）** 或 **RDMA Read（Decode 拉取）** 配合轻量控制信号，就能在不打扰远端 CPU 的前提下把大片 KV Cache 直接落入目标显存。
+
+## 一次完整 RDMA Write 的端到端时序
+
+由于普通 RDMA Write 不会在远端 CQ 生成任何记录，双方必须建立明确的“数据交接协议”——远端只有收到约定通知后才能读取目标缓冲区；若发起端要反复复用同一个远端槽位，远端消费完后还需归还槽位，避免新一轮写入踩踏正在读取的数据。
 
 ```mermaid
 sequenceDiagram
-    participant A as A 进程
-    participant AN as A RNIC
-    participant BN as B RNIC
-    participant B as B 进程
-    Note over A,B: 两端 RC QP 已就绪
-    B-->>A: 发布 B 的目标地址、长度和 rkey
-    A-->>AN: 投递请求 17，源与远程目标均有效
-    AN->>BN: A 读取本机源缓冲区并跨网发送 1024 B
-    BN->>BN: B 校验范围和权限，将数据写入目标 MR
-    AN-->>A: A 轮询到请求 17 的成功 WC
-    A-->>B: 通过控制通道通知 B 可以读取主机目标
-    B->>B: 读取目标，如要复写则按约定确认已消费
+    accDescr: 展示一次普通 RDMA Write 在发起端进程、发起端 RNIC、远端 RNIC 与远端进程之间的完整时序。包括远端发布目标地址与 rkey、发起端投递 WR、两端 RNIC 跨网搬运与权限校验、发起端轮询到成功 WC，以及经控制通道通知远端消费并归还槽位。
+    participant Init as 发起端进程
+    participant INIC as 发起端 RNIC
+    participant RNIC as 远端 RNIC
+    participant Rem as 远端进程
+    Note over Init,Rem: 两端 RC QP 已进入 RTS 就绪状态
+    Rem-->>Init: 经控制通道发布目标地址、长度与 rkey
+    Init-->>INIC: 投递 WR（wr_id=17），敲响门铃
+    INIC->>RNIC: DMA 读取本地源 MR 并跨网发送 1024 B
+    RNIC->>RNIC: 校验 PD、rkey、访问权限与区间边界，DMA 写入目标 MR
+    INIC-->>Init: 轮询到请求 17 的 IBV_WC_SUCCESS（源缓冲可复用）
+    Init-->>Rem: 通过控制通道通知远端数据已落盘
+    Rem->>Rem: 读取目标缓冲区；消费完毕后按约定归还槽位
 ```
 
-实线展示载荷阶段，虚线展示元数据、投递和应用通知。图省略网卡之间的传输确认。A 的成功完成记录和 B 的应用消息分属两个事件。若 A 要反复写同一槽位，双方还要保证上一份数据已消费，例如让 B 消费后归还槽位。
+*图 06-03-01：普通 RDMA Write 的端到端控制流与数据流时序。实线代表数据载荷搬运，虚线代表元数据交换、队列投递、完成回执与应用层通知（图中省略网卡硬件内部的可靠确认包）。*
 
-## Send、Read、Write 与带立即数的 Write
+## 读懂两条最典型的错误完成记录
 
-投递 **Receive** 指 B 预先在接收队列中放一项接收工作。对 Send，这一项给出接收缓冲区，收到的载荷交给它。Read 和普通 Write 由 A 指定远程地址和 `rkey`，B 事先注册缓冲区，该 MR 和 B 的 QP 均须授予对应的远程访问权限。Read 的本地结果写入 A 的 MR，因此 A 的目的 MR 须允许本地写。 [NVIDIA RDMA 编程手册 v1.7，RDMA Operations](https://docs.nvidia.com/rdma-aware-networks-programming-user-manual-1-7.pdf) · [rdma-core v57.0 的工作请求与操作类型](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_post_send.3) · [MR 访问标志](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3)
+当 RC 传输失败时，RNIC 会在发起端 CQ 中返回带错误状态码的 WC。把 WC 中的 `status` 与发起端自己记录的原 WR 操作类型对起来，就能第一时间锁定远端缺失的前置条件：
 
-| A 发起的操作 | 载荷方向 | B 侧载荷缓冲区如何选 | B 是否消耗 Receive | 成功完成记录 |
-| --- | --- | --- | --- | --- |
-| Send | A → B | B 在 Receive 中给出目标 | 是 | A 的发送 WC，B 的接收 WC |
-| RDMA Read | B → A | A 指定 B 的源地址并携带 B 授权的 `rkey` | 否 | A 的 Read WC |
-| RDMA Write | A → B | A 指定 B 的目标地址并携带 B 授权的 `rkey` | 否 | A 的 Write WC |
-| RDMA Write with Immediate | A → B | 和 Write 一样由 A 给出远程目标 | 是，用于接收通知 | A 的发送侧 WC，B 的接收 WC 带立即数 |
-
-表中假定 A 要求成功时产生完成记录。Write with Immediate 附带一个 `32 bit` 立即数，可作槽位编号或序号。B 消耗一个接收项获得这条接收完成，主载荷仍写到 Write 指定的目标 MR。若 B 的目标在显存，还须把接收通知接到 CUDA 的数据可见性和执行依赖上。 [rdma-core v57.0 的完成字段与立即数](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_poll_cq.3) · [CUDA 13.1.2 的 GPUDirect RDMA 内存顺序](https://docs.nvidia.com/cuda/archive/13.1.2/gpudirect-rdma/index.html#synchronization-and-memory-ordering)
-
-## 从完成状态追到缺少的前置条件
-
-下表是两个独立的教学变体。两例均假定 RC QP 已连接。操作来自 A 保存的 WR，状态来自 A 轮询取得的 WC。
-
-| A 原来投递的 WR | A 取得的 WC | 在 B 侧补查的证据 |
+| 发起端原 WR | 轮询得到的错误 WC | 根因含义与远端排查清单 |
 | --- | --- | --- |
-| `wr_id=21`，Send | `IBV_WC_RNR_RETRY_EXC_ERR` | RNR（Receiver Not Ready）表示对端在该次尝试时没有可用的接收项，状态表示重试耗尽。对照 B 的接收投递时间和队列余量，再看 A 的 RNR 重试设置。 |
-| `wr_id=22`，RDMA Write | `IBV_WC_REM_ACCESS_ERR` | 校对请求到达时 B 的远程地址和长度、`rkey`、目标 MR 的有效期和访问许可，也核对接收 QP 的权限。 |
+| `wr_id=21`，**Send** | `IBV_WC_RNR_RETRY_EXC_ERR` | **RNR（Receiver Not Ready）重试耗尽**：数据包到达时远端 RQ 里没有空闲的 Receive 接收项，重试次数用光仍未等到补给。核查远端预投递时机、RQ 队列深度与发起端 RNR 重试配置。 |
+| `wr_id=22`，**RDMA Write** | `IBV_WC_REM_ACCESS_ERR` | **远端访问授权或越界拒绝**：请求到达远端时未通过门禁。对照发起端保存的原目标地址与长度，逐项核查是否超出 MR 边界、`rkey` 是否过期或错写、目标 MR 与接收 QP 的远程写权限是否同时开启。 |
 
-状态能缩小取证范围。以第二例为例，仍需用原请求还原目标区间，才能分辨是越界还是密钥、权限等条件发生了变化。若 A 的普通 Write 已成功，B 在 CQ 里没有收到接收 WC 符合这种操作的行为，消费应等待约定的应用通知。 [rdma-core v57.0 的 WC 状态定义](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/verbs.h) · [QP 的 RNR 重试与访问属性](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_modify_qp.3)
+> [!summary] 核心结论
+> 看到普通 Write 在发起端返回 `IBV_WC_SUCCESS`、而远端 CQ 毫无动静时，不必惊慌——这正是单边 Write 的标准语义；反过来，若在显存场景使用 Write 或 Write with Immediate，除了应用通知本身，远端还必须接上 CUDA 显存可见性同步（第 05 篇展开）。
 
-一条请求走到投递之前，要依靠本机软件打开设备、创建队列并建立映射。若程序连设备都打不开，连接和工作请求尚无从谈起，可以沿驱动栈逐项确认这些资源是否存在。
+到这里，我们已经把连接、操作和完成回执全链路理顺。但如果程序在真机上连 RDMA 设备都打不开，上述一切都无从谈起——下一篇我们顺着 Linux RDMA 驱动栈往下看，学会用五条只读命令把抽象设备对回具体的物理网卡。
+
+> [!info]- 参考资料
+> - **RC QP 状态机与 RDMA 操作语义**：[rdma-core v57.0 `ibv_modify_qp(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_modify_qp.3)、[`ibv_post_send(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_post_send.3)、[`ibv_reg_mr(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3)、[`ibv_poll_cq(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_poll_cq.3)、[WC 状态枚举 `verbs.h`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/verbs.h)
+> - **RDMA CM 与编程手册**：[rdma-core v57.0 `rdma_cm(7)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/librdmacm/man/rdma_cm.7)、[`rdma_get_cm_event(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/librdmacm/man/rdma_get_cm_event.3)、[NVIDIA RDMA Aware Networks Programming User Manual v1.7](https://docs.nvidia.com/rdma-aware-networks-programming-user-manual-1-7.pdf)
+> - **基准测试连接与显存内存顺序**：[perftest 26.07.8 README](https://github.com/linux-rdma/perftest/blob/a31f9ea9df720ee68f941e55f75fec31349fcd35/README)、[CUDA 13.2.1 GPUDirect RDMA Synchronization and Memory Ordering](https://docs.nvidia.com/cuda/archive/13.2.1/gpudirect-rdma/index.html#synchronization-and-memory-ordering)

@@ -1,63 +1,111 @@
+# kubelet 的 GPU 选卡、Allocate 与 CDI 交接
 
-Pod `gpu-example/probe` 请求一张 `nvidia.com/gpu`，已通过型号与数量检查并绑定到 `gpu-h`。调度器的输出是节点名。此时 kubelet 要接纳这个 Pod，再以本机逐卡状态为准，确定哪张 GPU 能交给 `workload` 容器。这一篇用 Kubernetes v1.36.0、独立 NVIDIA Device Plugin v0.19.2、containerd v2.3.0 和普通 runc 说明交付。 [kubelet v1.36.0 的设备分配](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)
+调度器完成过滤与打分后，只把节点名写入 Pod 的 `spec.nodeName`。它从未接触过具体的物理 GPU UUID。从这一刻起，接力棒正式交给目标节点上的 kubelet。
 
-## 从健康集合和已分配集合选出 B
+节点侧要办成两件事：**从本机健康设备中挑出确切的物理卡**，并**把交接信息准确传给容器运行时**。本篇以 Kubernetes v1.36、NVIDIA Device Plugin v0.20.1 与 containerd 2.3.0 为基准，拆解这条本地交付链路。
 
-只考虑本例的一种完整 GPU 资源和单容器 Pod，其他本地接纳条件都满足。插件上报的健康集合为 `{A, B}`，设备管理器已有的分配记录占用 `{A}`。从健康集合扣除已分配设备，得到 `{B}`。容器要一个单位，而 B 是唯一候选，因此无需假定插件或 kubelet 的偏好顺序。
+## 从本地健康集合里挑出目标卡
 
-如果候选有多张卡，具体选择还可能受节点拓扑与插件偏好影响。插件声明支持时，kubelet 可通过 `GetPreferredAllocation` 请求建议，并结合本地约束决定使用哪些 ID。选定 ID 后，kubelet 调用插件的 `Allocate`。v0.19.2 的 NVIDIA 插件验证传入 ID，再为容器返回 `ContainerAllocateResponse`。协议允许响应包含设备、挂载、环境变量、注解或 CDI（Container Device Interface，容器设备接口）名称。另一个可选接口 `PreStartContainer` 需由插件声明支持，这个 NVIDIA 版本未启用它。 [Kubernetes Device Plugin 接口](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-implementation) · [kubelet v1.36.0 选卡实现](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go) · [NVIDIA v0.19.2 Allocate 实现](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.2/internal/plugin/server.go)
+目标节点的 kubelet 接纳新 Pod 时，其 Device Manager 按本机实时状态算出空闲候选集合：
 
-分配成功后，设备管理器按 Pod UID、容器名和资源名保存设备 ID 及交接配置，并写入本地检查点。创建容器时，kubelet 取出对应配置。Pod 不再活跃后，设备管理器随活跃 Pod 状态清理分配，健康的设备可再次成为候选。 [kubelet v1.36.0 持久化与回收](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go) · [kubelet 容器配置衔接](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/container_manager_linux.go)
+$$\text{本地空闲候选} = \text{健康设备集合} \setminus \text{已分配设备集合}$$
 
-## 从 Allocate 响应到运行时创建请求
+以 `node-h100` 为例，插件上报的健康清单包含两张 H100。第一张已被活跃 Pod 占用。相减后，唯一剩余的第二张卡自然成为本次分配对象。
 
-**容器运行时接口 CRI（Container Runtime Interface）** 承接 kubelet 发出的创建与启动请求。第 10 章介绍的 CDI 定义节点上的设备描述，供运行时按全名展开设备节点、访问规则和库挂载等配置。此处要追的输入是形如 `设备类别=设备名` 的 CDI 全名。containerd 的 CRI 实现在 `CreateContainer` 中用该名称查规格，组装 OCI（Open Container Initiative）运行时配置。创建成功后，kubelet 经 `StartContainer` 启动容器。 [CRI v0.36.0 接口](https://github.com/kubernetes/cri-api/blob/v0.36.0/pkg/apis/runtime/v1/api.proto) · [CDI 1.1.0 规范](https://github.com/cncf-tags/container-device-interface/blob/v1.1.0/SPEC.md) · [containerd v2.3.0 容器创建实现](https://github.com/containerd/containerd/blob/v2.3.0/internal/cri/server/container_create_linux.go)
+如果节点有两张以上空闲卡，kubelet 按以下三步敲定分配并落盘：
+- **征询偏好与拓扑**：若插件声明支持 `GetPreferredAllocation`，kubelet 会先向插件请求选卡建议（如优先同一互联域），再结合本地拓扑约束拍板（第 15 章详讲 Topology Manager）。
+- **调用插件 `Allocate`**：选定设备 ID 后，kubelet 调用插件 `Allocate`。插件校验 ID 合法后返回 `ContainerAllocateResponse`，可携带设备节点、挂载点、环境变量、注解或 CDI 全名（可选的 `PreStartContainer` 钩子需插件声明，NVIDIA `v0.20.1` 未启用）。
+- **持久化与回收**：分配成功后，Device Manager 按“Pod UID + 容器名 + 资源名”把设备 ID 与交接配置写入本地检查点。容器创建时取出使用；Pod 不再活跃后清理占用，健康卡重回候选池。
+
+## 从 `Allocate` 响应到 containerd 原生 CDI 注入
+
+拿到 `Allocate` 响应后，kubelet 经 CRI 向 containerd 发起 `CreateContainer`。原生 CDI 路径的交接非常干脆，如图 11-04-01 所示。
 
 ```mermaid
 sequenceDiagram
-    participant K as gpu-h 上的 kubelet
+    accDescr: Pod 绑定到节点后，kubelet 扣除已占设备选出目标卡，调用 NVIDIA Device Plugin 的 Allocate 获取 CDI 全名，再通过 CRI CreateContainer 交由 containerd 解析规格并启动容器。
+    participant K as 节点 kubelet
     participant P as NVIDIA Device Plugin
     participant R as containerd CRI
-    Note over K: Pod 已绑定 gpu-h
-    K->>K: 健康设备扣除已有分配，选出 B
-    K->>P: Allocate（B 的设备 ID）
-    P-->>K: ContainerAllocateResponse（B 的 CDI 全名）
-    K->>K: 记录设备 ID 与交接配置
-    K->>R: CreateContainer（含该全名）
-    R->>R: 查找节点规格，展开 OCI 修改
+    Note over K: Pod 已完成节点绑定
+    K->>K: 健康集合扣除已分配集合，选出目标卡
+    K->>P: Allocate（传入目标卡设备 ID）
+    P-->>K: ContainerAllocateResponse（返回 CDI 全名）
+    K->>K: 持久化设备 ID 与交接配置
+    K->>R: CreateContainer（携带同一 CDI 全名）
+    R->>R: 查本机 CDI 规格，组装 OCI 修改
     R-->>K: 返回容器 ID
     K->>R: StartContainer
 ```
 
-下例是独立插件的教学配置摘录，省略了部署、卷和容器运行时配置。整卡在插件清单中以 GPU UUID 作为设备 ID。`deviceIDStrategy: uuid` 使插件对外传递设备选择时也保留 UUID，`cdi-cri` 使它把 CDI 全名放入分配响应。Kubernetes 自 v1.31 起将 Device Plugin 返回 CDI 全名的支持转为稳定版。 [NVIDIA v0.19.2 设备 ID](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.2/internal/rm/devices.go) · [NVIDIA v0.19.2 配置选项](https://github.com/NVIDIA/k8s-device-plugin/tree/v0.19.2#configuration-option-details) · [Kubernetes CDI 设备插件支持](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-implementation)
+*图 11-04-01：Pod 绑定后，kubelet 本地选卡、调用插件 `Allocate` 并经由 CRI 将 CDI 全名交接给 containerd 的完整时序。*
+
+要让 NVIDIA Device Plugin `v0.20.1` 走这条原生 CDI 路径，只需关注三项核心参数（自 Kubernetes v1.31 起，Device Plugin 返回 CDI 全名的支持已转稳定版）：
 
 ```yaml
 version: v1
 flags:
-  migStrategy: none
+  migStrategy: none               # 整卡模式，关闭 MIG 切分
   plugin:
-    deviceListStrategy: cdi-cri
-    deviceIDStrategy: uuid
+    deviceListStrategy: cdi-cri   # 通过 CRI 原生字段传递 CDI 全名
+    deviceIDStrategy: uuid        # 以 GPU UUID 作为设备标识
 ```
 
-把 B 的教学 UUID 记作 `GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`。将同一次创建请求中的三处字段逐字对齐，就能检查运行时是否有条件获得 B 的配置。
+整卡清单中，插件默认使用 GPU UUID 作为设备 ID。启用 `cdi-cri` 后，插件启动时会在宿主机 `/var/run/cdi` 生成节点 CDI 规格（官方 Helm 模板将该目录挂进插件容器）。
 
-| 位置 | 本例的对应值 |
+宿主机另一侧，containerd 2.3.0 的 `version = 3` 配置默认开启 `enable_cdi`。它会自动扫描 `/etc/cdi` 与 `/var/run/cdi` 两个目录。
+
+设目标 H100 的 UUID 为 `GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`。排查交接是否畅通，只需逐字对齐下面三处字符串：
+
+| 观察位置 | 本例应完全一致的对应值 |
 | --- | --- |
-| `Allocate` 返回的容器条目 | `k8s.device-plugin.nvidia.com/gpu=GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb` |
-| `CreateContainerRequest.config` | `CDI_devices[].name` 为相同全名，Go 字段名为 `CDIDevices`。 |
-| 节点上的 CDI 规格 | `kind` 为 `k8s.device-plugin.nvidia.com/gpu`，`devices[].name` 中的 B 为该 UUID。 |
+| `Allocate` 响应的 CDI 条目 | `k8s.device-plugin.nvidia.com/gpu=GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb` |
+| CRI `CreateContainerRequest.config` | `CDI_devices[].name`（Go 字段名 `CDIDevices`）携带相同全名 |
+| 宿主机 `/var/run/cdi` 规格文件 | `kind` 为 `k8s.device-plugin.nvidia.com/gpu`，`devices[].name` 含该 UUID |
 
-本例的 CDI kind 由 v0.19.2 的独立插件决定，扩展资源键 `nvidia.com/gpu` 则用于 Kubernetes 计数。插件启动时生成规格，官方 Helm 模板把 `/var/run/cdi` 映射到宿主机。containerd v2.3.0 的版本 3 配置中，`io.containerd.cri.v1.runtime` 默认开启 `enable_cdi`，扫描 `/etc/cdi` 与 `/var/run/cdi`。要证实一次交付，需检查本次请求、实际生成的全名和运行时的有效规格集合。 [NVIDIA v0.19.2 规格生成](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.2/internal/cdi/cdi.go) · [插件启动与规格生成](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.2/cmd/nvidia-device-plugin/plugin-manager.go) · [官方 Helm 模板](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.2/deployments/helm/nvidia-device-plugin/templates/daemonset-device-plugin.yml) · [containerd v2.3.0 配置](https://github.com/containerd/containerd/blob/v2.3.0/docs/cri/config.md)
+> [!note] 其他交接策略：为什么独立部署常见 `envvar`？
+> 独立 NVIDIA Device Plugin `v0.20.1` 的默认 `deviceListStrategy` 仍是 `envvar`。该模式通过 `NVIDIA_VISIBLE_DEVICES` 环境变量传递已选卡，因此容器创建必须走能消费该变量的 NVIDIA Container Runtime 包装层（见第 10 章第 04 篇）。
+>
+> 此外插件还支持 `volume-mounts` 与 `cdi-annotations`。更换策略只改变交接媒介与消费者，资源计数与选卡逻辑保持不变。
 
-独立插件 v0.19.2 的默认策略是 `envvar`。这条路用 `NVIDIA_VISIBLE_DEVICES` 传递已选设备，要求本次创建经过能消费这个变量的 NVIDIA Runtime。其他策略还可用 `volume-mounts` 传挂载标记，或用 `cdi-annotations` 传 CDI 注解，由相应消费者解析。改变策略会改变交接的媒介和消费者。第 10 章用运行时 handler 与实际创建记录说明怎样辨认这些路径。 [NVIDIA v0.19.2 设备列表策略](https://github.com/NVIDIA/k8s-device-plugin/tree/v0.19.2#configuration-option-details)
+## 跨层核验：从本地分配到容器计算闭环
 
-## 从分配 ID 验证到 CUDA 计算
+确认一次整卡交付真正成功，要把“节点分配、容器可见、算子跑通”三层证据对齐到同一个 Pod UID 和容器名：
 
-同一个 Pod 的各项证据应按节点、Pod UID、容器名和时间对齐。kubelet V(4) 发起分配前的 `devices`、`resourceName`、`pod`、`containerName` 说明它准备请求哪些 ID。后续还需看 RPC 结果。对正在运行的 Pod，可从 kubelet 本地 `/var/lib/kubelet/pod-resources/kubelet.sock` 查询 PodResources `List`，按命名空间、Pod 名和容器名定位 `resource_name`、`device_ids`。本例的设备 ID 应是 B 的 UUID。 [kubelet v1.36.0 分配日志](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go) · [Kubernetes v1.36 PodResources API](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#monitoring-device-plugin-resources)
+```text
+# 1) kubelet 本地分配日志（-v=4 级别，确认发起 Allocate 前的选中结果）
+I1120 10:05:11.042 kubelet "Allocated devices"
+  pod="gpu-example/probe" containerName="workload"
+  resourceName="nvidia.com/gpu" devices=["GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]
 
-主机和容器各运行 `nvidia-smi -L`，用 UUID 核对容器枚举的卡。若 B 是 CUDA 进程唯一可见的卡，且进程没有额外掩码，则 CUDA 序号为 0。最后在兼容镜像中运行一轮探针，按 UUID 确认设备，让一个 Kernel 写入整数 7，同步后拷回并校验。分配记录、管理枚举和探针结果分别覆盖本地分配、设备可见和计算成功。 [NVIDIA SMI 设备查询](https://docs.nvidia.com/deploy/nvidia-smi/index.html) · [CUDA 13.2.1 枚举](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/05-appendices/environment-variables.html#cuda-visible-devices) · [CUDA 13.2.1 同步 API](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__DEVICE.html)
+# 2) 查询本机 PodResources API（/var/lib/kubelet/pod-resources/kubelet.sock）
+#    确认运行中容器绑定的 resource_name="nvidia.com/gpu" 与 device_ids 一致
 
-## 绑定与本地接纳之间的健康变化
+# 3) 宿主机与容器内分别执行 nvidia-smi -L 核对 UUID，再跑最小 CUDA 探针
+$ kubectl -n gpu-example exec probe -- nvidia-smi -L
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb)
+# 仅此卡可见且无额外掩码时，容器内 CUDA 进程序号为 0；
+# 运行兼容探针写入整数 7、同步并拷回校验通过，即完成计算验收。
+```
 
-如果 B 在节点绑定之后、kubelet 分配之前被标记为不健康，并且设备管理器已处理更新，本地健康集合就变成 `{A}`。扣除 A 的已有分配后候选为空，即使 API 中还显示旧的 `Allocatable: 2`，kubelet 在这个阶段也无法选出一张卡。此时应按时间对齐设备列表和本地分配记录。若已经发出 `Allocate`，则再查该调用的返回，找出失败发生在本地选择还是插件处理。 [kubelet v1.36.0 健康检查与设备分配](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)
+> [!tip] 工程直觉：三层证据各管一摊
+> PodResources `List` 证明 kubelet 本地账本已把目标 UUID 分给容器。`nvidia-smi -L` 证明管理通道可见。最小 CUDA 探针同步回读成功，才最终排除第 10 章讲过的驱动库失配或设备权限拦截。
+
+## 竞态变体：绑定之后、选卡之前卡突然坏了
+
+设想一个真实的时序竞态。调度器读缓存看到 `node-h100` 的 `Allocatable` 为 `2`、已占 `1`，于是把新 Pod 绑定过去。就在绑定完成到 kubelet 选卡的短短间隙，空闲的第二张卡突然故障，插件立刻推来新清单将其标为 `Unhealthy`。
+
+kubelet 处理完新清单后，本机健康集合瞬间只剩已占用的第一张卡。再做集合减法，空闲候选为空。此时即使 API Server 里的 Node 状态尚未刷新、仍挂着旧的 `Allocatable: 2`，kubelet 也会在**本地接纳选卡阶段直接失败**，根本走不到调用 `Allocate` 那一步。
+
+> [!warning] 常见误区：API 里还有余量，本地为何接纳失败？
+> 调度器看到的 `Allocatable` 是异步同步的控制面快照，kubelet 选卡则以本机实时健康集合为准。遇到“已绑定却本地分配失败”，务必按时间戳对齐节点 `ListAndWatch` 健康更新、本地分配记录与 `Allocate` 调用返回，先切清究竟死在本地选卡还是插件 RPC。
+
+至此，Device Plugin 整卡路径已完整闭合。回到第 03 篇留下的问题：如果集群有混装节点，或业务想直接按“显存大于 40 GiB”逐卡申请，整数扩展资源已经力不从心。下一篇正式切入下一代机制——DRA。
+
+---
+
+> [!info]- 参考资料
+> - **Kubernetes Device Plugin 实现与监控**：[Device Plugin Implementation (v1.36)](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-implementation)、[Monitoring Device Plugin Resources - PodResources API (v1.36)](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#monitoring-device-plugin-resources)
+> - **CRI、CDI 与 containerd 规范**：[CRI v0.36.0 api.proto](https://github.com/kubernetes/cri-api/blob/v0.36.0/pkg/apis/runtime/v1/api.proto)、[CDI 1.1.0 Specification](https://github.com/cncf-tags/container-device-interface/blob/v1.1.0/SPEC.md)、[containerd v2.3.0 CRI 配置](https://github.com/containerd/containerd/blob/v2.3.0/docs/cri/config.md)、[containerd v2.3.0 container_create_linux.go](https://github.com/containerd/containerd/blob/v2.3.0/internal/cri/server/container_create_linux.go)
+> - **NVIDIA 设备插件 v0.20.1 源码与配置**：[Configuration Option Details](https://github.com/NVIDIA/k8s-device-plugin/tree/v0.20.1#configuration-option-details)、[server.go](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.20.1/internal/plugin/server.go)、[devices.go](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.20.1/internal/rm/devices.go)、[cdi.go](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.20.1/internal/cdi/cdi.go)、[plugin-manager.go](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.20.1/cmd/nvidia-device-plugin/plugin-manager.go)、[Helm DaemonSet 模板](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.20.1/deployments/helm/nvidia-device-plugin/templates/daemonset-device-plugin.yml)
+> - **kubelet 与 CUDA 核验参考**：[kubelet v1.36.0 Device Manager](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)、[kubelet v1.36.0 container_manager_linux.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/container_manager_linux.go)、[NVIDIA SMI](https://docs.nvidia.com/deploy/nvidia-smi/index.html)、[CUDA 13.2.1 可见设备](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/05-appendices/environment-variables.html#cuda-visible-devices)、[CUDA 13.2.1 同步 API](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__DEVICE.html)

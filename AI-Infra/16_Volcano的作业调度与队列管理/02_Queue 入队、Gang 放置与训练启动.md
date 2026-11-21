@@ -1,9 +1,16 @@
+# Queue 入队、Gang 放置与训练启动
 
-`train-12` 固定要三只 worker Pod，分别放在 `h1`、`h2`、`h3`。每台节点的 Allocatable（可供 Pod 请求的容量）为 8 GPU、32 CPU、192 GiB 主机内存、2 个支持 RDMA 的 VF。每个 worker 请求 4 张 H100 80 GB 整卡、16 CPU、96 GiB、1 VF。三台节点用同一可互通的网络域，这比第 15 章的多网络域例子少一层约束。本篇按 Volcano v1.16.0 的 `enqueue, allocate` 教学配置推演，启用 `capacity`、`predicates` 和 `gang`。以下快照中的余量都已扣除调度器计入的请求，除特别说明外，其余资源和网络条件满足。 [Volcano v1.16.0 Actions](https://volcano.sh/docs/v1.16.0/scheduler/actions/)
+很多工程师第一次用 Volcano 排障，都会遇到两种让人摸不着头脑的“干等”现象：
 
-## Queue 有效上限与最低入队请求
+一种是作业明明提交成功了，集群里还有整机空闲，却连一只 worker Pod 都没创建出来；另一种是 3 只 worker Pod 全都创建出来了，集群总计还空着 14 张卡（大于作业所需的 12 张），结果所有 Pod 依然纹丝不动地卡在 `Pending`。
 
-`train` 是一组 PodGroup 共用的资源账本。它开放接纳作业，GPU 维度的使用上限（`capability`）为 16，应得份额（`deserved`）为 12。应得份额供共享竞争时使用，空闲资源可以让队列用到上限。下列配置只展示本例需要的 GPU 维度，其他维度的有效容量充足，且无任何队列的专属保留。 [Volcano v1.16.0 Queue](https://volcano.sh/docs/v1.16.0/concepts/queue/) · [Capacity 配置指南](https://volcano.sh/docs/v1.16.0/userguide/user_guide_how_to_use_capacity_plugin/)
+这两种现象，正好对应 Volcano 调度流程里的**两道硬关卡**：第一道是**队列入队（`enqueue`）**，第二道是**节点成组放置（`allocate` + `gang`）**。
+
+## 一、第一道关卡：Queue 有效上限与 `enqueue` 放行
+
+本篇使用三节点单网络域资源池（`node-1`–`node-3`，每台可分配 `8` GPU、`32` CPU、`192 GiB` 内存与 `2` RDMA VF），部署上一篇定义的 `train-12`（3 只 worker，各需 4 卡，每节点最多 1 只）。
+
+队列 `train` 开放接纳作业，其 GPU 配额配置如下（假设其他资源维度充足，且全池无专属保留）：
 
 ```yaml
 apiVersion: scheduling.volcano.sh/v1beta1
@@ -12,85 +19,120 @@ metadata:
   name: train
 spec:
   capability:
-    nvidia.com/gpu: "16"
+    nvidia.com/gpu: "16"    # 队列最高使用上限（硬封顶）
   deserved:
-    nvidia.com/gpu: "12"
+    nvidia.com/gpu: "12"    # 队列应得份额（共享竞争与回收时的基准线）
 ```
 
-Job Controller 先为 Job 建立 PodGroup，写入 `minMember=3` 和 `minResources` 中 12 GPU 等最低请求。在本例的平级队列中，`enqueue` 调用 `capacity`，检查队列开放状态和各资源维度的有效上限。典型非空最低请求的账式为 `新组最低请求 + 已分配 + 在途 − 弹性校正`。在途表示已经放行且还需计入的资源，插件在统计时扣除同一组已分配的部分。弹性校正来自已有作业中超出最低规模的可弹性部分。本例两项均为 0，GPU 有效上限为 16。若检查通过，PodGroup 进入 `Inqueue`。Job Controller 看到组阶段已有值且已离开 `Pending`，才继续创建成员。 [v1.16.0 capacity 入队检查](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/capacity/capacity.go#L1621-L1667) · [v1.16.0 enqueue](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/actions/enqueue/enqueue.go) · [v1.16.0 Pod 同步条件](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L400-L414)
+Job Controller 为 `train-12` 生成 `PodGroup` 后，该组最初处于 `Pending`。此时还没有任何 worker Pod 被创建——Volcano 刻意把“创建 Pod”推迟到队列确认有额度之后，避免大量无法运行的空 Pod 撑爆 API Server 与调度器缓存。
 
-## 节点筛选、暂选放置与 Gang 提交
+在每个调度周期的 `enqueue` 步骤，`capacity` 插件会先确认队列处于开放状态，再对每个资源维度核验入队不等式：
 
-NodeSelector 用标签选出 H100 80 GB 节点。Pod 的硬性反亲和按主机名划定范围，要求同一命名空间内带 `infra.example.com/workload: train-12` 标签的 Pod 分居不同节点。以下是 `spec.tasks[0].template.spec` 中的新增字段，标签应写在同一模板的 metadata。每节点最多一只本作业的 worker，所以一台余 8 卡的节点仍只贡献一个落点。 [Kubernetes v1.36 节点选择与 Pod 反亲和](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+$$\text{新组 } \texttt{minResources} + \text{已分配 } (\text{allocated}) + \text{在途 } (\text{inqueue}) - \text{弹性校正 } (\text{elastic}) \le \text{队列有效上限}$$
+
+式中有两项容易被忽略的账目：
+
+- **在途资源（`inqueue`）**：已经通过入队放行、但尚未全部分配落地的同队列组所占的最低预算（统计时会自动扣除同一组已实际分配的部分，防止重复记账）。
+- **弹性校正（`elastic`）**：同队列已有作业中，超出其最低门槛、属于可弹性伸缩的那部分余量。
+
+当本例的 `inqueue` 与 `elastic` 均为 `0` 时，只需检查 `新组 12 GPU + 已分配 ≤ 16 GPU`。只要不等式成立，调度器就把 `PodGroup` 推进到 **`Inqueue`**，Job Controller 随即按模板批量创建 3 只 worker Pod。
+
+## 二、第二道关卡：节点筛选、暂选放置与 Gang 原子提交
+
+Pod 创建出来后，进入 `allocate` 阶段。除了核对四维资源余量，`train-12` 的 Pod 模板还额外附加了卡型选择与“每节点最多一只本作业 worker”的硬性反亲和：
 
 ```yaml
+# 写入 VolcanoJob 的 spec.tasks[0].template.spec
 nodeSelector:
-  infra.example.com/gpu-model: h100-80gb
+  infra.example.com/gpu-model: h100-80gb        # 限定 H100 80 GB 节点池
 affinity:
   podAntiAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
       - labelSelector:
           matchLabels:
-            infra.example.com/workload: train-12
-        topologyKey: kubernetes.io/hostname
+            infra.example.com/workload: train-12 # 匹配同作业所有 worker Pod
+        topologyKey: kubernetes.io/hostname     # 按宿主机隔离，每节点至多 1 只
 ```
 
-在三个连续时点，分别看队列还有多少容量、节点能提供几个完整落点。
+由于硬性反亲和生效，一台空出 8 张卡的节点也只能为 `train-12` 贡献 **1 个**落点，而不是 2 个。
 
-| 快照 | 已有 GPU 请求 | `train` 账面（GPU） | `h1 / h2 / h3` GPU 余量 | 可放 worker |
+下面我们沿三个连续快照，对照跟踪队列账面与三台节点（表格括号内为图内节点简标）的余量变化：
+
+| 快照阶段 | 集群内已有 GPU 占用 | `train` 队列账面（GPU） | `node-1 (h1) / node-2 (h2) / node-3 (h3)` GPU 余量 | 合格 worker 落点数 |
 | --- | --- | --- | --- | ---: |
-| A，提交作业 | `train` 在 `h1/h2` 各用 4 | `8 + 12 = 20 > 16`，继续等入队 | `4 / 4 / 8` | 3 |
-| B，入队后 | `h1` 旧成员退出并归账，`h2` 的 4 卡保留。新成员首次参与放置前，`batch` 已在 `h3` 占 6 卡 | `4 + 12 = 16`，通过入队 | `8 / 4 / 2` | 2 |
-| C，节点资源释放后 | `h3` 上 `batch` 的一个 2 卡 Pod 退出并归账 | 新组的 12 卡放入后合计 16 | `8 / 4 / 4` | 3 |
+| **快照 A：提交作业** | `train` 在 `node-1`、`node-2` 各占 4 卡 | `8 + 12 = 20 > 16`，阻塞在 `Pending` | `4 / 4 / 8`（共余 16） | 3（仅作容量对照） |
+| **快照 B：放行入队后** | `node-1` 旧成员退出归账；新组放置前，`batch` 在 `node-3` 占 6 卡 | `4 + 12 = 16 ≤ 16`，进入 `Inqueue` | `8 / 4 / 2`（共余 14） | **2**（无法凑齐 3 员） |
+| **快照 C：节点释卡后** | `node-3` 上 `batch` 的 1 只 2 卡 Pod 退出归账 | 新组 12 卡计入后合计 16 | `8 / 4 / 4`（共余 16） | **3**（达标提交绑定） |
 
 ![快照 A 中 train 用量 8 加最低需求 12 超过上限 16，三个节点在容量上各有一个落点。快照 B 中 4 加 12 等于 16，作业已经入队，h3 仅余 2 张卡。](images/fig-16-02-01-queue-and-gang.png)
 
-图 16-02-01　队列与节点的两道检查。快照 A 仍在等入队，图中的三个落点是假设已有待放置成员时的节点容量。快照 B 已可创建成员，但只有两个落点。图中的「可分配」指扣除已有请求后的调度余量。
+*图 16-02-01：队列与节点的两道检查（图中 `h1`/`h2`/`h3` 依次对应 `node-1`/`node-2`/`node-3`，“可分配”指扣除已计入请求后的调度余量）。快照 A 卡在队列上限，尚未创建 Pod；快照 B 虽已入队且总余 14 卡，却因第三台节点仅余 2 卡而无法凑齐 3 个落点。*
 
-对快照 B，`allocate` 读取三个待放 Pod，检查队列是否允许增加请求，在候选节点上检查资源向量、标签和反亲和，然后给合格节点打分。它可以暂选 `h1` 和 `h2`，并将暂选结果计入下一只 Pod 的判断。第三只被同组反亲和排除在前两台之外，`h3` 的 2 GPU 也小于 4。Gang（成组调度）插件检查整组和适用的角色门槛。本例两者都是 3，且没有已绑定的成员或即将释放的候选资源，因此本轮无法提交这两个暂选绑定。即使总余量 `8 + 4 + 2 = 14` 超过需求 12，结果也一样。 [v1.16.0 allocate 提交逻辑](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/actions/allocate/allocate.go) · [v1.16.0 Gang 的组及角色检查](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/gang/gang.go#L175-L196)
+看清快照 B 里的执行细节，就能彻底理解 Volcano 的**事务型放置（Statement）**：
 
-快照 C 可各选一台节点，整组和 `worker` 角色的门槛同时满足，调度器提交放置并为各 Pod 发起绑定。此后各节点分别启动容器，节点侧设备准备、镜像加载和应用启动有各自的状态和耗时。 [v1.16.0 调度事务](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/framework/statement.go) · [Kubernetes v1.36 Pod 生命周期](https://v1-36.docs.kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+1. `allocate` 读到 3 只待放置的 worker Pod，先校验队列额度允许增量分配。
+2. 对第 1、2 只 Pod，调度器依次在调度事务中**暂选** `node-1` 和 `node-2`，并把暂选占用立刻反映到后续判断中。
+3. 轮到第 3 只 Pod 时，前两台已被同组硬反亲和排除，而第三台仅余 2 卡（`< 4`），筛选结果为空。
+4. 最后由 `gang` 插件核验整组门槛（`minMember=3`）与角色门槛（`minTaskMember.worker=3`）：当前只有 2 个暂选落点，既无已绑定成员也无待释流水线，判定不达标——**调度器直接回滚整个事务，撤销前两只 Pod 的暂选绑定**。
 
-## Pod 绑定、会合与进程组就绪
+直到快照 C 释放了第三台节点的 2 张卡，余量变成 `8 / 4 / 4`，三台节点各自承接一只 worker，整组与角色门槛同时满足，调度器才一次性原子提交 3 个绑定请求。
 
-每个 worker Pod 内的 `torchrun` Agent 使用相同的会合后端、会合标识和可达端点。**会合**（Rendezvous）让本轮的三个 Agent 确认成员和分工，`--nnodes=3 --nproc-per-node=4` 表示三台节点、每节点四个进程。进程总数为 `WORLD_SIZE=3 × 4=12`，每个进程在本轮有一个全局编号 Rank，并按本地编号选用容器可见的 GPU。应用建立进程组后还需验证首次集合通信能够完成。DNS 可用时，可以用 Volcano 的可选 `svc` 作业插件协助成员发现，由应用配置选择其中实际提供会合服务的端点。 [PyTorch 2.9 torchrun](https://docs.pytorch.org/docs/2.9/elastic/run.html) · [Volcano v1.16.0 SVC 插件](https://volcano.sh/docs/v1.16.0/userguide/user_guide_how_to_use_svc_plugin/)
+> [!summary] 核心结论
+> 队列总量达标只让你拿到“入场券”（生成 Pod）；能不能真正落座，要看全组所有必需成员能否在同一轮调度事务中凑齐合格节点。只要差一个落点，已暂选的其他成员也会整体回滚，杜绝死锁。
 
-下面是三只 Pod 启动器使用同一组配置的示意命令。`rdzv.training.example` 代表本轮可达的会合服务主机，部署时替换为真实主机和端口。`train.py` 为镜像中的训练入口。
+## 三、绑定之后：kubelet 交付、会合与弹性门槛
 
-```bash
-torchrun --nnodes=3 --nproc-per-node=4 --rdzv-backend=c10d \
-  --rdzv-id=train-12-run1 --rdzv-endpoint=rdzv.training.example:29400 train.py
-```
+调度器提交绑定只是控制面交接的终点。接下来，三台节点的 kubelet 各自并行拉取镜像、向 Device Plugin 申请具体 GPU 与 RDMA VF，并在容器内拉起训练启动器。
 
-若只想在快照 B 的两台节点启动，需要区分三种条件。
-
-| 新提交的规格 | 可提交的放置与训练结果 |
-| --- | --- |
-| 只把 Job 的 `minAvailable` 改成 2，Task 仍为 3 | v1.16.0 发现整组门槛 2 小于角色门槛之和 3，跳过逐角色检查。最低 GPU 请求按两个副本计为 8，两只可先绑定，固定三节点应用继续等。 |
-| 同时把 Job 与 Task 的 `minAvailable` 改为 2，`replicas` 仍为 3 | 两只 Pod 能先绑定，最低 GPU 请求也降至 8。仍用 `--nnodes=3` 时，两个 Agent 等第三台。 |
-| 两级门槛均为 2，且训练应用支持 `--nnodes=2:3` | 若本轮只有两个 Agent 完成会合，`WORLD_SIZE=8`。第三个在下一轮加入时，应用需要按新规模恢复和重新分工。 |
-
-在本例的单角色规格中，前两行都可能先交付两只 Pod。将两级门槛都写成 2，可以明确表达最低规模。留空 Task 的门槛时，无分区策略的 v1.16.0 webhook 会按 `replicas` 补值。多角色作业若把整组门槛降到各角色之和以下，就可能让部分角色没有最低副本保障。选择门槛要回到应用能用哪些成员推进。 [v1.16.0 Task 默认化](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/webhooks/admission/jobs/mutate/mutate_job.go#L180-L211) · [v1.16.0 最低资源计算](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L895-L928) · [v1.16.0 角色检查分支](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/api/job_info.go#L1056-L1128) · [PyTorch 2.9 会合与成员变化](https://docs.pytorch.org/docs/2.9/elastic/rendezvous.html)
-
-## 入队、绑定和应用等待的证据
-
-下面的只读命令用于对应作业、组、队列和成员。命令面向采用上述命名且已安装 Volcano 的集群。事件按 `regarding.uid`、报告组件和时间筛选，再解读 `reason` 与 `note`。 [Kubernetes v1.36 Event API](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/events/event-v1/)
+三只 Pod 内的 `torchrun` Agent 通过统一的会合后端、会合标识与可达端点完成多机会合（使用 Volcano 可选 `svc` 插件可自动创建 Headless Service 辅助 DNS 发现）：
 
 ```bash
-kubectl get jobs.batch.volcano.sh train-12 -n ai-demo -o yaml
-kubectl get podgroups.scheduling.volcano.sh -n ai-demo -o yaml
-kubectl get queues.scheduling.volcano.sh train -o yaml
-kubectl get pods -l infra.example.com/workload=train-12 -n ai-demo -o yaml
-kubectl get events.events.k8s.io -n ai-demo -o yaml
+# 三只 worker Pod 使用相同的 rdzv-id 与可达会合端点，凑齐 3 节点 × 4 进程 = 12 进程
+torchrun --nnodes=3 --nproc-per-node=4 \
+  --rdzv-backend=c10d \
+  --rdzv-id=train-12-run1 \
+  --rdzv-endpoint=rdzv.training.example:29400 \
+  train.py
 ```
 
-| 当前证据 | 下一步 |
+只有当全部 12 个进程（`WORLD_SIZE = 3 × 4 = 12`）完成会合、建立进程组并跑通首次集合通信，训练才真正进入计算循环。
+
+如果业务希望在快照 B（仅两台节点够放）时就能降级启动，必须同时对齐 **Volcano 两级门槛**与 **应用启动参数**。下面对比三种修改结果：
+
+| 新提交的作业规格与启动参数 | Volcano 调度行为与训练结果 |
 | --- | --- |
-| 已有 Job，找不到由这个 UID 拥有的 PodGroup | 查 Job Controller 的同步错误与 Job 的 `.status.state.phase`。若 Job 本身写入失败，从提交的 API 返回查校验或 webhook。 |
-| 组为 `Pending`，worker 尚未创建 | 查 `spec.minResources`、Queue `.status.state` 和 `.status.allocated`。账面似乎有余量时，进一步查 scheduler 会话中的 `inqueue`、`elastic` 和有效上限。 |
-| 组已入队，worker 已生成，当前 Pod 的 `spec.nodeName` 为空 | 查 PodGroup `.status.conditions`、节点筛选事件和当前可落点数。若入队后仍无 worker，则先追控制器创建成员的结果。 |
-| Pod 已绑定或容器已经启动 | 用 `PodScheduled`、节点事件和容器 `state` 区分 kubelet 准备与应用运行。若容器都已启动，核对 Agent 端点、会合标识、最终 `WORLD_SIZE` 和通信进度。 |
+| 仅把 Job `minAvailable` 改为 `2`，Task 仍留 `3` | Volcano `v1.16.0` 检测到整组门槛（2）小于各角色门槛之和（3），**跳过逐角色校验**；最低需求按 2 只计（8 GPU），两只 Pod 先绑定，但固定 `--nnodes=3` 的训练进程仍会无限等第三台。 |
+| Job 与 Task 的 `minAvailable` 均改 `2`，`replicas` 仍为 `3`，仍用 `--nnodes=3` | 两只 Pod 干净通过双门槛并先绑定，但应用层未放开弹性会合，两个 Agent 依然原地苦等第 3 个节点。 |
+| 两级 `minAvailable` 均为 `2`，且启动命令改为弹性 `--nnodes=2:3` | 两个 Agent 先完成会合，以 `WORLD_SIZE = 2 × 4 = 8` 开跑；待第三只 Pod 后续绑定启动后，由框架触发弹性扩员与状态重分片。 |
 
-`.status.allocated` 可用于核对队列分配量。处于不同写入时点的 Queue 状态、PodGroup 条件和 Pod 事件需结合 UID 和时间读。Volcano v1.16.0 的 `capacity` 达到队列有效上限时可能给 PodGroup 记 `Unschedulable` 事件，具体资源和原因还要查看消息。 [v1.16.0 capacity 事件路径](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/capacity/capacity.go) · [Volcano v1.16.0 PodGroup 状态](https://volcano.sh/docs/v1.16.0/concepts/podgroup/)
+> [!warning] 常见误区：门槛缩水破坏多角色保障，或忘记对齐应用参数
+> 1. 在 Volcano `v1.16.0` 中，如果留空 Task 的 `minAvailable`（且未启用分区策略），Webhook 会默认将其补全为 `replicas`。对于多角色作业，切忌把整组 `minAvailable` 改得比各角色之和还小，否则会绕开逐角色检查，导致关键角色缺失。
+> 2. **调度器只负责把容器送进节点，不改写应用命令行**。把成组门槛降为 2 却保留固定 `--nnodes=3`，只会把“调度器排队”变成“两台节点空占 8 张卡干等会合”的资源黑洞。
 
-快照 A 的解法需要改变队列账本，快照 B 的解法需要改变特定节点的余量。队列份额、作业顺序和节点评分分别作用在这两道检查的不同位置。
+## 四、只读排查：快速定位卡在哪一道门
+
+当作业迟迟没出训练日志时，先用下面五条只读命令按“作业 → 组 → 队列 → Pod → 事件”拉出完整现场，并按 `regarding.uid` 和时间戳把事件与具体对象对齐：
+
+```bash
+kubectl get jobs.batch.volcano.sh train-12 -n ai-demo -o yaml       # 1. 查 Job 阶段与规格
+kubectl get podgroups.scheduling.volcano.sh -n ai-demo -o yaml      # 2. 查 PodGroup 阶段、minResources 与条件
+kubectl get queues.scheduling.volcano.sh train -o yaml              # 3. 查 Queue 开放状态与 .status.allocated
+kubectl get pods -l infra.example.com/workload=train-12 -n ai-demo -o yaml  # 4. 查 Pod 是否已创建及 spec.nodeName
+kubectl get events.events.k8s.io -n ai-demo -o yaml                 # 5. 按 regarding.uid 核对失败原因与消息
+```
+
+拿到对象快照后，直接按下面四步对照定位当前卡点：
+
+| 当前观察到的现象 | 阻塞阶段 | 下一步核对重点 |
+| --- | --- | --- |
+| API 中有 `VolcanoJob`，但查不到该 UID 拥有的 `PodGroup` | 控制器建组阶段 | 查 Job Controller 同步错误与 Job `.status.state.phase`；若提交时即报错，核对 Webhook 拒绝消息。 |
+| `PodGroup` 停在 `Pending`，集群中没有任何 worker Pod | `enqueue` 队列准入 | 核对 `spec.minResources`、Queue `.status.state` 与 `.status.allocated`；若账面看似够用，排查在途资源 `inqueue`、有效上限或 `Unschedulable` 事件详情。 |
+| `PodGroup` 已进 `Inqueue` 且 Pod 已创建，但 `spec.nodeName` 为空 | `allocate` 成组放置 | 查 `PodGroup` `.status.conditions` 与 Pod 调度事件，逐台核对节点四维余量、标签及反亲和是否凑足 `minMember`；若入队后无 Pod，回头查 Job Controller 创建失败事件。 |
+| 所有 Pod 已有 `spec.nodeName`，容器启动中或已 `Running` | 节点交付或应用会合 | 用 `PodScheduled`、节点事件和容器 `state` 区分镜像/设备准备；若容器已全部 `Running`，转查 `torchrun` 会合端点、`rdzv-id`、`WORLD_SIZE` 与首次集合通信日志。 |
+
+回看快照 A 和快照 B：快照 A 要疏通的是**队列账本**，快照 B 要疏通的是**具体节点的物理余量**。下一篇，我们就打开队列份额、作业排序与节点装箱三个旋钮，看看多团队、训推混部集群如何合理分配账本与节点空间。
+
+> [!info]- 参考资料
+> - **Volcano 动作、队列与入队机制**：[Volcano v1.16.0 Actions](https://volcano.sh/docs/v1.16.0/scheduler/actions/)、[Queue 概念](https://volcano.sh/docs/v1.16.0/concepts/queue/)、[PodGroup 状态](https://volcano.sh/docs/v1.16.0/concepts/podgroup/)、[Capacity 插件配置指南](https://volcano.sh/docs/v1.16.0/userguide/user_guide_how_to_use_capacity_plugin/)、[capacity 入队检查源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/capacity/capacity.go#L1621-L1667)、[capacity 事件与实现源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/capacity/capacity.go)、[enqueue 动作源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/actions/enqueue/enqueue.go)
+> - **成组放置、事务提交与门槛源码**：[Pod 同步条件源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L400-L414)、[最低资源计算源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L895-L928)、[Task 默认化 Webhook 源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/webhooks/admission/jobs/mutate/mutate_job.go#L180-L211)、[allocate 动作源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/actions/allocate/allocate.go)、[Gang 组及角色检查源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/gang/gang.go#L175-L196)、[角色检查分支源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/api/job_info.go#L1056-L1128)、[调度事务 Statement 源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/framework/statement.go)、[Volcano SVC 插件](https://volcano.sh/docs/v1.16.0/userguide/user_guide_how_to_use_svc_plugin/)
+> - **Kubernetes 与 PyTorch 会合**：[Kubernetes v1.36 节点选择与 Pod 反亲和](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)、[Kubernetes v1.36 Pod 生命周期](https://v1-36.docs.kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)、[Kubernetes v1.36 Event API](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/events/event-v1/)、[PyTorch 2.9 torchrun](https://docs.pytorch.org/docs/2.9/elastic/run.html)、[PyTorch 2.9 会合与成员变化](https://docs.pytorch.org/docs/2.9/elastic/rendezvous.html)

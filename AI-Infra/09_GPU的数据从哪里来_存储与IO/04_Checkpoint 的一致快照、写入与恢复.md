@@ -1,99 +1,149 @@
+# Checkpoint 的一致快照、写入与恢复
 
-训练输入是持续的小批读取，**Checkpoint（保存点）** 则把某一逻辑保存点的训练状态集中写出，以便故障或重启后恢复。它改变了 I/O 的方向和时间形状，也增加了一个输入读取没有的要求：恢复时不能只见若干文件，还必须能辨认哪些分片属于同一份完整、可装载的状态。
+训练已经跑了十几个小时。万一突然掉卡或节点重启，没有落盘的进度就会瞬间归零。**Checkpoint（检查点 / 保存点）** 把某一逻辑步号的训练状态持久化下来，是大规模训练的生命线。
 
-本章不讨论作业调度器如何重启进程。第 05 章已经说明启动器与应用的恢复分工，这里集中解释应用状态怎样写出、何时算保存完成，以及存储压力怎样估算。
+与持续读样本相反，Checkpoint 把 I/O 方向反转为**短时爆发式大规模写出**。它还多出一道硬门槛：故障重启时，恢复进程面对满目录分片，必须辨认出哪几份凑在一起才是完整、一致、可装载的版本。
 
-## 先确定要恢复什么、由谁写出
+## 一、一份可恢复状态装什么，由谁写出
 
-一份可恢复状态通常包括模型参数、优化器状态和训练进度。若要求从同一数据位置继续、复现后续随机序列，还可能需要学习率调度器、随机数生成器状态、采样器或数据游标。容量必须从实际序列化结果估算，不能只按模型参数个数推断。
+估算 Checkpoint 体积时，绝不能只按模型参数量算账。一份能续训的完整状态，通常包含三类内容：
+- **模型参数**：各层权重张量；
+- **优化器状态**：例如 AdamW 的一阶/二阶动量与 FP32 主权重，体积常是模型权重的数倍；
+- **训练进度与随机状态**：全局步号、学习率调度器、随机数种子以及数据加载游标。
 
-“同一保存点”也是应用需要建立的逻辑条件。保存方应让参与保存的 Rank 对步号、状态组成和保存顺序达成一致，并在源状态仍会被优化器或设备 Kernel 修改时，先建立适当的同步或稳定副本。仅同时调用一个写文件接口，不会自动把任意在途更新变成一致快照。
+分布式场景下，“同一逻辑保存点”不会因各进程同时写文件就自动成立。参与保存的各 Rank 须先对齐步号与状态清单。在显存源张量被下一步反向传播改写前，还必须建好与计算隔离的稳定副本。
 
-| 写入组织 | 数据怎样集中 | 主要优势 | 关键约束 |
+把分散在各卡的状态落盘，主要有两种组织形态：
+
+| 写入组织方式 | 数据汇聚形态 | 核心优势 | 关键约束 |
 | --- | --- | --- | --- |
-| 单 Rank 或单写端汇总 | 先收齐分散在各 Rank 的状态，再由一个写入者输出 | 文件与版本组织较集中 | 汇聚通信、主机缓冲、单客户端带宽和单点完成时间 |
-| 多 Rank 分片写入 | 各 Rank 写出自己负责的状态分片，再共同形成一份保存点 | 可并行承担搬运和写入 | 必需分片与慢写入者、共享后端容量、元数据协调和恢复布局 |
+| **单写端汇总** | 先经集合通信把全组状态收齐到单一 Rank，再统一落盘 | 文件数量少，版本管理简单 | 汇聚通信开销大、单机内存承压、单客户端写带宽成死穴 |
+| **多 Rank 分片写入** | 各 Rank 各自写出本卡持有的状态分片，最后汇总发布版本 | 搬运与写盘并发度高，适合大模型 | 整体进度受最慢分片拖累；多写入者仍可能挤爆共享存储后端 |
 
-分片写入不能把单客户端实测带宽简单乘以 Rank 数。多个写入者可能共享服务端、磁盘、网络或节点内路径；完整版本仍受最慢必需分片和最终协调约束。
+分片写入不能把单客户端写速直接乘以 Rank 数。多个写入者在服务端、磁盘或网卡处仍共享物理通道。整份快照何时完成，永远由最慢那个必需分片决定。
 
-## 从稳定状态到可发现的完整版本
+## 二、从稳定副本到版本发布：PyTorch DCP 流程
 
-以 PyTorch 2.9 的 Distributed Checkpoint（DCP）为例。下图假定含 GPU 状态、采用 Rank 间协调、各 Rank 分片写入共享文件系统，并允许后台保存。**staging（暂存）** 是指为待保存状态建立与源状态分离的稳定副本；若源在显存，本例包含 D2H，若源已在主机，则可能表现为主机侧复制或序列化准备，不能一概写成 D2H。
+以 **PyTorch 2.9 Distributed Checkpoint（DCP）** 的共享文件系统后端为例，跟踪一次带后台写入的保存过程。这里的 **staging（暂存）** 指为待保存状态建立隔离副本：源在显存时通常表现为 D2H 拷贝，源本就在主机内存时，则表现为主机侧复制或序列化准备。
 
 ```mermaid
 sequenceDiagram
-    participant App as 各 Rank 的训练应用
-    participant GPU as GPU 中的源状态
-    participant Host as 主机 staging 与写入端
+    accDescr: 展示 PyTorch DCP 分布式检查点保存时序，包含步号对齐、显存到主机暂存、后台分片写入与训练继续并行，以及最终元数据发布。
+    participant App as 各 Rank 训练进程
+    participant GPU as 显存源状态
+    participant Host as 主机暂存与写线程
     participant Store as 共享文件系统
-    App->>App: 对齐 checkpoint_id、步号与状态组成
-    GPU->>Host: 将本 Rank 的 GPU 状态暂存到主机
-    Host-->>App: staging 完成，允许修改对应源状态
-    par 各 Rank 写入分片
-        Host->>Store: 序列化并写出各自的数据
-    and 训练继续处理输入
-        Store-->>Host: 同一后端继续提供训练样本
-        Host-->>GPU: 送入后续批次并更新源状态
+    App->>App: 协调 checkpoint_id、步号与分片计划
+    GPU->>Host: 将本 Rank 源状态暂存（staging）至主机副本
+    Host-->>App: staging 完成，解锁显存源状态继续训练
+    par 后台线程写出状态分片
+        Host->>Store: 各 Rank 并发序列化并写入分片文件
+    and 前台继续下一轮训练
+        Store-->>Host: 同一或独立后端继续读取训练样本
+        Host-->>GPU: 送入新批次并更新模型参数
     end
-    Host->>Store: 必需写入协调完成后发布元数据
+    Host->>Store: 全组必需分片落盘后，原子重命名发布 .metadata
 ```
 
-图中训练与后台写并行，所以保存开销不只在调用保存接口时出现。若训练样本和 Checkpoint 使用同一后端，读写可能争用存储服务、磁盘或客户端网络；即使分用后端和网络，也仍可能争用主机内存、CPU 序列化或 PCIe 路径。
+*图 09-04-01：多 Rank 分片异步保存时序。后台写与下一轮训练重叠，若共用存储后端、网卡或 PCIe 通道，读写会直接争用。*
 
-DCP 的 `FileSystemWriter` 在 `single_file_per_rank=True` 时合并本 Rank 的写入项；在默认单写线程等条件下，每 Rank 的数据通常写成一份文件，实际文件数还受线程数和写计划影响。`sync_files=True` 时，2.9.0 实现会对数据文件和临时元数据执行 `fsync`，然后再重命名元数据；这段实现本身没有完成目录 `fsync`。默认协调实现会汇集写入结果，先把数据位置等元数据写入临时文件，再重命名为最终的 `.metadata`。若改用 `use_collectives=False`，则写出的是每 Rank 的 `__<rank>.metadata`，不能套用单一 `.metadata` 的发布描述。分片文件已经存在只证明部分写入出现；最终元数据描述了怎样找到并组织整份状态。每次保存使用独立目录，并让恢复端只选择满足完整性条件的版本。 [PyTorch 2.9 DCP](https://docs.pytorch.org/docs/2.9/distributed.checkpoint.html) · [DCP 2.9.0 文件写入与元数据实现](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/checkpoint/filesystem.py#L754-L786)
+在 PyTorch 2.9 的 `FileSystemWriter` 默认协调路径下，各 Rank 先把本卡状态写成独立分片。开启 `single_file_per_rank=True` 时，单写线程下通常合并为每 Rank 一份文件。待全部分片落盘后，协调端把索引写入临时元数据，再重命名为正式的 `.metadata`。
 
-### 四个时点回答四个不同问题
+若关闭默认协调（`use_collectives=False`），各 Rank 会写出各自的 `__<rank>.metadata`，完整性判定口径也随之变化。无论哪种模式，目录里出现分片文件只说明写入开始了。只有最终元数据发布且必需分片齐全，新版本才真正对外可读。
 
-| 时点 | 能支持的判断 | 不能据此直接推断什么 |
+### 四个完成时点，各自回答一个问题
+
+排查“日志明明说保存成功，重启却读出残缺快照”，关键是把四个层面的完成信号拆干净：
+
+| 完成时点 | 确切含义与可做的决定 | 尚未覆盖的风险边界 |
 | --- | --- | --- |
-| staging 完成 | 保存端已有可独立使用的状态副本，对应源状态可按该实现契约继续修改 | 后端已经写完，或重启后已经能够恢复 |
-| 框架保存完成 | 该 writer 已按实现完成数据写入和元数据发布 | 任意断电故障下都已持久化，或新进程已经装载成功 |
-| 后端持久性得到确认 | 按具体文件系统、同步调用和服务契约，相关数据与命名变化达到约定持久状态 | 应用状态一定完整，恢复布局一定匹配 |
-| 恢复就绪 | 新 Rank 已找到完整版本、读齐所需状态并装载到目标设备 | 之前某次后台写的具体耗时，或训练已重新达到稳态 |
+| **staging 完成** | 本地已建好隔离副本，训练线程可安全继续更新显存里的源参数 | 后台还没写盘，此刻进程崩溃会丢掉这份快照 |
+| **框架保存完成** | Writer 已完成全部分片写出并发布了最终 `.metadata` | 遇到节点断电时，持久性还取决于底层同步与挂载契约 |
+| **后端持久性确认** | 数据与命名变更已按文件系统 `fsync` 或 NFS `COMMIT` 落稳 | 仍需确认逻辑状态完整且与目标恢复拓扑匹配 |
+| **恢复就绪** | 新拉起的全部必需 Rank 已识别有效版本、读齐状态并装入 GPU | 这是故障重启后训练重新开跑的真正起点 |
 
-普通缓冲写返回时，数据可能仍在客户端缓存。框架完成后能否经受某类故障，要结合 `sync_files`、目录项处理、挂载协议和服务端持久性语义判断。以本地 Linux 文件系统为例，文件数据的 `fsync` 与包含该文件的目录项持久化不是同一个动作；远端文件系统和对象存储也应按各自提交与故障恢复契约解释，不能套用单盘结论。 [Linux fsync 手册](https://man7.org/linux/man-pages/man2/fsync.2.html) · [NFSv4.1 WRITE](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.32) · [NFSv4.1 COMMIT](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.3)
+> [!warning] 常见误区：开启 `sync_files=True` 仍要看清目录与协议边界
+> 普通缓冲写返回时，数据往往还留在客户端页缓存里。PyTorch 2.9 的 `FileSystemWriter(sync_files=True)` 会对分片与临时元数据调用 `fsync`，随后重命名元数据，但并未额外对父目录调用 `fsync`。对本地文件系统来说，文件数据落盘与目录项持久化是两回事。远端 NFSv4.1 则还要服从服务端的 `WRITE`/`COMMIT` 持久性契约。
 
-## 异步保存把哪段工作移出调用线程
+## 三、异步保存、背压控制与关键配置
 
-同步保存让调用方等待保存结束。常规 `async_save` 先完成 staging，再由后台继续保存，因此调用方虽然能较早继续训练，仍要承担同步 staging 的时间。
+同步保存会让训练线程干等写盘结束。常规 `async_save` 把写盘甩给后台，主线程仍要等完同步 staging。PyTorch 2.9 引入 `async_stager` 后，连 staging 也能异步化，并返回含两枚完成信号的 `AsyncSaveResponse`：
+- `staging_completion`：只表示**本 Rank** 的隔离副本已就绪，并非全组同步点。在此之前，优化器绝不能改写仍在暂存的显存源张量。
+- `upload_completion`：表示全组后台分片写出与最终元数据发布彻底完成。
 
-PyTorch 2.9 的 `async_stager` 路径允许把 staging 也异步化。当 stager 返回 Future 时，`async_save` 返回 `AsyncSaveResponse`：
+下面是一段展示异步保存、CPU 后端前提与背压控制的精简示例：
 
-- `staging_completion` 表示**本 Rank** 的本地稳定副本已经就绪，不是全 Rank 同步点；在此之前，优化器或其他操作不能破坏仍用于 staging 的源状态。
-- `upload_completion` 表示后续保存过程完成。
+```python
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 
-传统的同步 staging 路径返回单个保存 Future，不要把两种返回类型和等待方式混写。另一个版本条件是：PyTorch 2.9.0 在分布式已经初始化时，`async_save` 要求所用 process group 含 CPU 后端，例如 `cpu:gloo,cuda:nccl`；这不改变上述两个阶段的意义，但属于使用该接口前需要满足的配置条件。异步化改变的是工作发生在哪里、调用方等待什么，并不减少需要复制和写出的字节。 [DCP 2.9.0 保存返回值与 staging 实现](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/checkpoint/state_dict_saver.py#L203-L214) · [CPU 后端条件](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/checkpoint/state_dict_saver.py#L293-L299)
+# 1. PyTorch 2.9 分布式 async_save 要求进程组具备 CPU 后端（如 cpu:gloo,cuda:nccl）
+dist.init_process_group(backend="cpu:gloo,cuda:nccl")
 
-如果上一份仍在写入就继续提交下一份，可能同时积累暂存副本、序列化缓冲、存储队列和未发布版本。需要限制内存或后端积压时，可以在下次提交前检查上一次的完成信号，形成背压：传统路径等待返回的保存 Future；若拿到的是 `AsyncSaveResponse`，限制“仍在上传的保存份数”应等待 `upload_completion`，不能只等本 Rank 的 `staging_completion`。测量记录可带 `checkpoint_id`、`rank`、`step`、`bytes`、`stage_ms`、`write_ms` 和 `publish_ms`；这些是应用自定义字段，应按同一时间窗对照训练读、后台写和集合通信。
+writer = dcp.FileSystemWriter(
+    path="/mnt/shared-ckpt/step_10000",
+    single_file_per_rank=True,  # 合并本 Rank 张量项，减少小文件元数据冲击
+    sync_files=True,            # 写完分片与临时元数据后调用 fsync 再重命名
+)
 
-## 用完成窗口计算写入压力
+pending_upload = None
 
-**容量与带宽算例。** 两节点四 Rank，每份完整 Checkpoint 的有效载荷为 64 GiB，四个 Rank 各写一个 16 GiB 等量分片。忽略元数据、协议、后端副本和重试。
+# 2. 提交新一轮保存前先做背压检查，避免未落盘副本把主机内存和存储队列打爆
+if pending_upload is not None:
+    pending_upload.result()     # 限制在途上传份数：必须等上一轮 upload_completion
 
-| 条件 | 换算 | 结果与含义 |
-| --- | --- | --- |
-| 每 600 s 保存一份 | `64 GiB ÷ 600 s` | 长期平均约 0.107 GiB/s |
-| 每份要求在 20 s 内写完载荷 | `64 GiB ÷ 20 s` | 窗口内合计至少 3.2 GiB/s |
-| 三个作业的这些窗口完全重叠 | `3 × 3.2 GiB/s` | 共享路径合计至少 9.6 GiB/s |
-| 始终保留三份完整版本，新一份完整后才删除最旧一份 | `(3 + 1) × 64 GiB` | 转换期间逻辑容量至少 256 GiB |
+# 3. 发起异步保存，并按 checkpoint_id / stage_ms / write_ms / publish_ms 埋点观测
+resp = dcp.async_save(state_dict, storage_writer=writer)
+pending_upload = resp.upload_completion  # 若为传统同步 staging 路径，resp 本身即 Future
+```
 
-长期平均 0.107 GiB/s 不能用来判断 20 s 窗口是否达标。若 20 s 还包括 staging、序列化和元数据发布，真正可用于数据写入的时间更短，所需写速率更高。若三个作业的窗口错开，峰值只按实际重叠的作业计算；同窗训练读也需要保留带宽。256 GiB 同样只是应用有效载荷，文件系统开销、后端副本、临时文件和失败版本另计。
+异步化只是把等待移出了关键路径，并没有少写一个字节。若保存周期比后台落盘还短，又不加背压限制，多份暂存副本和未完成上传很快就会撑爆主机内存与存储队列。
 
-## 恢复时间由完整版本和最慢 Rank 决定
+## 四、用完成窗口核算突发带宽与容量
 
-恢复过程可以沿下面的顺序跟踪：
+规划 Checkpoint 存储带宽，最致命的坑是拿“长期平均速率”去对标硬件指标。
 
-1. 识别一份满足完整性条件的保存点，读取其元数据。
-2. 按当前 Rank 与目标分片布局规划读取，取得各自需要的字节。
-3. 反序列化并装载到主机或目标 GPU，建立后续训练所需的状态。
-4. 所有必需 Rank 都就绪后，同步训练才能继续。
+来看双节点四卡算例。每份完整快照有效载荷为 **64 GiB**（4 个 Rank 各写 `16 GiB`），每 `600 s` 保存一次，要求在 **20 s** 窗口内写完载荷。目录常驻保留 **3 份**完整版本，新版完整发布后才删最旧版。暂不计元数据、后端副本与重试开销：
 
-DCP 能按目标布局规划读取；对支持的分片张量，可以只取本 Rank 需要的部分。因此，改变 Rank 数或分片布局后，不能默认每个 Rank 都读取原先那一个 16 GiB 文件，也不能默认总读取量和并发度不变，应记录实际读取计划。 [PyTorch 2.9 DCP 加载语义](https://docs.pytorch.org/docs/2.9/distributed.checkpoint.html)
+$$\text{长期平均写速率} = \frac{64\text{ GiB}}{600\text{ s}} \approx 0.107\text{ GiB/s}$$
 
-**恢复算例。** 设四个 Rank 合计需要读取 64 GiB，有效聚合读速率为 2 GiB/s，则仅读取阶段的模型下界是：
+$$\text{单作业 20 s 突发写带宽} = \frac{64\text{ GiB}}{20\text{ s}} = 3.2\text{ GiB/s}$$
 
-`T_read ≥ 64 GiB ÷ (2 GiB/s) = 32 s`。
+$$\text{三作业窗口完全重叠时聚合带宽} = 3 \times 3.2\text{ GiB/s} = 9.6\text{ GiB/s}$$
 
-元数据、反序列化和 H2D 可能部分重叠，也可能落在关键路径上；同步训练要等最晚恢复的 Rank，所以 32 s 不是完整恢复时长承诺。各 Rank 的 `restore_ready_ms` 应从同一恢复起点计时。推理服务冷启动也会读取并装载模型，但状态组成和“服务就绪”的条件由服务自身定义。
+$$\text{版本切换期最低逻辑容量} = (3 + 1) \times 64\text{ GiB} = 256\text{ GiB}$$
 
-无论是训练输入还是 Checkpoint，前面讨论的都是存储与主机、显存之间怎样交接。下一篇改变其中一段物理搬运方式：在受支持的文件与平台上，让 GDS 将文件载荷直接送入 GPU 缓冲；保存点的一致性和完整性要求并不会因此改变。
+四笔账摆在一张表里，反差非常直观：
+
+| 规划维度 | 算式 | 最低需求 | 工程含义 |
+| --- | --- | ---: | --- |
+| **长期平均速率** | `64 GiB ÷ 600 s` | `0.107 GiB/s` | 只反映总数据量，对带宽选型几乎没有指导意义 |
+| **单作业突发窗口** | `64 GiB ÷ 20 s` | `3.2 GiB/s` | 若 20 s 还含 staging 与发布，净写速要求更高 |
+| **三作业撞窗峰值** | `3 × 3.2 GiB/s` | `9.6 GiB/s` | 共享后端须为同窗训练读另留余量，或错峰保存 |
+| **切换期逻辑容量** | `(3 + 1) × 64 GiB` | `256 GiB` | 新版落稳前旧版不能删，底层副本与临时文件另计 |
+
+> [!tip] 工程直觉：错开保存步号，是最便宜的存储扩容
+> 共享并行文件系统的多个训练作业，若习惯在整百步或整点同时保存，写峰值就会线性叠加（本例从 `3.2 GiB/s` 暴涨至 `9.6 GiB/s`）。在框架或调度脚本里加一点随机错峰偏移，不花一分钱就能削平尖峰。
+
+## 五、故障恢复时间：下界与最慢 Rank
+
+作业掉卡重启后，恢复流程与保存镜像对称：
+1. 扫描目录，锁定最新一份元数据完整、校验通过的版本；
+2. 由 DCP 按当前 Rank 数与目标分片布局，规划每个 Rank 需读取的字节范围；
+3. 各 Rank 并发读取、反序列化并经 H2D 装入目标 GPU；
+4. 等全部必需 Rank 上报 `restore_ready_ms` 就绪，同步训练再迈出第一步。
+
+DCP 支持恢复重分片（Resharding）。扩容或缩容改变 Rank 数后，各卡按新布局只取所需切片，因此必须按实际读取计划重算负载，不能沿用旧的单卡 `16 GiB` 假定。
+
+设四卡恢复合计需读取 `64 GiB`，存储有效聚合读速为 `2 GiB/s`，则仅读取阶段的耗时下界为：
+
+$$T_{\text{read}} \ge \frac{64\text{ GiB}}{2\text{ GiB/s}} = 32\text{ s}$$
+
+元数据解析、反序列化、H2D 搬运和最晚到齐的慢 Rank 还会继续叠加，实际恢复就绪时间只会高于 `32 s`。
+
+> [!summary] 核心结论：训练恢复与推理冷启动同源而异构
+> 训练恢复要读带优化器状态的读写型 Checkpoint。在线推理弹性扩容时，面对的则是动辄 140–800 GB 的只读模型权重（第 07 篇详解）。两者都绕不开一道核心物理问题：数据从存储进显存，能不能少绕主机内存一圈？下一篇我们拆解 **GPUDirect Storage（GDS）** 的直达路径。
+
+> [!info]- 参考资料
+> - **PyTorch 分布式检查点与源码**：[PyTorch 2.9 · Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/2.9/distributed.checkpoint.html)、[`filesystem.py` 写入与元数据发布源码](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/checkpoint/filesystem.py#L754-L786)、[`state_dict_saver.py` 异步保存返回值源码](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/checkpoint/state_dict_saver.py#L203-L214)、[`state_dict_saver.py` CPU 后端校验源码](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/distributed/checkpoint/state_dict_saver.py#L293-L299)
+> - **文件系统与远端持久性契约**：[Linux man-pages · `fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html)、[RFC 8881 · NFSv4.1 WRITE](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.32)、[RFC 8881 · NFSv4.1 COMMIT](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.3)

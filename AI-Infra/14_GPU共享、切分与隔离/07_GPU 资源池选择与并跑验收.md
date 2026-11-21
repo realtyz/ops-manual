@@ -1,34 +1,94 @@
+# GPU 资源池选择与并跑验收
 
-资源池把一组具有特定配置和交付规则的 GPU 提供给工作负载。选择时先写应用在单个 CUDA 设备上的峰值显存、设备数量、并发下的性能目标和允许共用的故障域，再把这些条件转成可申请的资源或放置约束。下面以 Linux 容器为例，先按容量排除不可行的池，再比较能够放下任务的方案。
+走到这一步，手里已经握齐了六种 GPU 交付方式：**整卡独占**、**Time-Slicing**、**CUDA MPS**、**预建 MIG**、**HAMi-core 软件限额**与**HAMi Flexible MIG**。但真正搭建集群时，基础设施团队面对的问题极其务实：
 
-## 单设备显存与可请求规格
+- 线上 7B/14B 核心对话 API 要保 `TTFT P99` 和 `TPOT P99`，不能因为隔壁业务突发长文本就卡顿；
+- 内部评测、向量嵌入和算法开发容器量很大，全给整卡成本会立刻失控；
+- 70B 大模型张量并行推理和分布式训练又必须独占高速卡间互联。
 
-假定某推理进程需要在同一个 CUDA 设备上驻留 12 GiB。它来到一个预建 MIG 池，目前空闲两个 `2g.10gb`，没有空闲的 `3g.20gb`。每份小实例的可用容量都低于 12 GiB。只有应用能够显式跨多个 CUDA 设备拆分数据与计算时，才可以重新评估另一种多设备方案。对当前的单设备进程，候选是有足够可用显存的大 Profile 或整卡。 [NVIDIA A100 MIG Profile](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/supported-mig-profiles.html#a100-mig-profiles) · [NVIDIA MIG 与 CUDA 设备](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/610/mig-device-names.html)
+解决之道不是找一种“通吃所有场景的银弹”，而是**按业务隔离与延迟需求划分清晰的功能资源池，再用可复现的并跑压测验收上线**。
 
-若 Pod 请求 `nvidia.com/mig-3g.20gb: 1`，就用该资源键的余量和节点约束判断是否能调度。改变池布局时则回到硬件：即使卡上仍有足量空位，空位也要落在某个合法窗口内才能创建目标规格。前一个问题发生在已发布设备库存，后一个问题发生在 GI 布局。 [GPU Operator v26.7 MIG 配置与资源](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/gpu-operator-mig.html) · [NVIDIA MIG 620 Profile 放置](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/concepts.html#profile-placement)
+## 六类资源池全景对比与选型决策树
 
-以两张空闲 A100-SXM4-40GB 为例，假定目标服务每个 Pod 请求一个 `3g.20gb`，小开发任务每个 Pod 请求一个 `1g.5gb`。两张都切为小实例可同时交付 14 个小规格，却无法接纳目标服务。若一张卡建七个小实例，另一张建两个大实例，可同时接纳最多七个小任务和两个目标服务。这个算例只计算规格库存，假定设备健康且其他放置约束满足。根据请求的规格分布与到达顺序，还可进一步估计多少任务会等待。 [NVIDIA A100 MIG Profile 与每卡最大实例数](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/supported-mig-profiles.html#a100-mig-profiles)
+先把前五篇的工程评估收拢到同一张五维全景表里，横向看清每种资源池的真实护城河与代价：
 
-## 性能干扰、用量限制与故障域
+| 资源池形态 | 显存硬隔离 | 算力与 HBM 带宽干扰 | P99 尾延迟表现 | 卡内碎片率 | 运维灵活性 | 最适配业务场景 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **整卡独占** | 物理整卡独占 | 无同卡干扰 | 最优（无邻居） | 低（大负载）/ 极高（小模型浪费） | 最高 | 多卡 TP/EP 推理、大模型训练、高吞吐核心服务 |
+| **Time-Slicing** | **无**（易 OOM 连坐） | 高干扰（粗粒度轮转） | 不可控 | 极低 | 高 | 交互式开发、调试 Notebook、低频无 SLO 任务 |
+| **CUDA MPS** | 弱—中（运行时上限） | 中高干扰（共享 L2/HBM） | 中度抖动 | 极低 | 中 | 同团队轻量嵌入/分类模型并发压榨整卡吞吐 |
+| **预建 MIG** | **物理级硬隔离** | **极低（物理切开）** | **极佳且可预测** | 中高（离散档位） | 较低（改布局需排空） | **高 SLO 多租户在线推理池**（7B/14B 稳定规格） |
+| **HAMi-core** | **强（软件拦截硬墙）** | 中度干扰（共享 HBM） | 中—良 | 极低（MiB 级切分） | 极高（动态申请） | 内部非核心推理、研发评测高密防 OOM 混部 |
+| **HAMi Flexible MIG** | **物理级硬隔离** | **极低（物理切开）** | **极佳且可预测** | 中（退出即回收） | 高（按需动态建删） | 规格多变、又要求物理硬隔离的弹性在线推理池 |
 
-| 负载约束 | 候选方案与应验收的行为 |
+落到实际架构决策时，可以顺着下面这棵决策树，把任何一条业务线快速归类到对应候选池：
+
+```mermaid
+flowchart TD
+    accDescr: 资源池选型决策树：先判断单副本是否需整卡或多卡并行，再判断是否需要在线推理严格 P99 SLO 与物理 HBM 隔离，随后细分静态或弹性 MIG、HAMi-core 防 OOM 限额、MPS 轻量并发及 Time-Slicing 开发共享。
+    S["评估目标 AI 工作负载"] --> Q1{"单副本需整卡或\n多卡 TP/EP/训练?"}
+    Q1 -->|"是"| P1["整卡独占资源池"]
+    Q1 -->|"否（单卡可放多副本）"| Q2{"需严格在线推理 P99 SLO\n与物理 HBM/显存隔离?"}
+    Q2 -->|"是"| Q3{"模型规格稳定可预估?"}
+    Q3 -->|"是"| P2["预建 MIG 推理池\n(GPU Operator 托管)"]
+    Q3 -->|"否（规格动态变化）"| P3["HAMi Flexible MIG 池\n(按需预留与回收)"]
+    Q2 -->|"否"| Q4{"需显存硬上限\n阻断 KV Cache 连坐 OOM?"}
+    Q4 -->|"是"| P4["HAMi-core 软件限额池\n(高密防爆显存)"]
+    Q4 -->|"否"| Q5{"持续高频小 Kernel\n追求更高聚合吞吐?"}
+    Q5 -->|"是"| P5["CUDA MPS 并发池\n(可信同团队)"]
+    Q5 -->|"否（间歇开发调试）"| P6["Time-Slicing 共享池"]
+```
+
+*图 14-07-01：面向在线推理与研发混部集群的 GPU 资源池选型决策树。*
+
+## 单设备容量门槛、混合池核算与物理故障域
+
+选定池类型后，第一关永远是**单设备峰值显存门槛**。假设某量化推理服务单副本需在同一个 CUDA 设备上常驻 `12 GiB`（含权重、推理框架上下文与峰值 KV Cache）。即使当前预建 MIG 池里空着两块 `2g.10gb` 实例，单设备容量都低于 `12 GiB`，它也放不进去——除非模型引擎显式启用多设备拆分（例如 `TP=2`），否则必须转向 `3g.20gb` 或整卡。
+
+规划节点池布局时，要分清两笔账：**已有发布库存**与**物理卡几何切分能力**。以一台空闲双卡 A100-SXM4-40GB 节点同时承接“14B 在线推理（`3g.20gb`）”和“小模型研发调试（`1g.5gb`）”为例：
+
+- **两卡全切小规格**：可容纳 $2 \times 7 = 14$ 个开发 Pod，但 `3g.20gb` 容量为 `0`，在线推理彻底无法落脚。
+- **单卡专切混合布局**（一张卡 `7 × 1g.5gb`，另一张卡 `2 × 3g.20gb`）：
+
+$$\text{节点同时承载能力} = 7\ \text{个开发副本} + 2\ \text{个在线推理副本}$$
+
+这样既为在线推理保住了硬件硬隔离槽位，又没把整台节点锁死在单一规格上。具体比例再结合集群内两类请求的到达分布动态调优即可。
+
+> [!warning] 常见误区：两个独立 GI ≠ 两个高可用故障域
+> 把主备两个在线推理副本分别放进同一张物理卡的 `GI 0` 与 `GI 1`，虽然实现了算力与显存硬隔离，但**它们依然共享同一张物理 GPU、同一块主板与同一台宿主机**，整卡异常（如 `Xid 95`）或节点断电仍会导致双双下线。
+>
+> 有高可用要求的服务，必须将副本调度到**不同的物理 GPU UUID**，并通过节点反亲和分散到不同宿主机（第 15 章展开）。跨租户部署时，还须同步核查容器设备权限、宿主机特权与管理面重配置权限。
+
+## 多 Rank 负载（TP / 分布式训练）的设备与通信边界
+
+如果负载从单卡单进程扩展成多进程多 Rank（例如多卡张量并行推理或分布式训练），资源池选型就不能只看单设备显存，必须额外核对三条通信前提：
+
+1. **设备唯一性**：每个 Rank 必须映射到互不相同的物理 GPU 或独立 MIG 实例 UUID；多个 Rank 落在同一个 MIG 设备上会导致资源冲突或初始化失败。
+2. **卡间 P2P 范围限制**：在 MIG 模式下，CUDA P2P 互联能力受硬件隔离边界严格约束（例如在多代驱动路径上，MIG 实例间的 P2P 仅限于同一物理卡内的实例之间，无法像整卡那样畅通走跨卡 NVLink 全互联）。
+3. **跨机通信与选路核验**：一旦多 Rank 跨越多台节点，必须按第 06、08、13 章的方法完整核对两侧高速网卡、父 GPU 的 PCIe/NUMA 亲和路径、显存注册能力及通信库实际选路日志。
+
+> [!note] 版本与基线说明（多 MIG 集合通信）
+> 在本书统一参考栈（`CUDA 13.2.1` + `NCCL 2.27.3`）下，NCCL 尚未原生内置多 MIG 通信组支持；**生产级多卡 TP/EP 在线推理与分布式训练应统一部署在整卡独占资源池**，以完整保留 NVLink/NVSwitch 带宽。
+>
+> 在更新的 NCCL 实验路径（自 `2.31` 起、配合 `CUDA 13` 驱动）中，官方引入了实验性 MIG 通信组支持，要求每个 Rank 绑定独立 MIG UUID 且显式设置 `NCCL_MNNVL_ENABLE=0`（不支持 NVLS）；如确需尝试，应在隔离测试池按指定消息尺寸逐项压测。
+
+## 面向在线推理 SLO 的单跑 vs 并跑验收方法
+
+资源池方案最终不能只靠纸面表格拍板，上线前必须用**同口径的单跑与并跑对照实验**把性能与隔离边界钉死。
+
+验收遵循“先单跑立基线 → 再同卡加压并跑 → 按最严 SLO 一票否决”三步闭环：
+
+| 验收环节 | 必须固定与记录的关键证据 |
 | --- | --- |
-| 可信团队的间歇任务，允许同卡干扰 | 对照整卡与 Time-Slicing。用同时驻留内存和并跑尾延迟确认能否利用执行空档。 |
-| 两个进程都持续提交较小的 Kernel，目标是提高整卡吞吐 | 对照普通共享与 MPS。确认并发条件，再测总吞吐和每个客户端的尾延迟。 |
-| 同一可信租户的进程需要不同显存上限 | 评估 HAMi-core。检查逐卡配额、实际库注入和运行时分配结果，再测并跑干扰。 |
-| 服务需要一份由硬件分配的内存与计算资源 | 选择容量合适的预建 MIG，或者支持目标位置的 Flexible MIG。验收父 GI、实际 Profile 和并跑性能。 |
-| 两份服务不能共用同一物理 GPU 故障域 | 要求两个不同物理 GPU UUID，若还需覆盖驱动、整机或供电故障，进一步约束节点和故障域。 |
+| **1. 固定压测边界** | 锁定相同的提示词长度分布、输出长度分布、并发请求数、预热轮次与统计时间窗，避免输入波动掩盖邻居干扰。 |
+| **2. 锁定环境与映射** | 完整记录 GPU 型号、驱动版本、容器运行时、切分/共享配置、目标服务与同卡竞争邻居各自拿到的物理 GPU UUID 或 MIG UUID。 |
+| **3. 采集推理核心指标** | 分别采集单跑与并跑时的**峰值显存（含 KV Cache 与框架工作区）**、**TTFT P50/P99**、**TPOT（ITL）P50/P99**、总输出吞吐（`tokens/s`）以及所有 CUDA/OOM 报错计数。 |
+| **4. 故障与权限核验** | 若业务含隔离与安全红线，补充核对设备映射归属、邻居 OOM 触发时的波及证据及容器设备权限配置。 |
 
-整卡是大容量和多卡负载的对照基线。MIG 可以隔离两个 GI 的硬件资源，同卡实例仍依赖同一物理设备和节点。跨租户还要确认容器设备访问、宿主机特权与重配置权限，才能把资源隔离与安全要求对应起来。 [NVIDIA MIG 620 硬件隔离](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/introduction.html) · [NVIDIA GPU Operator 安全考虑](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/security.html)
+> [!summary] 核心结论：总吞吐上涨，绝不能掩盖 P99 违约
+> 在在线推理资源池的验收桌上，有一条铁律：**即使同卡并跑让整张卡的聚合 `tokens/s` 提升了 40%，只要其中高优先级在线服务的 `TTFT P99` 或 `TPOT P99` 跌破了业务 SLO 红线，或者在峰值并发下出现哪怕一次邻居连坐 OOM，这次共享方案就必须判定不通过**——要么降低同卡密度、切入 HAMi-core 显存硬墙，要么直接升级到物理隔离的 MIG 池。
 
-## 多 Rank 负载的设备与通信条件
-
-若从单进程扩成多个进程，每个成员有一个通信组内的编号 Rank。应把每个 Rank 的 CUDA 设备对应到实例和父卡，再检查通信库与互联能力。设 Rank 0 和 Rank 1 分别使用 `GPU-A` 上的两个 `3g.20gb`，实例简记为 `MIG-0` 与 `MIG-1`。给定 NCCL（NVIDIA Collective Communications Library，NVIDIA 集合通信库）2.31.2、支持 CUDA 13.0 或更高版本的驱动、`NCCL_MNNVL_ENABLE=0`（关闭 Multi-Node NVLink），这个映射满足文档列出的 MIG 通信组条件，可进入验证。若两个 Rank 实际使用同一个 MIG UUID，则违反了每个 Rank 必须选择不同 MIG 设备的约束。NCCL 自 2.31 起对 MIG 的支持为实验性。 [NCCL 2.31.2 的 MIG 通信组条件](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/usage/communicators.html#using-mig-instances)
-
-即使两个实例同属一张卡，CUDA P2P、NCCL 的实际传输和 GPUDirect RDMA 也各有条件。MIG 620 指南以 R570 为例，P2P 支持范围限于同一物理 GPU 的 MIG 实例之间。若将第二个 Rank 换到另一节点，还要按第 06、08、13 章的方法核对两侧 NIC、父卡 PCIe 路径、显存注册和 NCCL 选路。读取初始化及传输记录，再用指定消息尺寸和 Rank 布局测试链路。 [NVIDIA MIG 620 应用与通信条件](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/deployment-considerations.html#application-considerations) · [NCCL 2.31.2 的 MIG 传输限制](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/usage/communicators.html#using-mig-instances)
-
-## 单跑与并跑的验收对照
-
-先定判定标准，例如在同一输入与目标并发下，单设备峰值显存包含运行时工作区并留出余量，各任务的吞吐和尾延迟都达到业务目标。尾延迟可以用 P95/P99，也就是分别覆盖 95% 和 99% 请求的延迟分位值。
-
-在候选池内先做单跑，再在相同输入、预热和测量窗口下做并跑。应明确每个试验的物理 GPU、实例和同卡竞争者，记录 GPU 型号、驱动、运行时、配置、实际分配 UUID、总吞吐、每任务延迟、显存峰值与 CUDA 失败。若并跑吞吐上升而一项服务的 P99 超过目标，就按该服务的目标判定这次并跑结果。涉及故障域或权限的要求，再用设备映射、故障影响证据和权限配置验收。上述场景采用教学假设，实际性能和可用容量由目标环境测量。
+> [!info]- 参考资料
+> - **MIG Profile 容量与放置规划**：[NVIDIA MIG 620 A100 Profile 表](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/supported-mig-profiles.html#a100-mig-profiles)、[NVIDIA MIG 610 设备命名与 CUDA 映射](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/610/mig-device-names.html)、[NVIDIA MIG 620 Profile 放置原则](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/concepts.html#profile-placement)、[GPU Operator v26.7.2 MIG 配置与资源管理](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/gpu-operator-mig.html)
+> - **硬件隔离与平台安全边界**：[NVIDIA MIG 620 硬件隔离说明](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/introduction.html)、[NVIDIA GPU Operator v26.7.2 安全说明](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/security.html)
+> - **多 Rank 与 MIG 通信条件**：[NVIDIA MIG 620 应用与通信条件](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/deployment-considerations.html#application-considerations)、[NCCL MIG 实例通信组条件参考](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/usage/communicators.html#using-mig-instances)

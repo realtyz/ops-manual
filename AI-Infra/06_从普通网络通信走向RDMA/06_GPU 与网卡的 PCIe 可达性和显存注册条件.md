@@ -1,42 +1,127 @@
+# GPU 与网卡的 PCIe 可达性和显存注册条件
 
-要让网卡直接读写显存，需要本机两设备之间有可用的 PCIe 路径，还需要 GPU 驱动与 RDMA 栈为该段显存建立网卡可用的 DMA 映射。以下检查针对裸机上的传统 PCIe GPUDirect RDMA。先确定实际采用哪一对设备，再判断路径和注册条件。 [CUDA 13.1.2 的平台与路径条件](https://docs.nvidia.com/cuda/archive/13.1.2/gpudirect-rdma/index.html#supported-systems)
+很多团队在上线高速集群时会遇到同一个头疼场景：主机内存 RDMA 跑出了漂亮的线速，单卡 CUDA 训练和推理也都一切正常，可只要开启 GPUDirect RDMA，程序要么在显存注册时直接报错，要么性能断崖式下跌、甚至悄悄回退到主机内存中转。
 
-## 从设备标识还原实际 PCIe 路径
+要让传统 PCIe 路径上的 GPUDirect RDMA 真正跑通，必须同时闯过两道关卡：**硬件与路由层的 PCIe 可达性**（物理拓扑、ACS、IOMMU），以及**软件驱动层的显存注册能力**（DMA-BUF 或 Peer Memory）。排查时永远遵循一个铁律：先锁定实际配对的那一张 GPU 和那一张网卡，再顺着拓扑树和内核状态逐关验票。
 
-本例在节点 A 选 GPU 0 和 RDMA 设备 `mlx5_0` 的端口 1。用 `nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv` 取得 GPU 的 PCI 地址。应用里的 CUDA 序号受设备可见性设置影响，应核对应用实际选到的卡。沿 `/sys/class/infiniband/mlx5_0/device` 找网卡的 PCI 地址，再用 `lspci -t` 在树上找两个地址的共同上游。本例两端具有同形的树，下面以 A 为例，BDF 为构造值。 [NVIDIA SMI 的 GPU 查询和拓扑矩阵](https://docs.nvidia.com/deploy/nvidia-smi/) · [CUDA 13.1.2 的设备枚举接口](https://docs.nvidia.com/cuda/archive/13.1.2/cuda-driver-api/group__CUDA__DEVICE.html)
+## 第一关：把 GPU 与网卡还原到同一棵 PCIe 树
 
-```text
+不要凭直觉猜“设备都在 NUMA 0 就一定直连”。在 `node-1` 上，先把应用实际用到的 CUDA 设备（注意 `CUDA_VISIBLE_DEVICES` 会改写进程内编号）与 RDMA 设备各自还原成 PCI BDF，再通过 `lspci -t` 找到它们的共同上游：
+
+```bash
+# 1. 查询物理 GPU 的序号、UUID 与 PCI BDF
+$ nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv
+index, uuid, pci.bus_id
+0, GPU-11223344-5566-7788-99aa-bbccddeeff00, 00000000:82:00.0
+
+# 2. 查出 RDMA 设备 mlx5_0 对应的 PCI BDF（与 04 篇一致）
+$ readlink -f /sys/class/infiniband/mlx5_0/device
+/sys/devices/pci0000:80/0000:80:01.1/0000:81:00.0/0000:81:02.0/0000:83:00.0
+
+# 3. 对照拓扑树：确认 GPU 0 与 mlx5_0 挂在同一个 PCIe Switch 下
 PCIe Root Complex（省略中间桥）
-└── PCIe Switch
+└── PCIe Switch（上游桥 0000:81:00.0）
     ├── 下游桥 0000:81:01.0
-    │   └── GPU 0     0000:82:00.0
+    │   └── GPU 0      0000:82:00.0
     └── 下游桥 0000:81:02.0
-        └── mlx5_0    0000:83:00.0（取端口 1）
+        └── mlx5_0/1   0000:83:00.0
 ```
 
-`nvidia-smi topo -m` 中，`PIX` 表示经过一个 PCIe Switch，`PXB` 对应多个 PCIe Switch 且未过主桥，`PHB` 经过 PCIe Host Bridge，`SYS` 还经过处理器的 NUMA（Non-Uniform Memory Access，非一致内存访问）节点互联。共享交换芯片为芯片内转发提供了候选路径。经过主桥时，要核对平台能否将请求转回目标所在分支。传统路径的重要前提是两设备共享上游 PCIe Root Complex，跨 Socket 或跨根的连接要以目标平台明确支持的路径为准。同一个 NUMA 编号仍可能涉及多个 PCIe 分支。 [NVIDIA SMI 的 topo 图例](https://docs.nvidia.com/deploy/nvidia-smi/) · [CUDA 13.1.2 的 Supported Systems](https://docs.nvidia.com/cuda/archive/13.1.2/gpudirect-rdma/index.html#supported-systems)
+配合第 04 章学过的 `nvidia-smi topo -m`，可以迅速判断 GPU 与网卡的物理距离：
+- **`PIX`（最优）**：只经过单个 PCIe Switch，两设备同处一颗交换芯片下，天然具备芯片内直接转发的物理基础；
+- **`PXB`（次优）**：跨越多个 PCIe Switch，但尚未经过 CPU 的 PCIe 主桥；
+- **`PHB`（谨慎核查）**：需要经过同一颗 CPU 的 PCIe Host Bridge，必须确认主板与芯片组支持主桥对等转发，且往往带宽/延迟逊于 `PIX`；
+- **`SYS`（传统路径应避开）**：跨越处理器间互联（跨 Socket/NUMA 节点），传统 PCIe GPUDirect RDMA 要求两设备共享上游 Root Complex，跨 Socket 往往性能骤降或根本不受支持。
 
-## ACS 控制事务转发，IOMMU 管理 DMA 地址
+> [!warning] 常见误区：同属一个 NUMA 节点就等于 `PIX`
+> 现代多路服务器一颗 CPU 往往引出多个独立的 PCIe Root Port。两张设备即使都归属 NUMA 0，如果分别插在不同根端口下，它们在拓扑矩阵里会呈现 `PHB` 而非 `PIX`，流量必须绕道 CPU 根复合体。
 
-**ACS（Access Control Services，访问控制服务）** 是 PCIe 层的访问控制能力。桥上的请求重定向 `ReqRedir` 和完成重定向 `CmpltRedir` 可以影响对等事务是否被发往上游。以 A 端网卡读取 GPU 为例，读请求由网卡发往 GPU，携带读回数据的 PCIe 完成再返回网卡。主题图中的载荷箭头对应后一方向。用 `lspci -vv -s 0000:81:02.0` 查看相应桥，`ACSCap` 是能力，`ACSCtl` 是控制位的读数。下面两行仅改变 A 的网卡侧下游桥上的一个控制位。 [Linux 内核 PCI Peer-to-Peer DMA](https://docs.kernel.org/driver-api/pci/p2pdma.html) · [pciutils v3.13.0 的 ACS 字段](https://github.com/pciutils/pciutils/blob/v3.13.0/ls-ecaps.c)
+## 第二关：ACS 决定转发方向，IOMMU 决定 DMA 地址映射
 
-| 同一对设备的独立教学读数 | 拓扑距离 | 网卡侧下游桥的控制位 | 判断 |
+哪怕 `nvidia-smi topo -m` 已经给出了完美的 `PIX`，PCIe 桥和主板固件里的两个硬件开关仍可能把近在咫尺的直达流量“拐走”甚至拦死。
+
+### 1. ACS（Access Control Services，访问控制服务）
+
+**ACS** 是 PCIe 协议层的设备访问控制机制，用来决定下游设备发出的对等事务能不能在 PCIe Switch 内部直接转给邻居。其中最关键的两个控制位是**请求重定向（`ReqRedir`）** 和**完成重定向（`CmpltRedir`）**：一旦开启，下游桥就会把对等请求强制发往上游 Root Complex 接受审查，而不是在交换芯片内就地抄近路。
+
+以发起端网卡读取本地 GPU 显存为例，存在一去一回两条 PCIe 事务：先是网卡向 GPU 发出**读请求**，随后 GPU 把带着显存数据的 **PCIe 完成包**发回网卡（图 06-05-01 中的载荷箭头对应后一方向）。用 `lspci -vv` 检查网卡侧下游桥 `0000:81:02.0` 的 `ACSCap`（硬件能力）和 `ACSCtl`（当前生效控制位）：
+
+```bash
+$ lspci -vv -s 0000:81:02.0 | grep -A 2 "Access Control Services"
+        Capabilities: [220 v1] Access Control Services
+                ACSCap: SrcValid+ TransBlk+ ReqRedir+ CmpltRedir+ UpstreamFwd+ EgressCtrl- DirectTrans-
+                ACSCtl: SrcValid+ TransBlk- ReqRedir- CmpltRedir- UpstreamFwd- EgressCtrl- DirectTrans-
+```
+
+哪怕拓扑距离同为 `PIX`，下游桥上仅仅多开一个 `ReqRedir+`，路径命运就可能完全不同：
+
+| 观察场景 | 拓扑距离 | 网卡侧下游桥 `ACSCtl` 读数 | 路径影响与下一步动作 |
 | --- | --- | --- | --- |
-| 条件甲 | `PIX` | `SrcValid+ ReqRedir- CmpltRedir-` | 这两个重定向位在该桥上关闭。继续核对另一侧及其余相关桥。 |
-| 条件乙 | `PIX` | `SrcValid+ ReqRedir+ CmpltRedir-` | 网卡发起的对等请求可能被送上游。沿实际路径检查上游能否转发回目标。 |
+| **场景甲（放行直达）** | `PIX` | `SrcValid+ ReqRedir- CmpltRedir-` | 该桥已关闭对等重定向；继续核对 GPU 侧下游桥与其余相关桥。 |
+| **场景乙（被拽向上游）** | `PIX` | `SrcValid+ ReqRedir+ CmpltRedir-` | 网卡发往 GPU 的读请求会被强行重定向至上游 Root Complex；需检查上游是否支持转回以及是否触发性能回退。 |
 
-部分裸机 RDMA 计算网络会按服务器平台指南，在节点内关闭 GPU 与网卡路径上相关 PCIe 桥的 ACS。若平台支持单独控制，也可只关闭相应的对等重定向位。以本例为例，当路径上的桥允许在同一 PCIe Switch 内转发时，网卡的读请求和返回数据都可以留在交换芯片内，省去经 Root Complex 折返的路径。对于依赖 ACS 实现设备隔离的虚拟化或设备直通部署，应保留平台要求的 ACS 设置。 [NVIDIA NCCL 2.27.3 的 ACS 排查说明](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/troubleshooting.html#pci-access-control-services-acs) · [Linux 内核 VFIO 的设备隔离说明](https://docs.kernel.org/driver-api/vfio.html)
+裸机 AI 计算节点通常会按照服务器硬件指南关闭 GPU 与网卡之间 PCIe 桥的 ACS（或单独关闭 `ReqRedir` / `CmpltRedir`），让读写事务全程留在 PCIe Switch 内部高速折返。但如果是**虚拟化或 VFIO 设备直通**环境，虚拟机隔离高度依赖 ACS 防止跨租户窃听，切不可盲目一刀切关闭。
 
-**IOMMU（Input–Output Memory Management Unit，输入输出内存管理单元）** 为设备 DMA 提供地址转换和隔离。CUDA 13.1.2 所述的传统路径要求参与设备看到一致的物理地址，使用 IOMMU 时须核对该路径能否取得一一映射。固件设置、`/proc/cmdline` 和启动日志可提供平台与默认设置的线索。查某个 PCI 功能时，可由 `/sys/bus/pci/devices/<BDF>/iommu_group` 对到实际组，若该内核公开 `/sys/kernel/iommu_groups/<组号>/type`，再读其默认域类型，例如 `identity` 或 `DMA`。组号用于关联设备，默认域只说明默认映射方式。虚拟化和 Grace Blackwell 搭配 ConnectX-8 Data Direct 等路径需看各自的平台条件。 [CUDA 13.1.2 的 IOMMU 限定](https://docs.nvidia.com/cuda/archive/13.1.2/gpudirect-rdma/index.html#supported-systems) · [Linux v6.12 的 IOMMU group ABI](https://github.com/torvalds/linux/blob/v6.12/Documentation/ABI/testing/sysfs-kernel-iommu_groups) · [NVIDIA Grace Blackwell Data Direct 平台要求](https://docs.nvidia.com/multi-node-nvlink-systems/grace-blackwell-cx8-gpudirect-rdma-guide/platform_software_and_configuration.html)
+### 2. IOMMU（Input–Output Memory Management Unit，输入输出内存管理单元）
 
-## DMA-BUF 从本机导出到 MR 导入
+**IOMMU** 位于设备与内存之间，负责为外设 DMA 提供地址转换和隔离保护。根据 CUDA 13.2.1 GPUDirect RDMA 指南，传统 PCIe 路径要求参与直达的设备看到一致的物理地址；因此启用 IOMMU 时，必须确认相关设备处于直通一一映射（`identity` / `passthrough`）模式，否则硬件地址转换会阻断对等访问。
 
-1. **CUDA 分配和导出。** CUDA 13.1.2 可用 `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` 检查设备内存的导出能力。对满足条件的 `cuMemAlloc()` 分配，`cuMemGetHandleForAddressRange()` 可导出 DMA-BUF 文件描述符。地址和长度须按主机页大小对齐。若使用预留虚拟地址，所选范围还须完全映射，所有背后的物理分配应位于同一设备且具有相同分配属性。 [CUDA 13.1.2 的显存导出接口](https://docs.nvidia.com/cuda/archive/13.1.2/cuda-driver-api/group__CUDA__MEM.html)
-2. **RDMA 驱动导入并注册。** 应用用 `ibv_reg_dmabuf_mr()` 将文件描述符指定的范围注册进本机 PD。它提供 `fd`、文件内偏移 `offset`、长度、访问标志和 `iova`。后者是 MR 被密钥引用时使用的基址，其页内偏移须与 `offset` 相同。注册成功后，文件描述符服务于本机导入，A 远程写 B 时使用 B 发布的 RDMA 地址、长度和 `rkey`。 [rdma-core v57.0 的 DMA-BUF MR 注册](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3)
-3. **通过请求检验映射。** 导出成功说明 CUDA 接受了该分配的导出。导入成功进一步说明所选 RDMA 设备接受了注册参数。还需一次成功的实际请求，才能把证据扩展到所测的设备配对、方向和操作。
+现场排查时，除了检查 BIOS 设置和 `/proc/cmdline` 启动参数，更直接的证据在 sysfs 中：
 
-Peer Memory 路径由 `nvidia-peermem` 模块向具备相应接口的 RDMA 栈提供 GPU 对等内存映射。旧系统上可能见到早期独立模块 `nv_peer_mem`。模块已加载只能确认这项内核组件在运行。还需核对 NIC 驱动及其接口、程序实际采用的注册路径和注册结果。CUDA 13.1.2 指南还提醒，先于 MLNX_OFED 安装 GPU 驱动时，应确保 GPU 驱动按目标 RDMA API 构建。 [CUDA 13.1.2 的 nvidia-peermem 部署与兼容说明](https://docs.nvidia.com/cuda/archive/13.1.2/gpudirect-rdma/index.html#using-nvidia-peermem)
+```bash
+# 查看网卡 BDF 所属的 IOMMU 分组，以及该分组的默认映射域类型
+$ readlink -f /sys/bus/pci/devices/0000:83:00.0/iommu_group
+/sys/kernel/iommu_groups/42
 
-GPU Operator 25.3.4 的部署文档将 DMA-BUF 路径的前提列为 NVIDIA 开放内核模块、CUDA 11.7 或更高、Linux 5.12 或更高，以及 Turing 或更新的相应 GPU，可用受支持的发行版网络驱动或厂商驱动。它为 `nvidia-peermem` 路径列出 MLNX_OFED 或 DOCA-OFED。使用这些前提筛选候选组合后，还要核对目标平台、实际 GPU 分配、NIC、运行固件以及用户态 provider。 [GPU Operator 25.3.4 的 RDMA 部署前提](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/25.3.4/gpu-operator-rdma.html#common-prerequisites) · [GPU Operator 25.3.4 的平台矩阵](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/25.3.4/platform-support.html)
+$ cat /sys/kernel/iommu_groups/42/type
+identity    # identity 表示直通一一映射；若为 DMA / DMA-FQ 则经过地址转换
+```
 
-若设备和拓扑均匹配，先跑主机内存 RDMA，再换成显存缓冲区。分别记录 CUDA 导出、RDMA 导入和工作请求完成，就能把失败定位到比“GPUDirect 不工作”更具体的阶段。
+> [!note] 新架构平台边界
+> 面向虚拟化直通的特殊配置，以及新一代 Grace Blackwell 搭配 ConnectX-8 **Data Direct** 等全新互连架构，其 PCIe 拓扑与 IOMMU 约束与传统 x86 PCIe 裸机路径存在差异，部署时应直接对照对应平台的专项配置指南。
+
+## 第三关：DMA-BUF 导出导入链路与 Peer Memory 对比
+
+物理路径和开关全部绿灯后，最后一步落在软件栈能否真正为一块显存签发 MR。当前 Linux 6.8+ 主线内核与 CUDA 13.2.1 栈中，**DMA-BUF** 是官方优先推荐的标准方案，整个注册过程分三步推进：
+
+```c
+// 步骤 1：查询目标 GPU 是否支持 DMA-BUF 显存导出
+cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, dev);
+
+// 步骤 2：在 GPU 上分配显存并导出为 Linux DMA-BUF 文件描述符（fd）
+// 约束：地址与长度必须按主机页大小对齐；若用虚拟地址预留，全区间须完整映射且归属同一设备与属性
+cuMemAlloc(&dptr, size);
+cuMemGetHandleForAddressRange(&dmabuf_fd, dptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+
+// 步骤 3：把 fd 导入本地 RDMA 保护域（PD），注册生成可供远程读写的显存 MR
+// 约束：MR 基址 iova 的页内偏移必须与文件偏移 offset 保持一致
+mr = ibv_reg_dmabuf_mr(pd, offset, size, iova, dmabuf_fd,
+                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+```
+
+注意一个关键细节：导出的文件描述符 `dmabuf_fd` 只服务于本机跨驱动交接。一旦 `ibv_reg_dmabuf_mr()` 成功返回 MR，跨机传输时发起端依然只使用远端发布的 RDMA 地址、长度与 `rkey`，网络协议层面完全不需要传递文件描述符。
+
+这三步恰好天然切出了三条精准的排障分界线：
+- **导出成功**：说明 GPU 驱动接受了该块显存分配的 DMA-BUF 导出条件；
+- **导入成功**：进一步说明网卡内核驱动、用户态 provider 与固件接受了这组映射参数；
+- **实际请求成功**：只有真实跑通一次工作请求并收到 `IBV_WC_SUCCESS`，才构成该 GPU–网卡配对在该方向上支持 GPUDirect RDMA 的闭环证据。
+
+至于传统的 **Peer Memory** 路径，它依靠 `nvidia-peermem` 内核模块（早期旧系统称 `nv_peer_mem`）把显存映射回调挂接到 OFED 栈上。排查旧环境时尤其要核实两点：
+
+- **模块在跑 ≠ 流量真走它**：`lsmod` 看到 `nvidia-peermem` 已加载只能证明内核组件存在；现代 NCCL 等通信库在环境支持时会优先选用主线 DMA-BUF。
+- **安装顺序与接口匹配**：若 GPU 驱动安装早于 MLNX_OFED，必须确保 `nvidia-peermem` 按目标 RDMA 内核 API 重新构建，否则符号不匹配会导致显存注册静默失效。
+
+> [!note] 统一软件栈与 Kubernetes 集群前提
+> 对齐全书参考栈（**Ubuntu 24.04 LTS / Linux 6.8+、NVIDIA 开源内核模块 R595、CUDA 13.2.1**），Turing 及更新架构 GPU 可直接通过主线 **DMA-BUF** 与受支持的发行版或厂商网络驱动配合，彻底告别逐台编译维护 `nvidia-peermem` 的烦恼。
+>
+> 在 Kubernetes 集群中，**GPU Operator（v26.7.2）** 官方优先推荐原生 DMA-BUF 路径，并与 **Network Operator** 协同完成 Pod 高速网络交付（详见第 12–13 章）。
+
+> [!tip] 推理集群 PD 分离上线前核查
+> 部署基于 NIXL 或 vLLM `NixlConnector` 的 PD 分离推理资源池前，务必按本篇顺序把每台 Prefill 与 Decode 节点的 `PIX` 拓扑、`ACSCtl`、`iommu_group/type` 与 DMA-BUF 注册全部过一遍。一旦某一关失守导致底层静默回退到主机内存中转或 TCP，长上下文请求的 TTFT 就会在上线后突发暴涨。
+
+软硬件条件都对照清楚了，怎么用最小的隔离实验把“主机内存 RDMA 正常”和“GPUDirect RDMA 正常”分别验实？下一篇，我们用 `perftest`（`ib_write_bw`）做一轮干净的两阶段对照测量。
+
+> [!info]- 参考资料
+> - **CUDA 13.2.1 GPUDirect RDMA 与显存导出接口**：[Supported Systems (PCIe / IOMMU)](https://docs.nvidia.com/cuda/archive/13.2.1/gpudirect-rdma/index.html#supported-systems)、[Using `nvidia-peermem`](https://docs.nvidia.com/cuda/archive/13.2.1/gpudirect-rdma/index.html#using-nvidia-peermem)、[CUDA Memory Management (`group__CUDA__MEM`)](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-driver-api/group__CUDA__MEM.html)、[CUDA Device Management (`group__CUDA__DEVICE`)](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-driver-api/group__CUDA__DEVICE.html)
+> - **PCIe P2P、ACS 与 IOMMU 内核与工具文档**：[NVIDIA SMI Documentation](https://docs.nvidia.com/deploy/nvidia-smi/)、[Linux Kernel PCI P2P DMA](https://docs.kernel.org/driver-api/pci/p2pdma.html)、[pciutils v3.13.0 `ls-ecaps.c`](https://github.com/pciutils/pciutils/blob/v3.13.0/ls-ecaps.c)、[NCCL 2.27.3 ACS Troubleshooting](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/troubleshooting.html#pci-access-control-services-acs)、[Linux Kernel VFIO](https://docs.kernel.org/driver-api/vfio.html)、[Linux v6.12 `sysfs-kernel-iommu_groups`](https://github.com/torvalds/linux/blob/v6.12/Documentation/ABI/testing/sysfs-kernel-iommu_groups)
+> - **DMA-BUF 注册、GPU Operator 与新平台参考**：[rdma-core v57.0 `ibv_reg_mr(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3)、[NVIDIA GPU Operator GPUDirect RDMA & GDS Guide](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-rdma.html)、[NVIDIA GPU Operator Platform Support](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/platform-support.html)、[Grace Blackwell ConnectX-8 Data Direct Guide](https://docs.nvidia.com/multi-node-nvlink-systems/grace-blackwell-cx8-gpudirect-rdma-guide/platform_software_and_configuration.html)

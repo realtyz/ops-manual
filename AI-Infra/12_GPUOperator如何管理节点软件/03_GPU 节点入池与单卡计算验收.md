@@ -1,42 +1,79 @@
+# GPU 节点入池与单卡计算验收
 
-`gpu-h1` 是新加入的 Ubuntu 24.04 LTS 节点，运行 containerd 2.3，有两张 H100 PCIe。其他组件由 GPU Operator `v26.7.2` 的 `ClusterPolicy` 部署，Kubernetes 版本为 v1.36。节点已经具备 NFD 的 PCI 标签，Operator 已将它纳入 GPU 组件范围。接下来观察节点软件如何启用，并用一张卡验收这条交付链。
+新节点拿到部署标签后，DaemonSet 控制器几乎同时派发出 driver、Toolkit、Validator、Device Plugin 和 GFD 的 Pod。此时看 `kubectl get pods`，常会发现一排组件停在 `Init:0/1`，Node 上也迟迟不见 `nvidia.com/gpu`。
 
-## 驱动与 Toolkit 如何解除插件的启动等待
+这不是部署卡死了，而是 GPU Operator 刻意设计的**启动秩序**。DaemonSet 只管并发建 Pod，不管先后顺序。Operator 借助 Kubernetes 的 **Init 容器机制**，把跨组件依赖变成了节点本地的逐级放行门禁。
 
-DaemonSet 可以先后为 `gpu-h1` 创建 driver、Toolkit 和 Device Plugin 的 Pod。每个 Pod 中的初始化容器（init container）完成后，kubelet 才启动该 Pod 的应用容器。这个机制把分散在多个对象里的依赖变成节点上的等待条件。 [Kubernetes Init 容器](https://v1-36.docs.kubernetes.io/docs/concepts/workloads/pods/init-containers/) · [Toolkit 模板](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-container-toolkit/0500_daemonset.yaml)
+## Init 门禁如何把并发 Pod 编排成有序启动链
 
-1. driver Pod 将驱动装到节点上，内核加载 `nvidia` 模块。Toolkit Pod 的 `driver-validation` init 检查驱动能否使用，通过后 Toolkit 的主容器才开始配置运行时。在 CDI 开启、NRI 关闭的主例中，直接访问 GPU 的管理 Pod 使用 `runtimeClassName: nvidia`。RuntimeClass 将这个名字映射到 containerd 的运行时处理器（handler）。Toolkit 配好这个 handler 后，使用它的管理 Pod 才能启动。 [Toolkit 模板](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-container-toolkit/0500_daemonset.yaml) · [GPU 管理容器的 RuntimeClass](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/cdi.html#cdi-and-gpu-management-containers)
-2. Operator Validator 的 `toolkit-validation` 在 GPU 管理容器中运行 `nvidia-smi`，成功后写入节点共享位置 `/run/nvidia/validations/toolkit-ready`。本章的裸金属路径里，Device Plugin 的 `toolkit-validation` init 等待该标记和加载中的 `nvidia` 模块。即使插件 Pod 已被创建并绑定节点，缺其中任一条件时，插件的主容器仍在等待启动。 [Validator 清单与实现](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-operator-validation/0500_daemonset.yaml) · [验证标记实现](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/cmd/nvidia-validator/main.go) · [Device Plugin 模板](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-device-plugin/0500_daemonset.yaml)
-3. 插件启动后向本机 kubelet 注册。kubelet 通过 `ListAndWatch` 接收设备 ID 与健康列表，更新 Node 的资源状态。两张健康整卡经过这一步才成为调度器可用的数量。 [Kubernetes Device Plugin 注册与设备状态](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-registration)
+在裸金属节点上，driver、Toolkit、Validator 与 Device Plugin 按三道关卡依次解锁：
+
+1. **驱动先就绪，再配运行时**：driver Pod 先向内核加载 `nvidia` 模块。Toolkit 的 `driver-validation` init 通过后，主容器才配置 containerd。在开启 CDI、关闭 NRI 的主线里，管理容器靠 `runtimeClassName: nvidia` 映射到对应 handler。
+2. **Validator 盖章，插件才启动**：Validator 的 `toolkit-validation` 在管理容器中跑通 `nvidia-smi`，随后写入 `/run/nvidia/validations/toolkit-ready`。Device Plugin 的 `toolkit-validation` init 同时检查该标记与 `nvidia` 模块，缺一便持续等待。
+3. **插件注册，库存入账**：门禁全部通过后，Device Plugin 主容器启动并向 kubelet 注册。kubelet 经 `ListAndWatch` 收到健康设备列表，将整卡数量写回 Node 的 `Capacity` 与 `Allocatable`。
 
 ```mermaid
-flowchart
-    D["节点驱动可用"] --> T["Toolkit 的 driver-validation 通过"]
-    T --> R["Toolkit 配置运行时"]
-    R --> V["Validator 写入 toolkit-ready"]
-    D --> I["插件的 toolkit-validation 通过"]
+flowchart TD
+    accDescr: 新节点入池时驱动、Container Toolkit、Validator 与 Device Plugin 通过 init 容器门禁依次解锁并向 kubelet 上报 GPU 资源的依赖流程图。
+    D["1. driver Pod 完成加载<br/>宿主机 nvidia 内核模块可用"] --> T["2. Toolkit init (driver-validation) 通过"]
+    T --> R["3. Toolkit 主容器配置 containerd handler"]
+    R --> V["4. Validator 跑通 nvidia-smi<br/>写入 /run/nvidia/validations/toolkit-ready"]
+    D --> I["5. Device Plugin init (toolkit-validation) 通过"]
     V --> I
-    I --> P["插件注册并上报"]
-    P --> K["kubelet 发布 GPU 资源"]
+    I --> P["6. Device Plugin 主容器启动并向 kubelet 注册"]
+    P --> K["7. kubelet 刷新 Node Capacity 与 Allocatable"]
 ```
 
-这张图表示启动依赖。就绪状态和资源状态分别写回 API，实际采集时可能先看到其中一项变化。
+*图 12-03-01：新节点入池时的 init 启动依赖链。图中箭头表示前置放行条件；各组件状态与 Node 资源字段由不同控制器异步写回 API Server。*
 
-## 组件覆盖与 GPU 资源分别计数
+排查新节点入池进度时，最直接的抓手是按目标节点过滤 `gpu-operator` 命名空间的 Pod。下面对照“正在解锁 init”与“全部就绪”的典型输出（以新入池节点为例）：
 
-下面是三个教学快照。`gpu-h0` 始终就绪，`cpu-0` 始终在 Device Plugin 范围外，`gpu-h1` 之前从未上报 GPU。DaemonSet 的两个数来自 `nvidia-device-plugin-daemonset` 的 `status.desiredNumberScheduled` 与 `status.numberReady`，单位是节点。Node 的两个数取 `status.capacity` 与 `status.allocatable` 下的 `nvidia.com/gpu`，单位是本例的整卡。 [DaemonSetStatus 定义](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/apps/daemon-set-v1/#daemonsetstatus) · [Kubernetes 不健康设备计数规则](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices)
+```bash
+# 按目标节点筛选所有 GPU Operator 组件 Pod（关键看 READY 与 STATUS 列）
+kubectl get pods -n gpu-operator --field-selector spec.nodeName=gpu-h1 -o wide
 
-| 教学时点 | 插件期望 / 就绪节点数 | `gpu-h1` 的 GPU Capacity / Allocatable | 推理 |
+# --- 典型过渡态（驱动已加载，Toolkit 正在配置，插件与特征发现尚在等 init 门禁）---
+# NAME                                       READY   STATUS     RESTARTS   NODE
+# nvidia-driver-daemonset-7k2mn              1/1     Running    0          gpu-h1  # 驱动已就绪
+# nvidia-container-toolkit-daemonset-9x4pl   1/1     Running    0          gpu-h1  # 正在配置运行时
+# nvidia-operator-validator-3q8rt            0/1     Init:1/4   0          gpu-h1  # 正执行 toolkit-validation
+# nvidia-device-plugin-daemonset-5v2wb       0/1     Init:0/1   0          gpu-h1  # 等待 toolkit-ready 标记
+# gpu-feature-discovery-8h6zc                0/1     Init:0/1   0          gpu-h1  # 同上，等待验证标记
+# nvidia-dcgm-exporter-4m9dn                 0/1     Init:0/1   0          gpu-h1  # 同上，等待验证标记
+
+# --- 全部就绪态（可继续核对 Node 的 nvidia.com/gpu 资源字段）---
+# nvidia-operator-validator-3q8rt            1/1     Running    0          gpu-h1  # 四道校验全通，进入驻留
+# nvidia-device-plugin-daemonset-5v2wb       1/1     Running    0          gpu-h1  # 已向 kubelet 注册
+# gpu-feature-discovery-8h6zc                1/1     Running    0          gpu-h1  # 已发布型号特征
+# nvidia-dcgm-exporter-4m9dn                 1/1     Running    0          gpu-h1  # /metrics 采集就绪
+```
+
+## 区分两套账本：DaemonSet 节点数 vs Node 整卡数
+
+观察入池进度时，必须分清 **DaemonSet 聚合计数**和 **Node GPU 资源计数**。
+
+前者来自 `nvidia-device-plugin-daemonset` 的 `desiredNumberScheduled` 与 `numberReady`，单位是**节点**。后者来自目标 Node 的 `status.capacity` 与 `status.allocatable` 下的 `nvidia.com/gpu`，单位是**整卡**。
+
+假定已有就绪节点始终健康、普通 CPU 节点不在部署范围内，新入池节点从刚注册到入池完成会呈现三个清晰阶段：
+
+| 入池阶段 | 插件 DaemonSet 期望 / 就绪（节点） | 新节点 `gpu-h1` GPU Capacity / Allocatable（整卡） | 现场判断与下一步 |
 | --- | ---: | ---: | --- |
-| 节点已注册，部署标签尚未到位 | 1 / 1 | 两键缺失 | 两个 1 都来自旧节点。先看新节点的发现和部署条件。 |
-| 新节点匹配模板，运行时 handler 已就绪，插件 init 正等待验证标记 | 2 / 1 | 两键缺失 | 期望多了 `gpu-h1`，就绪仍只有 `gpu-h0`。去新节点查等待条件。 |
-| 两个插件 Pod 均就绪，kubelet 已发布两张健康整卡 | 2 / 2 | 2 / 2 | 新节点已发布整卡资源，可以用业务形态的 Pod 检查后续交付。 |
+| 1. 节点已 `Ready`，部署标签未到位 | `1 / 1` | 两键均缺失 | 两个 `1` 全来自已有节点；先查 NFD 发现与 Operator 标签 |
+| 2. 已匹配模板，插件停在 `Init:0/1` | `2 / 1` | 两键均缺失 | 期望数已纳入新节点，就绪仍为 `1`；直接去新节点查 init 等待条件 |
+| 3. 两个插件 Pod 均就绪，上报完成 | `2 / 2` | `2 / 2` | 两张健康整卡已入账，可以提交业务形态测试 Pod 做计算验收 |
 
-可以用 `kubectl get ds -n gpu-operator nvidia-device-plugin-daemonset -o yaml` 读聚合计数，再用 `kubectl get pods -n gpu-operator --field-selector spec.nodeName=gpu-h1 -o wide` 找目标节点的组件 Pod，最后用 `kubectl get node gpu-h1 -o yaml` 读资源键。将三次读取的节点和时间对应起来，才能把“已选中”和“可调度”连到同一台机器。
+> [!warning] 常见误区：只看聚合数容易误判
+> `kubectl get ds` 的 `1/1` 在新节点尚未打标签时完全“看起来正常”。必须把下面三条命令的节点名与采集时刻对齐，才能把“进范围”“Pod 就绪”与“可调度库存”连到同一台机器上。
 
-## 用普通 Pod 验证调度、注入与计算
+```bash
+kubectl get ds -n gpu-operator nvidia-device-plugin-daemonset -o yaml           # 1) 读集群级期望与就绪节点数
+kubectl get pods -n gpu-operator --field-selector spec.nodeName=gpu-h1 -o wide  # 2) 看目标节点组件是否卡在 Init
+kubectl get node gpu-h1 -o yaml                                                 # 3) 查 status.capacity 与 allocatable
+```
 
-下面改写自 NVIDIA 的 CUDA VectorAdd 示例。假定 `kubernetes.io/hostname=gpu-h1` 唯一匹配目标节点，CPU、内存、污点、镜像获取等其他条件满足，初始没有 GPU 请求。使用节点选择器限定目标，保留调度器的放置过程。在这种独占资源上，只写 GPU limit 时，同值作为请求计入调度。Pod 的一张卡进入节点调度账本后，剩余量为 `2 − 1 = 1` 张。若两张卡仍健康，Node 的 `Allocatable` 继续为 2。 [NVIDIA CUDA VectorAdd 示例](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/getting-started.html#cuda-vectoradd) · [Kubernetes GPU 请求规则](https://v1-36.docs.kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
+## 用单卡 CUDA 负载完成端到端验收
+
+Node 上出现 `nvidia.com/gpu: 2`，只说明调度器看到了库存。它不能替代**调度、分配、CDI 注入与真实 CUDA 计算**的闭环验收。生产入池前，最干净的做法是提交一个单卡验证 Pod（改写自 NVIDIA 官方 CUDA VectorAdd 示例）：
 
 ```yaml
 apiVersion: v1
@@ -46,15 +83,35 @@ metadata:
 spec:
   restartPolicy: Never
   nodeSelector:
-    kubernetes.io/hostname: gpu-h1
+    kubernetes.io/hostname: gpu-h1   # 用 nodeSelector 限定目标节点，仍走 kube-scheduler 完整调度流程
   containers:
     - name: cuda-vectoradd
       image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04
       resources:
         limits:
-          nvidia.com/gpu: 1
+          nvidia.com/gpu: 1          # 独占扩展资源只写 limits 时，requests 自动取同值 1
 ```
 
-先确认 `spec.nodeName=gpu-h1`，再看容器的创建、运行和终止状态。需要验证具体卡的身份时，在容器运行期间用节点 kubelet 的 PodResources `List` 接口查看对应 Pod 和容器的 `device_ids`。本章插件默认使用 GPU UUID，可以同节点上的驱动枚举核对。VectorAdd 的运行窗口较短，必要时用可保持运行的测试负载采集身份。对于这次 CUDA 验收，查容器日志是否输出 `Test PASSED`，并核对终止状态的 `exitCode: 0`。这组预期证据覆盖目标节点上的一次调度、分配、CDI 注入和 CUDA 计算。 [Kubernetes PodResources API](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#monitoring-device-plugin-resources) · [v26.7.2 Device Plugin 模板](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-device-plugin/0500_daemonset.yaml) · [NVIDIA 示例的预期输出](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/getting-started.html#cuda-vectoradd)
+这里有两个关键细节。第一，用 `nodeSelector` 而不是硬写 `spec.nodeName`，是为了保留 kube-scheduler 的完整调度过程。第二，在独占扩展资源上只填 `limits: 1` 时，调度器会自动记入同值请求。
 
-若节点已发布资源，Pod 却停在绑定或容器创建，就从该 Pod 的状态向前追到最后一项已有证据，再检查下一环的输入和输出。
+假定新节点初始没有其他占卡负载，该 Pod 绑定后节点账本上的调度余量为：
+
+$$\text{剩余可调度整卡数} = \text{Allocatable} - \text{已计入 GPU 请求} = 2 - 1 = 1\text{ 张}$$
+
+只要两张物理卡仍健康，Node 对象的 `Allocatable` 字段本身保持为 `2`。它不会因 Pod 占用而扣减，调度余量由调度器在内存账本中实时核算。
+
+整条端到端验收按四项证据收口：
+1. **确认调度落点**：核对 `Pod.spec.nodeName` 指向目标节点，排除调度器跳过或绑定异常。
+2. **核对逐卡身份（按需）**：在运行窗口调用本机 kubelet 的 PodResources `List` 接口，读取容器拿到的 `device_ids`（默认是 GPU UUID）并与驱动枚举对照。VectorAdd 运行极短，需要从容取证时可改用常驻测试镜像。
+3. **确认注入与启动**：检查 Pod 未卡在 `CreateContainerError` 或运行时 CDI 解析失败。
+4. **验收计算输出**：核对容器日志输出 `Test PASSED`，且终止状态为 `exitCode: 0`。
+
+> [!summary] 核心结论
+> 新节点入池是四层递进的证据链：**组件覆盖 → init 门禁解锁 → kubelet 库存上报 → 单卡调度与 CUDA 计算**。唯有跑通带调度的单卡计算测试，节点才真正具备生产交付条件。
+
+如果新节点在其中任意一层卡住了——比如 `ClusterPolicy` 明明报 `ready`，或者 Validator 全绿，业务 Pod 却依然拿不到卡——该如何一眼锁定根因？下一篇我们拆解 `ClusterPolicy` 状态、Validator 边界与分层排障清单。
+
+> [!info]- 参考资料
+> - **Kubernetes Pod、DaemonSet 与资源机制**：[Kubernetes Init 容器](https://v1-36.docs.kubernetes.io/docs/concepts/workloads/pods/init-containers/)、[DaemonSetStatus 定义](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/apps/daemon-set-v1/#daemonsetstatus)、[Kubernetes GPU 请求规则](https://v1-36.docs.kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
+> - **Device Plugin 注册、健康计数与 PodResources**：[Kubernetes Device Plugin 注册与设备状态](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-registration)、[Kubernetes 不健康设备计数规则](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices)、[Kubernetes PodResources API](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#monitoring-device-plugin-resources)
+> - **GPU Operator 启动门禁与验收示例**：[Toolkit 模板](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-container-toolkit/0500_daemonset.yaml)、[Device Plugin 模板](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-device-plugin/0500_daemonset.yaml)、[Validator 清单与实现](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/assets/state-operator-validation/0500_daemonset.yaml)、[验证标记实现](https://raw.githubusercontent.com/NVIDIA/gpu-operator/v26.7.2/cmd/nvidia-validator/main.go)、[GPU 管理容器的 RuntimeClass](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/cdi.html#cdi-and-gpu-management-containers)、[NVIDIA CUDA VectorAdd 示例](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/getting-started.html#cuda-vectoradd)

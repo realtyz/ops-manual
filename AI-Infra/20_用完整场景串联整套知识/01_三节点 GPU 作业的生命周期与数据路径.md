@@ -1,88 +1,198 @@
 # 三节点 GPU 作业的生命周期与数据路径
 
-`ai-demo/train-12` 要在三台服务器上完成 3,000 个全局训练步。工单的作业 UID 简记为 `J20`，第一次运行尝试记为 `R1`。每台运行一个 **worker Pod**，其中的启动器启动四个训练进程。**Rank** 是训练进程在本轮通信组内的全局编号，每个进程使用一张整卡。同步训练的一步需要全组交换结果。缺一个必需成员时，即使另外十一张卡都能计算，这个固定规模的作业也无法完成该步。
+早高峰 08:45，运维团队向一座训推共存的生产集群提交了一份三节点、12 卡同步训练作业 `ai-demo/train-12`，目标是跑完 3,000 个全局优化步。从提交请求到跑通第 1 个训练步，整整花了 18 分钟：前 5 分钟卡在队列准入，接着 10 分钟卡在成组放置，最后 3 分钟完成节点设备交付、进程会合与首轮集合校验。
 
-本章使用构造的工单、配置摘要、事件和测量。时间是同一天的本地钟点，带时长的记录另注明统计范围。各组件版本用于解释行为，实际装机需要按平台重新验证。
+如果只盯 `kubectl get pod`，前 15 分钟全是一片毫无波澜的等待，后 3 分钟又瞬间跳成 `Running`。想在生产环境一眼看穿每分钟到底卡在哪一层，必须先把这套集群的拓扑角色、控制面交接和真实数据通路完整串起来。
 
-## 作业请求与集群拓扑
+## 训推共存集群与实战角色总览
 
-| 约束 | 每个 worker | 三个 worker 合计或共同要求 |
+这座生产集群按实际物理布线划出两个网络域，同时承载**高优先级在线大模型推理（`infer` 队列）**与**多节点分布式训练（`train` 队列）**：
+
+- **A 网络域（主力训推池）**：4 台标准 8 卡 HGX H100 80 GB 节点，卡间经 NVLink 与 NVSwitch 全互联，域内 RoCEv2 链路已按多机训练吞吐验收。
+- **B 网络域（跨域扩展与推理缓冲池）**：1 台 8 卡 H100 80 GB 节点与 1 台 8 卡 A100 40 GB 节点，承接常规训练及跨域弹性的在线推理副本。
+
+每台节点向 Kubernetes 暴露 8 张整卡、32 CPU、192 GiB 主机内存与 2 个支持 RDMA 的 SR-IOV VF。两个 VF 切自同一物理网卡 PF，共用一条 `200 Gb/s` RoCEv2 物理端口，集群另设独立存储网承载共享文件系统读写。
+
+为避免后文在原理推演中被一堆短代号反复打断，本章叙述机制时优先使用**语义角色**，具体节点、Pod、设备与配图标签统一收敛到下面这张总览表，需要核对日志或手绘插画时按表回查即可：
+
+| 实战语义角色 | 集群实例名（括号为既有插画简标） | 本章承担的关键事件 |
 | --- | --- | --- |
-| GPU | 4 张 H100 SXM 80 GB 整卡 | 12 张。80 GB 是单卡显存规格。 |
-| Kubernetes CPU、主机内存 | 16 CPU、96 GiB | 48 CPU、288 GiB |
-| RDMA 网卡 | 1 个支持 RDMA 的 SR-IOV VF | 3 个，分别来自所在节点。 |
-| 位置 | H100 整卡池、A 网络域 | 三个不同主机，同在 A 域。 |
+| **主训练作业与尝试轮次** | `ai-demo/train-12`（图标 `J20`；首轮 `R1` / 重试 `R2`） | 固定 3 节点 12 卡同步训练，目标 3,000 步 |
+| **同集群在线推理服务** | `infer-llm`（独立高优先级 `infer` 队列） | 4 卡 TP 在线推理，受反亲和与 PDB 保护，守住 TTFT/TPOT SLO |
+| **A 域常规训练节点** | `node-1`（`h1`；首轮/重试 worker 图标 `P11`/`P12`） | 两轮均承接 Rank 0–3，并在试点期担任对端 |
+| **A 域故障与复归节点** | `node-2`（`h2`；首轮 worker `P21`；卡 `GPU-node2-02` / 图标 `GPU-h2-02`，`0000:65:00.0`） | 拆解 VF `0000:81:00.2` 交付；第 04 篇遭遇 PCIe 硬故障并复归 |
+| **A 域混部与慢步节点** | `node-3`（`h3`；首轮/重试 worker 图标 `P31`/`P32`） | 常驻 1 个 4 卡在线推理副本；第 03 篇出现 Rank 9 读取慢步 |
+| **A 域备用与升级试点节点** | `node-4`（`h4`；重试 worker `P41`；`基线 v1`/`候选基线 v2` 图标 `I0`/`I1`） | 08:50 因 VF 占满受阻；第 04 篇承接重试；第 05 篇执行内核升级试点 |
+| **B 域对照节点** | `node-5`（`h5`，8× H100 80 GB）、`node-a1`（`a1`，8× A100 40 GB） | 检验跨域限制、显存规格过滤及在线推理无损漂移落点 |
 
-A 域的 `h1/h2/h3/h4` 采用 HGX H100 八卡底板，节点内以 NVLink 和 NVSwitch 提供 GPU 间互联。B 域另有八卡 H100 节点 `h5` 和八卡 A100 40 GB 节点 `a1`。每台有 32 CPU、192 GiB 主机内存及两个 VF 可供 Pod 请求。**网络域**是平台根据实际布线和可用路径划出的节点范围。工单固定选择 A 域，因为该域内路径已按训练负载验收。节点标签表达这个选择，实际布线、地址和端口的证据负责验证标签对应的能力。 [NVIDIA · HGX H100 八卡底板与互联](https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/components.html)
+主训练作业的规格固定为 3 个 worker Pod、每 Pod 启动 4 个训练进程，硬性锁定 A 域 H100 池并按主机名反亲和分散到三台不同节点：
 
-RDMA（Remote Direct Memory Access，远程直接内存访问）让网卡在已注册的缓冲区之间传输数据。SR-IOV（Single Root I/O Virtualization，单根 I/O 虚拟化）让网卡向操作系统呈现可分别分配的 **VF**（Virtual Function，虚拟功能）。本例每节点的两个 VF 来自同一 **PF**（Physical Function，物理功能），共用一条 200 Gb/s 的 RoCEv2 物理端口。RoCE（RDMA over Converged Ethernet）是以太网上的 RDMA，RoCEv2 使用可路由的 IP/UDP 封装。两个 VF 是两个分配单位，遇到并发时仍受同一物理端口及上游路径的容量约束。 [Linux PCIe SR-IOV](https://docs.kernel.org/PCI/pci-iov-howto.html) · [NVIDIA RoCE 文档](https://networking-docs.nvidia.com/mlnxofedswum/24.10-5.1.6.1lts/rdma-over-converged-ethernet-roce)
+| 资源与位置维度 | 单个 worker Pod 请求 | 整组 3 个 worker 合计 / 共同约束 |
+| --- | --- | --- |
+| **GPU 整卡** | 4 张 H100 SXM 80 GB | 12 张同型整卡（单卡 80 GB 显存规格） |
+| **CPU 与主机内存** | 16 CPU、96 GiB | 48 CPU、288 GiB |
+| **高速 RDMA 网卡** | 1 个 SR-IOV VF（`example.com/rdma-vf: 1`） | 3 个，每节点各取 1 个 |
+| **网络域与拓扑** | A 域 H100 整卡池 | 同处 A 域，且分占 3 台不同物理主机 |
 
-## Volcano 准入、绑定与节点设备交付
+反映到提交给集群的 `VolcanoJob` 声明中，成组门槛、队列绑定、附加网络与硬件选择都在同一个模板里落盘：
 
-用户提交的 VolcanoJob 由 Kubernetes API 保存。Volcano 负责组织多 Pod 作业及其调度。Job Controller 为本作业创建 **PodGroup**，即调度器用于一起考虑这些成员的组对象。**Queue** 是各组共用的准入与用量账本。主例用 Volcano v1.16.0 的 `enqueue, allocate`，启用 `capacity`、`predicates` 和 `gang`。Job 与唯一 worker 角色的最低成员都为 3。通过 `enqueue` 后，组进入 `Inqueue`，控制器可以建立 worker Pod。`allocate` 再按节点余量、标签、反亲和等条件找节点，`gang` 检查能否满足该组的成组门槛。控制器创建成员、调度器绑定成员和节点交付设备是不同的交接。 [Volcano v1.16.0 · Actions](https://volcano.sh/docs/v1.16.0/scheduler/actions/) · [Volcano v1.16.0 · PodGroup](https://volcano.sh/docs/v1.16.0/concepts/podgroup/) · [v1.16.0 成员创建条件](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L400-L414)
+```yaml
+# 主训练作业 ai-demo/train-12 关键声明片段（Volcano v1.16.0）
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: train-12
+  namespace: ai-demo
+spec:
+  minAvailable: 3                    # 整组成组门槛：缺任意 1 个 worker 都不绑定
+  queue: train                       # 归入独立训练队列，与高优先级 infer 队列隔离
+  tasks:
+    - name: worker
+      replicas: 3
+      minAvailable: 3
+      template:
+        metadata:
+          annotations:
+            k8s.v1.cni.cncf.io/networks: roce-a   # 经 Multus 接入 A 域 RoCEv2 附加网
+        spec:
+          nodeSelector:
+            gpu.pool/model: h100-80gb             # 锁定 80 GB H100 整卡池
+            network.domain: domain-a              # 硬绑定已验收的 A 网络域
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname  # 强制三个 worker 分落三台主机
+                  labelSelector:
+                    matchLabels: { volcano.sh/job-name: train-12 }
+          containers:
+            - name: trainer
+              resources:
+                limits:
+                  cpu: "16"
+                  memory: 96Gi
+                  nvidia.com/gpu: "4"
+                  example.com/rdma-vf: "1"
+```
 
-09:00，三个 Pod 已绑定到 `h1/h2/h3`。以 `h2` 上的 Pod `P21` 为例，两个扩展资源请求分别是 `nvidia.com/gpu: 4` 和 `example.com/rdma-vf: 1`。调度阶段处理的是节点及资源数量。kubelet 的设备管理器在已绑定的节点上选择具体设备，并向相应 Device Plugin 发出 `Allocate`。本例选择启用了 `cdi-cri` 的 NVIDIA Device Plugin v0.20.1 与启用了原生 CDI 的 containerd v2.1.5。**CDI**（Container Device Interface，容器设备接口）让运行时按 `Allocate` 响应经容器运行时接口（CRI）交付的设备全名查本地规格，完成设备与所需配置的注入。请求的 4 个单位最终对应四个 GPU UUID。设备可见之后，应用还需在所选卡上完成计算和结果校验。 [Kubernetes v1.36 · Device Plugins](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/) · [NVIDIA Device Plugin v0.20.1 · 设备列表策略](https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.20.1/README.md) · [containerd v2.1.5 · CDI 配置](https://github.com/containerd/containerd/blob/v2.1.5/docs/cri/config.md)
+## 从提交到容器启动的三段控制交接
 
-另一条交付把一个 VF 接到 Pod。Pod 的附加网络选择指向 `roce-a`，一个 **NAD**（NetworkAttachmentDefinition，附加网络定义），其资源名与 Pod 请求一致。Multus v4.2.4 调用默认和附加的 CNI（Container Network Interface，容器网络接口）插件，从 kubelet 的本地分配信息取得 VF 的 PCI 地址，再把它交给 SR-IOV CNI。后者按本例的内核网卡模式接入 `net1` 并按配置分配地址。核对 `P21` 分到的 VF `0000:81:00.2`，以及 `net1`、RDMA 设备和物理口的映射，可以把应用端看到的设备追到交换机。VF 有余量时，仍要满足地址池、驱动和 Pod 网络配置等接入条件。 [Multus v4.2.4 · 资源名与设备索引](https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/v4.2.4/pkg/k8sclient/k8sclient.go) · [SR-IOV CNI · 设备和网络配置](https://github.com/k8snetworkplumbingwg/sriov-cni#sriov-cni)
+一份多卡作业从 YAML 落库到容器真正拉起进程，并不是一次原子操作，而是跨越三道彼此独立的控制交接：
+
+1. **队列准入（Volcano `enqueue` + `capacity`）**：作业落库后，Volcano Job Controller 自动创建 `PodGroup`。只有当 `train` 队列的可用配额能装下整组最低请求（12 GPU、48 CPU、288 GiB、3 VF），`PodGroup` 才进入 `Inqueue`，控制器这才开始创建三个尚未绑定节点的 worker Pod。
+2. **成组放置（Volcano `allocate` + `predicates` + `gang`）**：调度器逐节点核算型号、网络域、多维余量与反亲和，并在 `gang` 约束下确认三台候选主机全部凑齐，随后一次性写入三个 Pod 的 `spec.nodeName`（本例于 09:00 绑定到 `node-1`、`node-2`、`node-3`）。
+3. **节点双路本地交付（GPU CDI + SR-IOV VF）**：Pod 落到具体主机后，调度器已经退场，改由目标节点的 kubelet 接棒，同时推进两条本地设备交付支路。
+
+在 GPU 交付支路上，kubelet 设备管理器从本机健康池挑出 4 张物理卡，调用启用 `cdi-cri` 的 NVIDIA Device Plugin `v0.20.1` 完成 `Allocate`，再经 CRI 把设备全名交给 **containerd `2.3.0`**。
+
+按 [第 10 章](../10_GPU如何进入容器/00_内容大纲.md) 介绍的原生 CDI 路径，containerd 解析本地规格文件，将 4 张卡的设备节点与驱动库注入容器，每张卡均锚定唯一物理 UUID。
+
+在高速网络支路上，Multus `v4.2.4` 根据 Pod 注解指向的附加网络定义 `roce-a`，先从 kubelet 的本地分配快照取出该 Pod 获批的 VF PCI 地址，再交由 SR-IOV CNI 在容器网络命名空间内挂载为 `net1` 并分配 RoCE 地址。只有两条支路同时就绪，训练容器才会启动。
 
 ```mermaid
 flowchart TD
-    accTitle: 从 VolcanoJob 到设备交付和作业回收
-    accDescr: 控制器建立 PodGroup，队列检查后创建三个 Pod，调度器成组放置。GPU 注入与 VF 接入汇合于应用启动，随后是会合、首轮通信、训练、退出与资源归账。
-    J["提交 J20，控制器建立 PodGroup"] --> Q["Queue 最低请求检查通过"]
-    Q --> P["控制器创建三个 worker Pod"]
-    P --> B["成组放置并绑定到 h1、h2、h3"]
-    B --> G["节点交付四张 GPU，运行时解析 CDI"]
-    B --> V["节点交付一个 VF，CNI 接入 net1"]
-    G --> S["容器启动并通过本地设备检查"]
+    accTitle: 从提交作业到设备交付与退出归账
+    accDescr: 提交作业后控制器建立 PodGroup，队列配额检查通过后创建三个 Pod，调度器成组放置到三台主机。随后 GPU 原生 CDI 注入与 SR-IOV VF 接入并行汇合于容器启动，接着完成会合、首轮 AllReduce、训练与退出归账。
+    J["提交 train-12，控制器创建 PodGroup"] --> Q["train 队列最低请求检查通过（Inqueue）"]
+    Q --> P["控制器创建 3 个未绑定 worker Pod"]
+    P --> B["Volcano 成组绑定至 node-1、node-2、node-3"]
+    B --> G["kubelet 分配 4 张 GPU，containerd 2.3.0 原生 CDI 注入"]
+    B --> V["kubelet 分配 1 个 VF，Multus 与 SR-IOV CNI 接入 net1"]
+    G --> S["容器启动并通过本地设备映射核验"]
     V --> S
-    S --> R["三个 Agent 会合，十二个 Rank 完成首轮 AllReduce"]
-    R --> T["完成训练步并提交最终状态"]
-    T --> E["成员退出，核对请求和设备回收"]
+    S --> R["3 个 Agent 会合，12 个 Rank 完成首轮 AllReduce"]
+    R --> T["推进 3,000 个训练步并发布最终状态"]
+    T --> E["成员退出，核对设备、队列与节点三账归零"]
 ```
 
-*图 20-01-01｜固定三 worker 作业的正常交接。两条支路表达本地交付的依赖。各节点并行准备，各容器的启动时间可不同。图中的放置来自 `R1` 的教学记录。作业在后续尝试中完成时仍用末端两项验收。*
+*图 20-01-01：固定三节点作业从提交到退出归账的控制交接。绑定后 GPU 与 VF 两条本地交付并行推进，全部就绪后才进入应用会合与集合通信。*
 
-## 会合、集合通信与存储的实际路径
+容器变成 `Running` 后，运维不能仅凭状态字样就默认交付无误，而应立刻把节点分配快照与容器内视图对上号。以首轮运行节点 `node-2` 上的成员（`train-worker-1`）为例，下面这组核验把逻辑请求直接锚定到物理芯片与交换机链路：
 
-`torchrun` Agent 是每个 Pod 内负责组织本地训练进程的启动器。三个 Agent 使用相同的端点和本轮标识进行 **会合**（Rendezvous），借此确认同一批成员和启动信息。根据固定的三节点、每节点四进程设置，应用得到 `WORLD_SIZE=12`。记录中 `h1/P11` 对应 Rank 0–3、`h2/P21` 对应 Rank 4–7、`h3/P31` 对应 Rank 8–11。每个进程用 `LOCAL_RANK` 选择容器可见序列中的设备，并记录所用 UUID。`R1` 的 Rank 5 在 `h2/P21` 内为本地序号 1，实际使用 `GPU-h2-02`，其 PCI 地址（BDF，Bus、Device、Function）为 `0000:65:00.0`。短写的 UID 和 UUID 用于本章教学对照，重新启动后按新记录关联。 [PyTorch 2.9 · torchrun 的成员变量与重启语义](https://docs.pytorch.org/docs/2.9/elastic/run.html)
+```text
+# 09:01:20 节点 node-2（train-worker-1）本地交付核验摘录
+[PodResources API]  nvidia.com/gpu      -> [GPU-node2-01, GPU-node2-02, GPU-node2-03, GPU-node2-04]
+[PodResources API]  example.com/rdma-vf -> [0000:81:00.2]   # 所属 PF 对应 200 Gb/s 物理口
+[Container View]    LOCAL_RANK=1 (Rank 5) -> GPU-node2-02 (PCI BDF 0000:65:00.0)
+[Container Net]     net1 (roce-a)         -> VF 0000:81:00.2 -> mlx5_0 (RoCEv2 Active)
+```
 
-训练框架用 **NCCL**（NVIDIA Collective Communications Library）组织 GPU 间通信。**AllReduce** 将每个 Rank 的输入按指定运算归约，再让每个 Rank 都得到同一结果。本例用一轮 FP32（32 位浮点数）加和校验首轮结果。第 `r` 个 Rank 把缓冲区元素都设为 `r + 1`，十二个 Rank 的每个输出元素应为 `1 + 2 + … + 12 = 78`。应用核对同一调用序号、组成员、设备完成及校验结果。NCCL 的接口返回可表示操作已经提交到 CUDA 流，应用在对应流完成后读取并校验输出。NCCL 2.27.3 允许首轮操作时动态建立连接，因此引导和通信组初始化之后仍需检查首轮。 [NCCL 2.27.3 · 概览](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/overview.html) · [CUDA Stream 语义](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/usage/streams.html) · [NCCL_RUNTIME_CONNECT](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/env.html#nccl-runtime-connect)
+> [!tip] 工程直觉：把“身份快照”留在出事之前
+> 只要把 `Pod UID → Rank → GPU UUID / PCI BDF → VF / 物理口` 这张对应关系在启动瞬间落盘，后续无论是慢步查拥塞还是硬故障追 Xid，都能在几十秒内穿透容器边界，直接锁定宿主机物理链路。
 
-本例从应用和网络记录确认了四条路径。`eth0` 上的会合与 NCCL 引导传递成员和连接信息。GPU 间的数据段按实际传输方式经过节点内 NVLink/NVSwitch 或跨节点 RoCE。此处启用了 **GPUDirect RDMA**，网卡可按注册的显存缓冲区直接搬运这部分载荷，取决于实际选卡、PCIe 路径和驱动等条件。应用输入通过节点已挂载的共享文件系统读取，节点存储网卡传给主机内存，经 CPU 预处理再拷入 GPU 显存。保存状态在本例中经主机暂存后写回存储。 [NCCL 2.27.3 · Socket 接口、RDMA 设备与 GDR 配置](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/env.html) · [NVIDIA · GPUDirect RDMA](https://docs.nvidia.com/cuda/gpudirect-rdma/)
+## 四条运行路径与共享物理口边界
+
+容器内由 `torchrun` Agent 承担本地进程启动与会合。三台节点上的 Agent 指向同一会合端点完成对齐后，各自拉起 4 个训练进程，顺次组成 `Rank 0–11` 通信组（各节点分占 4 个连续 Rank，具体映射见上表）。
+
+由于 `NCCL 2.27.3` 默认在首次集合操作时按需动态建连（`NCCL_RUNTIME_CONNECT`），且调用返回仅代表指令提交到 CUDA Stream，启动后必须跑一轮 FP32 求和 AllReduce 做端到端验真。
+
+令第 $r$ 个 Rank（$r = 0, 1, \dots, 11$）把缓冲区全部填为 $r + 1$，则全组规模与每个输出元素的理论校验值为：
+
+$$
+\text{World Size} = 3 \text{ 节点} \times 4 \text{ 进程/节点} = 12
+$$
+
+$$
+\text{Checksum} = \sum_{r=0}^{11} (r + 1) = 1 + 2 + \cdots + 12 = 78
+$$
+
+只有 12 个 Rank 在各自 CUDA Stream 同步完成后全部读出 `78`，且选路日志确认跨机流量走了预期 RoCEv2 设备，才算真正跑通了全栈数据通路。从运行日志与拓扑映射可以清楚拆出四条各司其职的路径：
+
+1. **控制与引导路径（`eth0`）**：承担 `torchrun` 成员会合与 NCCL 建连信息交换，流量极小但决定通信组能否建立。
+2. **节点内高速互联（NVLink / NVSwitch）**：承接同机 4 个本地 Rank 之间的显存直连交换。
+3. **跨节点集合通信（RoCEv2 + GPUDirect RDMA）**：借 `net1` 对应的 VF 绕开主机内存，让网卡经 PCIe 直接搬运已注册的 GPU 显存缓冲区（原理见 [第 06 章](../06_从普通网络通信走向RDMA/00_内容大纲.md)）。
+4. **训练数据与检查点路径（独立存储网）**：样本批次经共享文件系统和节点存储网卡读入主机内存，由 CPU 预处理后再拷入 GPU 显存；检查点同样经主机暂存写回持久存储。
 
 ```mermaid
 flowchart TD
-    accTitle: J20 的引导、集合通信和输入路径
-    accDescr: 三个 Pod 的 eth0 用于会合和 NCCL 引导。两台节点间的 GPU 显存经 VF 所在的物理端口和 RoCEv2 网络交换数据。节点内 GPU 经 NVSwitch 互通。训练批次经独立存储网、主机和 CPU 预处理送入显存。
-    A["三个 Pod 的 eth0"] -.-> R["Agent 会合与 NCCL 引导"]
-    G["h2 的训练 GPU"] <-->|节点内 NVLink / NVSwitch| L["h2 的其他训练 GPU"]
-    G <-->|PCIe 与显存注册| N["h2 的 VF（net1）及父物理端口"]
-    N <--> F["A 域 RoCEv2 网络"]
-    F <--> P["对端 VF 及父物理端口"]
-    P <-->|PCIe 与显存注册| H["对端训练 GPU"]
-    S["共享文件系统"] -->|节点存储网| C["h2 主机内存与 CPU 预处理"]
-    C -->|主机到显存| G
+    accTitle: 三节点作业的引导、集合通信与数据供给路径
+    accDescr: 三个 Pod 的 eth0 负责会合与 NCCL 引导；节点内多张 GPU 经 NVLink 与 NVSwitch 互通；跨节点 GPU 显存经 PCIe、VF 与父物理口通过 A 域 RoCEv2 直传；训练输入经独立存储网、主机内存与 CPU 预处理进入显存。
+    A["三个 worker Pod 的 eth0"] -.-> R["torchrun 会合与 NCCL 引导"]
+    G["本端节点训练 GPU"] <-->|节点内 NVLink / NVSwitch| L["同节点其余训练 GPU"]
+    G <-->|PCIe 与显存注册| N["本端 VF（net1）及父物理口"]
+    N <--> F["A 域 RoCEv2 高速网络"]
+    F <--> P["对端 VF 及父物理口"]
+    P <-->|PCIe 与显存注册| H["对端节点训练 GPU"]
+    S["共享文件系统"] -->|独立存储网| C["主机内存与 CPU 预处理"]
+    C -->|H2D 拷入显存| G
 ```
 
-*图 20-01-02｜`h2` 与 `h1` 或 `h3` 的一段逻辑路径。虚线表达引导依赖，实线表达本例的载荷路径，双向线表示可双向交换。图展示存储读入方向，检查点写回经过节点存储网。两侧只画参与该段通信的设备。*
+*图 20-01-02：节点间四条核心路径分工。虚线为控制引导依赖，实线为数据载荷路径，存储写回检查点同样沿独立存储网回写。*
 
-![h2 的 P21 内，net1 以虚线连到 VF 0000:81:00.2。该 VF 与另一个 VF 都归同一个 PF，右侧只有一根标有 200 Gb/s 的线缆连到 A 域 RoCEv2 网络。](images/fig-20-01-03-pod-vf-shared-port.png)
+在训推共存集群里，跨节点网络有一条极易被忽视的物理边界：**SR-IOV 切分出来的两个 VF 只是两个独立的调度分配名额，底层依然共用同一块物理网卡 PF 与同一根 `200 Gb/s` 光模块链路**。当一台节点一半卡跑训练、另一半卡跑 PD 分离的在线推理副本时，双方各自拿着“独占”的 VF，出口流量却会在物理口与上游交换机队列里正面相遇。
 
-*图 20-01-03｜`h2/P21` 中的 `net1` 对应 `0000:81:00.2`。两个 VF 可以分别分配，流量仍可能争用同一个 200 Gb/s 物理端口及其上游路径。*
+![节点 h2 上 Pod P21 的 net1 以虚线连到已分配 VF 0000:81:00.2，该 VF 与同机另一个 VF 共同汇聚到同一个 PF，右侧仅有一条 200 Gb/s 物理链路接入 A 域 RoCEv2 网络。](images/fig-20-01-03-pod-vf-shared-port.png)
 
-## 从首个训练步到资源归账
+*图 20-01-03：训练成员所在节点 `node-2` 上 `net1` 映射到 VF `0000:81:00.2`（图中 `h2` / `P21` 对应 `node-2` / 首轮 `train-worker-1`）。两个 VF 可分别交付给不同 Pod，但底层共用同一 PF 与 `200 Gb/s` 物理口，并发流量仍受单一链路容量约束。*
 
-| 时刻（教学记录） | 观察到的结果 | 该结果确认的交接 |
+> [!warning] 常见误区：拿到独占 VF ≠ 拥有独占 200 Gb/s 带宽
+> SR-IOV 隔离了硬件队列与地址空间，却没有把一根物理光纤变成两根。第 03 篇排查网络尾延迟时，必须始终记得同机另一个 VF 上的邻近业务（例如在线推理 KV Cache 迁移）可能正在共享这根链路。
+
+## 从首个训练步到退出三账归零
+
+把 `08:45` 提交到 `09:03` 首步完成压缩到一张里程碑表里，每一步对应哪层交接一目了然：
+
+| 时刻 | 集群与作业观察到的事件 | 确认完成的交接层 |
 | --- | --- | --- |
-| 08:45 | API 返回作业 UID `J20`，控制器随后写入组对象。 | 声明已接受，组准备参加准入。 |
-| 08:50 | PodGroup 进入 `Inqueue`，随后出现三个未绑定成员。 | 队列门槛通过，节点放置尚待完成。 |
-| 09:00 | 三个 Pod 各有一个节点绑定结果。 | 组级落点已经落实，节点侧开始交付。 |
-| 09:01:20 | 三个训练容器已启动，分配快照与容器内 GPU、VF 身份对应。 | 运行时、设备和网络的本地交接有证据。 |
-| 09:02:10 | 三个 Agent 进入同一次会合，十二个 Rank 均记录本轮身份。 | 应用成员齐全。 |
-| 09:02:35 | 首轮 AllReduce 在十二个 Rank 上完成，校验值均为 78。 | 本次调用的通信和设备完成已验证。用选路记录确认它经过预期 RoCE 路径。 |
-| 09:03 | 全组完成第 1 个训练步。 | 输入、计算、通信和优化在这一步已走通。 |
+| **08:45** | API 返回作业对象并生成 `PodGroup` | 声明落库，进入队列准入评审 |
+| **08:50** | `PodGroup` 转为 `Inqueue`，控制器建出 3 个未绑定 Pod | `train` 队列配额放行，转入节点放置 |
+| **09:00** | 3 个 worker Pod 一次性获得节点绑定结果 | Volcano 成组放置落实，交棒给节点 kubelet |
+| **09:01:20** | 3 个训练容器启动，PodResources 快照与容器内 GPU/VF 对齐 | 原生 CDI 注入与 SR-IOV 附加网交接闭环 |
+| **09:02:10** | 3 个 Agent 完成同轮会合，12 个 Rank 落盘各自设备身份 | 应用进程组成员齐备 |
+| **09:02:35** | 首轮 12-Rank AllReduce 在设备侧完成，输出全员等于 `78` | 跨机 GPUDirect RDMA 实际路径与计算验真 |
+| **09:03** | 全组完成第 1 个全局优化步 | 供数、计算、集合通信与参数更新全线打通 |
 
-正常收尾要看到应用完成目标步并发布最终输出，三个 worker 成功退出后再看 Job 终态。其后分别核对 kubelet 上的旧分配清理、附加网络与地址回收、Queue 以及节点请求归账。只有再次观察到健康设备交给新 Pod，才有实际再分配的证据。三张账的更新时间可不同，应按旧 Pod UID 和当前快照对账。第 04 篇给出 `J20` 在 `R2` 上的最终记录。 [Volcano v1.16.0 · 终态判断](https://raw.githubusercontent.com/volcano-sh/volcano/v1.16.0/pkg/controllers/job/state/running.go) · [Kubernetes v1.36 · Pod 终止](https://v1-36.docs.kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) · [kubelet v1.36.0 · 设备分配清理](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)
+同样地，当作业最终跑完 3,000 步正常收尾时，也不能只看 `Job Completed` 就宣布资源已经回来，必须分别核对三本更新节奏并不完全同步的账：
 
-从提交到第一步用了十八分钟，其中五分钟等入队，十分钟等成组放置，三分钟用于绑定后的交付和启动。前两段都表现为尚未运行，准入与节点两张账可以辨认各自的阻塞条件。
+1. **节点本地账**：kubelet 设备管理器清理旧 Pod UID 的 GPU/VF 分配，CNI 回收附加网络接口与 IPAM 地址。
+2. **调度节点账**：3 台主机上的 12 GPU、48 CPU、288 GiB 内存与 3 VF 调度请求归还给集群剩余量。
+3. **队列配额账**：Volcano `train` 队列的已用额度扣除本作业请求。三张账对账时都应锚定旧 Pod UID，而设备是否真的恢复可再交付，最终以新 Pod 成功拿到并运行为准（本作业的最终收尾记录将在第 04 篇完整呈现）。
+
+> [!summary] 核心结论
+> 从提交到第 1 步完成的 18 分钟里，真正花在设备注入与启动上的只有 3 分钟，整整 15 分钟耗在“等队列”和“等成组放置”。集群明明还空着几十张卡，为什么前面 15 分钟却一步也动不了？下一篇我们把时钟拨回 `08:45`，打开早高峰训推共存集群的资源账本一探究竟。
+
+> [!info]- 参考资料
+> - **HGX H100 节点架构**：[NVIDIA HGX H100 参考架构组件说明](https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/components.html)
+> - **Volcano 队列、成组调度与终态**：[Volcano v1.16.0 Actions](https://volcano.sh/docs/v1.16.0/scheduler/actions/)、[Volcano v1.16.0 PodGroup](https://volcano.sh/docs/v1.16.0/concepts/podgroup/)、[Volcano v1.16.0 成员创建条件源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L400-L414)、[Volcano v1.16.0 运行终态判断源码](https://raw.githubusercontent.com/volcano-sh/volcano/v1.16.0/pkg/controllers/job/state/running.go)
+> - **Kubernetes 设备交付与容器运行时**：[Kubernetes v1.36 Device Plugins](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)、[Kubernetes v1.36 Pod 终止与回收](https://v1-36.docs.kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)、[kubelet v1.36.0 设备分配清理源码](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)、[NVIDIA Device Plugin v0.20.1 README](https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.20.1/README.md)、[containerd 2.3.0 CRI CDI 配置](https://github.com/containerd/containerd/blob/v2.3.0/docs/cri/config.md)
+> - **SR-IOV 与 Multus 附加高速网**：[Linux Kernel PCIe SR-IOV HOWTO](https://docs.kernel.org/PCI/pci-iov-howto.html)、[NVIDIA RoCE 文档](https://networking-docs.nvidia.com/mlnxofedswum/24.10-5.1.6.1lts/rdma-over-converged-ethernet-roce)、[Multus v4.2.4 设备索引实现](https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/v4.2.4/pkg/k8sclient/k8sclient.go)、[SR-IOV CNI 配置参考](https://github.com/k8snetworkplumbingwg/sriov-cni#sriov-cni)
+> - **PyTorch 会合与 NCCL GPUDirect RDMA**：[PyTorch 2.9 torchrun 指南](https://docs.pytorch.org/docs/2.9/elastic/run.html)、[NCCL 2.27.3 概览](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/overview.html)、[NCCL 2.27.3 CUDA Stream 语义](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/usage/streams.html)、[NCCL 2.27.3 环境变量与动态建连](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2273/user-guide/docs/env.html#nccl-runtime-connect)、[NVIDIA GPUDirect RDMA 文档](https://docs.nvidia.com/cuda/gpudirect-rdma/)

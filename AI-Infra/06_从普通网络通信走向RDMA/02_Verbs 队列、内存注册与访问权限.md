@@ -1,54 +1,103 @@
+# Verbs 队列、内存注册与访问权限
 
-节点 A 要把主机内存中的 `1024 B` 写到节点 B 的一个缓冲区。两端各用一组队列安排网卡的发送和接收，这组队列称为队列对。先假定两端的 **RC（Reliable Connected，可靠连接）** 已经就绪。RC 把两端各一个队列对配成一条可靠、有序的连接，传输服务处理确认和重传。B 在建立连接之外，还要明确开放哪段内存供 A 写入。 [NVIDIA RDMA 编程手册 v1.7 的 Transport Modes](https://docs.nvidia.com/rdma-aware-networks-programming-user-manual-1-7.pdf)
+取消内核缓冲区中转之后，两个极其现实的问题立刻浮出水面：第一，进程手里的指针只是虚拟地址，网卡如何找到它背后的物理内存页？第二，如果允许对端网卡直接往本机内存里写数据，凭什么防止它越界踩坏其他数据？
 
-## 内存注册建立设备映射和访问范围
+Verbs 用一套严谨的对象体系回答了这两个问题。本篇先假定发起端与远端之间的 **RC（Reliable Connected，可靠连接）** 已经就绪——RC 将两端各一个队列对配成一对一的可靠、有序通道，由网卡硬件负责确认与重传。在此基础上，我们拆解一次 `1024 B` 的非 inline RDMA Write 背后全部核心对象与门禁检查。
 
-进程中的指针是虚拟地址。RNIC 需要一份在执行请求时能用的设备映射，还要知道可以访问的范围和方式。对本例的普通主机缓冲区，应用将起始地址、长度和访问标志交给 `ibv_reg_mr()`。驱动固定相关内存页并准备 DMA 映射。固定让页面在设备使用期间保持可用。支持 ODP（On-Demand Paging，按需分页）的设备与注册方式可以按需处理映射，本例使用普通注册。 [Linux 内核 Userspace Verbs 的内存固定](https://docs.kernel.org/infiniband/user_verbs.html#memory-pinning) · [rdma-core v57.0 的 MR 注册](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3)
+## 内存注册（MR）：给内存办“通行证”与固定门牌
 
-注册得到一个**内存区域（Memory Region，MR）**。本机请求用 `lkey`（本地密钥）引用本机 MR。远端对这段 MR 发起 Read 或 Write 时，使用接收方授权的 RDMA 地址与 `rkey`（远程密钥）。远程写权限须在 MR 上显式开启，收到请求的队列对也须允许远程写。通常先结束在途操作，并约定对端停止访问，才注销 MR 和释放底层缓冲区。 [rdma-core v57.0 的 MR 权限](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3) · [队列对属性](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_modify_qp.3)
+普通进程分配的内存随时可能被操作系统换出或迁移物理页，而网卡 DMA 访问需要稳定有效的设备地址映射。因此，任何准备参与 RDMA 传输的内存，都必须先通过 `ibv_reg_mr()` 完成注册，生成一个 **内存区域（Memory Region，MR）**。
 
-## 从工作请求到完成队列
+常规注册时，内核驱动会**固定（Pin）** 该区间的物理内存页，防止它们在传输期间被换出或回收，并为其建立 RNIC 可见的 DMA 映射表。（部分新硬件支持 **ODP，On-Demand Paging，按需分页**，可按需触发页映射，常规高性能路径仍以显式固定注册为主。）
 
-应用通过 `libibverbs` 打开本机选定的 RDMA 设备，得到一个**设备上下文**。在这个上下文中创建**保护域（Protection Domain，PD）**，用它把能够在同一次访问中配合的本机资源归在一起。本例中，A 的队列对和源 MR 属于同一个 A 端 PD，B 的队列对和目标 MR 属于同一个 B 端 PD。两台机器分别建立自己的资源。 [rdma-core v57.0 的保护域](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_alloc_pd.3) · [队列对创建](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_create_qp.3)
+注册成功后，系统会返回两把关键钥匙：
+- **`lkey`（本地密钥）**：供本机发起的工作请求使用，告诉本机 RNIC 这段内存属于哪个已注册的 MR。
+- **`rkey`（远程密钥）**：交给远端进程，远端在发起 RDMA Read 或 Write 时必须携带目标地址与匹配的 `rkey`，才被允许访问这段内存。
 
-**队列对（Queue Pair，QP）** 在本例中由发送队列（Send Queue，SQ）和接收队列（Receive Queue，RQ）组成。主动发起的 Write 投到 SQ。RQ 用于预先提供接收项，普通 Write 执行时由 B 的 RNIC 直接找已授权的 MR。创建 QP 时指定发送侧和接收侧各关联哪个**完成队列（Completion Queue，CQ）**，两侧可以共用一个 CQ。CQ 归设备上下文管理。 [rdma-core v57.0 的队列对创建](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_create_qp.3) · [完成队列创建](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_create_cq.3)
+> [!warning] 常见误区：远程写权限的隐藏前提与注销顺序
+> 1. **权限联动**：按 Verbs 规范，给一个 MR 开启远程写权限（`IBV_ACCESS_REMOTE_WRITE`）时，**必须同时开启本地写权限（`IBV_ACCESS_LOCAL_WRITE`）**，否则注册直接报错。同时，接收该请求的队列对也必须打开远程写开关，二者缺一不可。
+> 2. **生命周期**：必须等所有引用该 MR 的在途请求彻底完成、且对端确认不再发起远程访问之后，才能注销 MR 并释放底层内存。
 
-A 提交一条**工作请求（Work Request，WR）**，给出操作、本地缓冲区和远程目标。每段本地缓冲区的描述称为 **SGE（Scatter/Gather Element，分散收集条目）**，包含地址、长度和本地密钥。设备库将这个 WR 编码成 **WQE（Work Queue Entry，设备工作队列项）**。本例要求成功时也产生完成通知，因此网卡执行完成后写入 **CQE（Completion Queue Entry，完成队列条目）**。应用用 `ibv_poll_cq()` 将结果取为 **WC（Work Completion，工作完成记录）**，借助自己指定的 `wr_id` 与原 WR 对上。 [rdma-core v57.0 的提交接口](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_post_send.3) · [完成轮询](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_poll_cq.3)
+## 核心对象图谱：从 PD、QP、CQ 到提交与完成
+
+应用通过用户态库 `libibverbs` 打开选定的本地 RDMA 设备后，会获得一个**设备上下文（Device Context）**，随后在其中按“门禁域 + 收发窗口 + 回执箱”的关系创建资源：
+
+- **保护域（Protection Domain，PD）**：相当于安全隔离的“门禁域”。只有归属同一个 PD 的队列对和 MR 才能在同一次操作里互相配合，防止不同模块或租户错用密钥跨区访问。两端机器各自独立维护自己的 PD。
+- **队列对（Queue Pair，QP）**：网卡的收发业务窗口，由**发送队列（Send Queue，SQ）**与**接收队列（Receive Queue，RQ）**成对构成。发起端主动投递的 Write 排进 SQ；RQ 则用于预先摆放接收缓冲区（普通 Write 直接按远程地址落盘，不消耗远端 RQ）。
+- **完成队列（Completion Queue，CQ）**：网卡用来投放执行回执的邮箱。CQ 直接归属设备上下文（位于 PD 之外），创建 QP 时可为发送侧和接收侧指定各自的 CQ，也可以共用一个 CQ。
+
+一次数据传输如何穿过这些队列？完整链路只有四步：
+1. **构造与提交**：应用构造 **工作请求（Work Request，WR）**，用自定义整数 `wr_id` 标记，并用 **SGE（分散收集条目）** 指明本地地址、长度与 `lkey`（Write 另附远端地址与 `rkey`）。
+   - 调用 `ibv_post_send()` 时，用户态库把 WR 编码为 **WQE（Work Queue Entry）** 写入 SQ，再敲响门铃。
+2. **网卡执行**：RNIC 收到门铃后读取 SQ 中的 WQE，经 SGE 校验本地 `lkey`，通过 DMA 读取源 MR 中的数据并跨网发送。
+3. **写回执**：请求执行完毕后（当 WR 请求了完成通知时），RNIC 向对应的 CQ 写入一条 **CQE（Completion Queue Entry）**。
+4. **应用轮询**：应用调用 `ibv_poll_cq()` 从 CQ 捞出 **工作完成记录（Work Completion，WC）**，核对 `wr_id` 与状态码，就能确认哪一条 WR 已经真正收尾。
 
 ![节点 A 的 QP 和源 MR 在同一 PD 内，发送 CQ 在 PD 外。应用提交编号为 17 的 WR，网卡读取源 MR 的 1024 B，应用从 CQ 轮询取得同编号的 WC。](images/fig-06-02-01-verbs-objects.png)
 
-**图 06-02-01**　只画 A 端。琥珀色实线是本机的载荷方向，虚线表示提交、引用和完成。网卡是节点 A 的硬件，设备上下文框用于归组软件资源。图在网卡处省略了 A 的发送与 B 的接收、校验和写入。
+*图 06-02-01：发起端（图中标为节点 A）Verbs 核心对象关系与一次 1024 B Write 的本机执行链路。QP 与源 MR 同属保护域 PD，发送 CQ 位于 PD 之外；实线为载荷 DMA 方向，虚线为提交、引用与完成回执。*
 
-## 用 1024 B 推导 Write 的授权条件
+## 用 1024 B Write 逐步验证四层门禁
 
-以下为**字段级教学配置**。A 已注册从 `src_A` 开始的一段足够大的源缓冲区。B 向 A 发布目标 MR 的 RDMA 基址 `base_B`、长度和 `rkey_B`。请求使用非 inline 路径，设备在执行时按 SGE 读取源数据。
+现在把上述抽象落到一组具体字段上。假设发起端（对应下图中节点 A）准备把 `1024 B` 数据通过非 inline Write 写入远端（对应下图中节点 B）提前发布的 `4096 B` 目标 MR：
 
 ```text
-A 的 WR           wr_id=17, opcode=IBV_WR_RDMA_WRITE, send_flags=IBV_SEND_SIGNALED
-A 的本地 SGE      addr=src_A, length=1024 B, lkey=lkey_A
-A 的远程目标      remote_addr=base_B + 3072, rkey=rkey_B
-B 的目标 MR       base_B, length=4096 B, rkey=rkey_B
-B 的 MR 许可      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
-B 的 QP 许可      IBV_ACCESS_REMOTE_WRITE
+# 发起端（节点 A）提交的工作请求（WR）
+wr_id       = 17                       # 应用自定义编号，用于与完成记录（WC）对齐
+opcode      = IBV_WR_RDMA_WRITE        # 单边写操作，直接写远端指定 MR
+send_flags  = IBV_SEND_SIGNALED        # 要求网卡在成功时也向 CQ 写入完成记录
+
+# 发起端本地 SGE（指明源数据在哪里）
+local_sge   = { addr = src_A, length = 1024 B, lkey = lkey_A }
+
+# 发起端指定的远程目标（由远端提前告知）
+remote_dst  = { remote_addr = base_B + 3072, rkey = rkey_B }
+
+# 远端（节点 B）提前配置好的目标 MR 与 QP 门禁
+target_mr   = { addr = base_B, length = 4096 B, rkey = rkey_B }
+mr_access   = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+qp_access   = IBV_ACCESS_REMOTE_WRITE
 ```
 
-1. A 的 RNIC 用本地密钥找到源 MR，检查源地址和长度是否在域内已注册的范围中。本例 A 的网卡只从自己的 MR 读数据。
-2. B 的 RNIC 根据请求到达的 QP 及远程密钥检查目标。先假定域、密钥和许可均匹配。目标 MR 的有效偏移区间为 `[0, 4096)`，请求覆盖的是 `[3072, 3072 + 1024) = [3072, 4096)`，最后写到偏移 `4095`。
-3. 长度增至 `1025 B` 且 A 的源区仍足够大时，请求覆盖到偏移 `4096`，该字节已在 B 的 MR 之外。改回 `1024 B` 后，若 `rkey_B` 写错或已失效，则范围计算依然成立，但授权检查无法通过。若只保留 B 的 QP 远程写权限，B 的 MR 仍须允许远程写。Verbs 要求开启 MR 的远程写权限时同时开启其本地写权限。 [rdma-core v57.0 的 MR 访问标志](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3) · [Write 字段和 SGE](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_post_send.3)
+数据包真正落盘前，两端 RNIC 会依次把关四道硬门槛：
+
+1. **发起端本地检查**：发起端 RNIC 凭 `lkey_A` 定位源 MR，确认它与当前 QP 同属一个 PD，且 `[src_A, src_A + 1024)` 完整落在源 MR 范围内，然后发起本机 DMA 读。
+2. **远端 PD 与密钥校验**：数据包抵达目标 QP 后，远端 RNIC 校验 `rkey_B` 是否有效且未注销、是否指向同一 PD 下的目标 MR。只要密钥填错或旧 MR 已被注销，即便地址没越界也会当场拒绝。
+3. **远端双权限校验**：远端 RNIC 同时检查目标 QP 和目标 MR 是否均已开启 `IBV_ACCESS_REMOTE_WRITE`；若只开了 QP 权限而漏开 MR 权限，校验同样失败。
+4. **远端偏移边界校验**：远端目标 MR 的合法偏移是左闭右开区间 $[0, 4096)$。本次 Write 起始偏移为 $3072$，写入 $1024\text{ B}$ 时覆盖的字节区间为：
+
+$$
+[3072,\; 3072 + 1024) = [3072,\; 4096) \implies \text{末字节偏移 } 4095 \in [0,\; 4096) \quad (\text{通过})
+$$
+
+如果把写入长度多加 $1\text{ B}$ 变成 $1025\text{ B}$（哪怕发起端源 MR 足够大），目标区间就会伸向偏移 $4096$：
+
+$$
+[3072,\; 3072 + 1025) = [3072,\; 4097) \implies \text{触及越界字节 } 4096 \notin [0,\; 4096) \quad (\text{拒绝})
+$$
 
 ![A 的本地 SGE 引用自己的源 MR，远程目标从 B 的偏移 3072 开始。1024 B 覆盖到 4095，1025 B 还请求访问 MR 之外的 4096。](images/fig-06-02-02-mr-range.png)
 
-**图 06-02-02**　上方的 `4096` 标记区间右边界，下方的 `4096` 格代表第一个越界字节。红格表示请求覆盖的范围。范围判断之前已假定 B 的 QP 与 MR 许可有效且 `rkey_B` 匹配。
+*图 06-02-02：发起端（节点 A）与远端（节点 B）的 Write 地址范围对照。1024 B 恰好落到偏移 4095 通过校验，增至 1025 B 后红格标记的偏移 4096 超出目标 MR 边界。*
 
-## 提交、完成和源缓冲区复用
+## 受理不等于完成：源缓冲区何时能安全复用
 
-| A 观察到的事件 | 对请求 17 的判断 |
+异步硬件队列最容易踩的坑，是把“`ibv_post_send()` 返回成功”当成“数据已经发完”。对非 inline 请求，网卡是稍后才来 DMA 读取源缓冲区的——如果函数一返回应用就覆盖源内存，发出去的就会是新旧混杂的脏数据。
+
+| 发起端观察到的事件 | 对请求 `wr_id=17` 的准确含义 |
 | --- | --- |
-| 单条请求的 `ibv_post_send()` 返回 `0` | 本地投递成功，设备可以随后执行。 |
-| `ibv_poll_cq()` 返回 `0` | 这一轮没有取到记录，继续按该请求的完成设置观察。 |
-| 取到 `wr_id=17, status=IBV_WC_SUCCESS` | 本例的非 inline Write 已成功完成，若没有其他在途请求引用同一段源内存，A 可复用它。B 的应用按约定取得消费信号。 |
-| 取到错误 WC | 从 `wr_id`、`qp_num` 关联原 WR，再读 `status`、`vendor_err`。错误时操作类型、目标和长度从保存的提交记录恢复。 |
+| `ibv_post_send()` 返回 `0` | 请求已成功排入本地 SQ，网卡稍后执行，**此时绝不能覆盖源缓冲区**。 |
+| `ibv_poll_cq()` 返回 `0` | 当前 CQ 里暂无新完成记录，请求仍在途或尚未处理完，需继续等待。 |
+| 取到 `wr_id=17, status=IBV_WC_SUCCESS` | 本次非 inline Write 已成功完成；若无其他在途请求引用同一块内存，**发起端可安全复用源缓冲区**。 |
+| 取到错误状态 WC | 凭 `wr_id` 和 `qp_num` 关联本地保存的原 WR 记录，再读 `status` 与 `vendor_err` 定位根因（出错时 WC 里的长度、操作类型等字段不可信，需从原提交记录还原）。 |
 
-对设备支持的小消息，`IBV_SEND_INLINE` 会在投递时将数据放进发送队列项，调用返回后即可重用原源缓冲区。批量发送还有选择性完成，例如在一条 RC SQ 上的一批普通 Write 中给最后一个请求设置完成标志，按发送队列的完成顺序回收其覆盖的前序请求。应用需要单独处理错误完成和队列状态。 [rdma-core v57.0 的提交与缓冲区生存期](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_post_send.3) · [完成记录的字段约束](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_poll_cq.3) · [perftest 26.07.8 的批量完成计数](https://github.com/linux-rdma/perftest/blob/a31f9ea9df720ee68f941e55f75fec31349fcd35/src/perftest_resources.c)
+> [!tip] 工程直觉：两个高频性能优化技巧
+> - **小消息内联（`IBV_SEND_INLINE`）**：对于几十到几百字节的小控制消息，只要不超过设备内联上限，开启 `IBV_SEND_INLINE` 会在投递时直接把载荷抄进 WQE 本身。这样不仅省去一次网卡 DMA 读，而且 `ibv_post_send()` 一返回即可立即复用原源缓冲区。
+> - **选择性完成通知（Selective Signaling）**：批量发送大量普通 Write 时，不必每条都设 `IBV_SEND_SIGNALED`。在有序的 RC 发送队列上，只需隔一批（例如每 64 或 128 条）给最后一条设置完成标志——当它的成功 WC 到达时，就能一次性回收前面整批请求的源缓冲区（`perftest` 即采用此技巧大幅降低 CQ 轮询开销）。
 
-一次 Write 已能从提交跟到完成。下一步要把 A 与 B 的两个 QP 接起来，并约定 B 何时发布地址、何时获知写入结果。
+至此，一次 RDMA Write 从提交到完成的本机逻辑已经闭环。接下来要补上两块关键拼图：两台机器上各自孤立的 QP 是如何牵手建成 RC 连接的？除了普通 Write，Send、Read 和带立即数的 Write 又各在什么场景下大显身手？
+
+> [!info]- 参考资料
+> - **RDMA 传输模式与内存固定**：[NVIDIA RDMA Aware Networks Programming User Manual v1.7 (Transport Modes)](https://docs.nvidia.com/rdma-aware-networks-programming-user-manual-1-7.pdf)、[Linux Kernel Userspace Verbs (Memory Pinning)](https://docs.kernel.org/infiniband/user_verbs.html#memory-pinning)
+> - **rdma-core v57.0 核心对象与接口手册**：[`ibv_alloc_pd(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_alloc_pd.3)、[`ibv_reg_mr(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_reg_mr.3)、[`ibv_create_qp(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_create_qp.3)、[`ibv_modify_qp(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_modify_qp.3)、[`ibv_create_cq(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_create_cq.3)、[`ibv_post_send(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_post_send.3)、[`ibv_poll_cq(3)`](https://github.com/linux-rdma/rdma-core/blob/v57.0/libibverbs/man/ibv_poll_cq.3)
+> - **批量选择性完成实现参考**：[perftest 26.07.8 `src/perftest_resources.c`](https://github.com/linux-rdma/perftest/blob/a31f9ea9df720ee68f941e55f75fec31349fcd35/src/perftest_resources.c)

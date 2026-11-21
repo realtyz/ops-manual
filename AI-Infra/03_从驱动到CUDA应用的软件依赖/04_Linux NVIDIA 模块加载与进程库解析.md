@@ -1,55 +1,135 @@
+# Linux NVIDIA 模块加载与进程库解析
 
-运行 `probe-sm90` 要同时具备两种运行状态。Linux 已装入 NVIDIA 内核模块，并让它管理目标 GPU。进程也选到了预期的共享库。软件包安装会改变磁盘上的文件，正在运行的内核和新启动的进程各有自己的加载过程。于是同一次更新后，可以出现整机的 GPU 管理查询失败，也可以只有某个启动环境无法使用 GPU。
+昨晚刚用 `apt upgrade` 给服务器打了内核安全补丁或升级了 NVIDIA 驱动，今天一早机器还没重启（或者刚重启完），`nvidia-smi` 就直接甩出一句 `Failed to initialize NVML: Driver/library version mismatch`，甚至干脆整机“丢卡”。更让人头大的是：同一个二进制程序，换个终端窗口跑，竟一边正常、一边报符号找不到。
 
-## 启动内核、磁盘模块与设备绑定
+这些看似玄学的故障，其实全被 Linux 最基础的两套机制管着：**内核态的模块加载与设备绑定**，以及 **用户态 glibc 动态链接器的共享库解析**。只要把“磁盘上有什么”“内核里跑着什么”“进程里载了什么”这三层账分开对，故障立刻水落石出。
 
-内核模块使用 Linux 内核提供的接口。更新内核包会在磁盘上增加可启动的版本，当前运行版本则由本次启动决定，用 `uname -r` 查询。若新启动的内核找不到适用的 NVIDIA 模块，PCIe 仍能枚举出同一张 H100，`nvidia` 驱动却无法接管那条 BDF。 [Ubuntu Server · NVIDIA 驱动模块安装](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#installing-the-kernel-modules) · [Linux kbuild · 外部模块](https://docs.kernel.org/kbuild/modules.html)
+## 启动内核、磁盘模块与 PCIe 设备绑定
 
-在 Ubuntu，适用的模块通常由以下一种方式提供。
+软件包更新改写的是**磁盘上的文件**，而当前真正运行的 Linux 内核版本由本次引导决定（用 `uname -r` 查看）。外部内核模块强依赖对应内核的接口；如果服务器升级并切进了新内核，但新内核对应的模块目录里还没有匹配的 NVIDIA 模块，PCIe 总线虽然照样能枚举出 H100，驱动却无法接管这张卡。
 
-- **预编译模块。** 发行版提供与特定内核 ABI（Application Binary Interface，应用二进制接口）和内核风味匹配的模块包。检查当前内核对应的包，例如 `linux-modules-nvidia-` 后接驱动分支、打包变体及 `uname -r` 对应的内核版本。计算用途的打包变体可能带 `-server` 后缀。
-- **DKMS（Dynamic Kernel Module Support，动态内核模块支持）。** 在目标机器上为指定内核构建和安装模块，需要对应的内核头文件和构建环境。已经为旧内核构建成功时，仍要查新内核的构建与安装状态。
+在 Ubuntu 服务器上，与当前内核匹配的 NVIDIA 模块通常由以下两种方式之一交付：
 
-对当前启动依次读下面的证据。 [Ubuntu Server · 预编译模块与 DKMS](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#installing-the-kernel-modules) · [kmod · modinfo(8)](https://man7.org/linux/man-pages/man8/modinfo.8.html) · [PCI 设备查询 · lspci(8)](https://man7.org/linux/man-pages/man8/lspci.8.html)
+- **预编译模块包**：发行版直接提供绑定特定内核 ABI（应用二进制接口）与内核风味的二进制包，例如 `linux-modules-nvidia-<分支>-server-<内核版本>`（无桌面计算节点常见 `-server` 变体）。一旦内核小版本变更而未同步装入对应预编译包，新内核启动后就会缺失模块。
+- **DKMS（Dynamic Kernel Module Support，动态内核模块支持）**：在目标机器上借助对应内核的头文件与构建环境现场编译安装模块。旧内核构建成功并不代表新内核自动就绪，内核升级后必须核对新内核下的 DKMS 构建状态。
 
-| 要确认的状态 | 可读证据 |
-| --- | --- |
-| 内核实际启动了哪个版本 | `uname -r` 给出当前内核。`journalctl -k -b` 将观察范围限定在本次启动的内核日志。 |
-| 磁盘上有对应的模块 | `modinfo -k "$(uname -r)" nvidia` 查该内核模块树中的文件。读 `filename`、`version`、`vermagic` 和 `signer`，分别查看路径、版本、构建标记和签名者。使用 DKMS 时，另查 `dkms status` 与目标内核的构建日志。 |
-| 当前已装入 NVIDIA 模块 | `lsmod` 检查装入状态，读取 `/proc/driver/nvidia/version` 可确认正在运行的 NVIDIA 模块版本。 |
-| 该卡归 NVIDIA 驱动管理 | `lspci -nnk` 中用 BDF `0000:65:00.0` 对准 H100。该条目显示 `Kernel driver in use: nvidia` 才能确认目标设备的绑定。 |
+即便磁盘模块树里找到了 `nvidia.ko`，Linux 内核在真正接纳它之前还要过两道安检：**模块符号版本校验（Module Versioning）** 确保模块引用的内核符号与当前内核 ABI 一致；若主机开启强制**模块签名验证**（如 Secure Boot 场景），内核还要求模块具备受信任公钥签发的有效签名。
 
-磁盘上找到文件后，内核还要验证能否接纳它。例如内核启用符号版本检查时，模块所需符号与内核对应符号的版本信息必须匹配。强制签名验证时，还需要有效签名和内核信任的签名公钥。在允许装载未签名模块的配置中，日志里的签名告警可以与成功装载同时出现。把 `modinfo` 的字段与本次启动日志、装入状态及 BDF 的绑定情况一起看，才能区分模块文件缺失、被拒绝与装入后未绑定。 [Linux kbuild · Module Versioning](https://docs.kernel.org/kbuild/modules.html#module-versioning) · [Linux 模块签名](https://docs.kernel.org/admin-guide/module-signing.html)
+> [!tip] 工程直觉：不要看到签名告警就草率定案
+> 在允许装载未签名模块的内核配置下，内核日志里出现“模块未签名（taint）”告警可以与模块成功加载同时存在。只有把 `modinfo` 字段、本次启动日志、`lsmod` 装入状态与 `lspci` 绑定结果合起来看，才能精准区分“磁盘缺文件”“模块被内核拒绝”与“模块已加载但未绑定设备”。
 
-## glibc 的共享库搜索顺序
-
-模块和绑定均正常时，同一探针仍可能在不同启动环境中映射到不同的 Runtime 文件。下面是教学打包。假设 `/opt/probe/probe-sm90` 的直接依赖为 `DT_NEEDED=libcudart.so.13`，打包时还设置了 `DT_RUNPATH=$ORIGIN/lib`。`DT_RUNPATH` 是为直接依赖提供的查找目录，`$ORIGIN` 在此展开为可执行文件所在的 `/opt/probe`。这些是本例额外指定的打包属性。 [glibc 动态链接器 · ld.so(8)](https://man7.org/linux/man-pages/man8/ld-linux.8.html) · [NVIDIA 官方镜像 · CUDA 13.2 Runtime 库名](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/nvhpc/26.5-runtime-cuda13.2-ubuntu22.04/layers)
-
-对这个普通 glibc 进程，假设直接依赖名没有斜杠，没有旧式 `DT_RPATH`，且未进入安全执行模式。动态链接器先查 `LD_LIBRARY_PATH`，再查该直接依赖的 `DT_RUNPATH`，之后才查缓存与默认目录。若两处都有可加载的同名文件，可推导出两次启动的第一处匹配。 [glibc 动态链接器 · 共享对象查找顺序](https://man7.org/linux/man-pages/man8/ld-linux.8.html)
-
-| 启动环境 | 按顺序选中的文件 |
-| --- | --- |
-| 未设置 `LD_LIBRARY_PATH` | `/opt/probe/lib/libcudart.so.13` |
-| `LD_LIBRARY_PATH=/opt/old-app/lib` | `/opt/old-app/lib/libcudart.so.13` |
-
-对这个假设已经打包好的探针，可以用下面的命令检查声明和实际路径。`readelf -d` 显示 ELF 记录的 `NEEDED`、`RUNPATH` 或 `RPATH`。`LD_DEBUG=libs,files` 则在启动时记录动态链接器实际走的路径，包括随后按需加载的对象。`trying file` 只表示搜索候选，要结合实际加载记录判断，例如为对象生成映射或调用其初始化函数的记录。真实环境的时序和路径应以跟踪输出为准。 [glibc 动态链接器 · LD_DEBUG](https://man7.org/linux/man-pages/man8/ld-linux.8.html) · [dlopen(3)](https://man7.org/linux/man-pages/man3/dlopen.3.html)
+按下面这四条命令顺次取证，几秒钟就能把当前启动的内核与设备绑定状态摸清：
 
 ```bash
-readelf -d /opt/probe/probe-sm90
-env -u LD_LIBRARY_PATH LD_DEBUG=libs,files /opt/probe/probe-sm90
-env LD_LIBRARY_PATH=/opt/old-app/lib LD_DEBUG=libs,files /opt/probe/probe-sm90
+# 1. 确认本次启动运行的内核版本
+$ uname -r
+6.8.0-51-generic
+
+# 2. 检查当前运行内核的模块树中是否存在匹配文件，重点看 path / version / vermagic / signer
+$ modinfo -k "$(uname -r)" nvidia | grep -E "^(filename|version|vermagic|signer):"
+filename:       /lib/modules/6.8.0-51-generic/updates/dkms/nvidia.ko.zst
+version:        595.91.07
+vermagic:       6.8.0-51-generic SMP preempt mod_unload modversions
+signer:         Ubuntu Secure Boot Module Signature key
+
+# 3. 确认内核内存中“实际正在运行”的模块版本（注意与磁盘 modinfo 对照）
+$ cat /proc/driver/nvidia/version
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.91.07  Release Build
+
+# 4. 确认目标 BDF 已由 nvidia 驱动接管，并用 journalctl -k -b 仅看本次启动内核日志
+$ lspci -nnk -s 0000:65:00.0
+65:00.0 3D controller [0302]: NVIDIA Corporation GH100 [H100 SXM5 80GB] [10de:2330] (rev a1)
+	Kernel driver in use: nvidia
 ```
 
-若库名无法解析，动态链接器会报告打不开所需库。若选中的库缺少应用要求的符号或符号版本，错误可能出现在链接装载或首次使用该符号时。上述查找顺序只覆盖给定条件。依赖名带路径、旧式 `DT_RPATH`、安全执行模式都可能改变查找行为。对于传递依赖，要查声明它的对象，因为主程序的 `DT_RUNPATH` 只用于主程序的直接依赖。 [glibc 动态链接器 · ld.so(8)](https://man7.org/linux/man-pages/man8/ld-linux.8.html)
+把这四个关键检查点收束成一张状态核对表：
 
-## NVML 与运行中内核模块的版本失配
+| 核对环节 | 核心取证命令 | 判断要点 |
+| --- | --- | --- |
+| **当前运行内核** | `uname -r`、`journalctl -k -b` | 锁定本次引导的内核版本，且只看本次启动的内核日志，避免被旧日志误导。 |
+| **磁盘模块准备** | `modinfo -k "$(uname -r)" nvidia`、`dkms status` | 确认 `filename`、`version`、`vermagic` 与 `signer`；DKMS 方案另查对应内核构建日志。 |
+| **内存运行中模块** | `lsmod`、`/proc/driver/nvidia/version` | 确认模块已经装入内核，并读出内存中正在运行的精确版本号。 |
+| **PCIe 设备绑定** | `lspci -nnk -s 0000:65:00.0` | 目标 GPU 条目明确出现 `Kernel driver in use: nvidia`，才算完成设备接管。 |
 
-用户态库加载成功后，库还要能与正在运行的内核驱动交互。Canonical 在 Ubuntu Server 文档中给出了一个独立的公开示例。`nvidia-smi` 在初始化 NVML 时报告 `Driver/library version mismatch`，内核的 `NVRM: API mismatch` 指明用户态客户端为 `570.172.08`、正在运行的内核模块为 `570.158.01`。文档用升级后旧模块仍在运行解释这类现象，公开片段没有列出 GPU、内核版本或采集日期。 [Ubuntu Server · Driver/library version mismatch](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#driver-library-version-mismatch-error)
+## glibc 共享库搜索顺序：为什么换个环境就加载错库
 
-如果只看到失配错误，先取参与运行的两个版本。用 `/proc/driver/nvidia/version` 和本次启动的内核日志确认模块，用同一启动环境下的 `LD_DEBUG=libs,files nvidia-smi` 确认实际加载的 `libnvidia-ml.so.1` 路径，再查该库的实际文件和所属包。加上 `modinfo` 查到的磁盘模块版本，可以检验两个不同的解释。 [Ubuntu Server · NVIDIA 驱动排查](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#troubleshooting) · [glibc 动态链接器 · LD_DEBUG](https://man7.org/linux/man-pages/man8/ld-linux.8.html)
+当宿主机内核模块与设备绑定都稳稳当当时，同一个预编译二进制依然可能因为启动环境里多了一条环境变量，就悄悄载入完全不同的 `libcudart` 或驱动库。
+
+以打包在 `/opt/probe/probe-sm90` 的探针为例：它的直接依赖为 `DT_NEEDED=libcudart.so.13`，同时构建者在 ELF 头里写入了 `DT_RUNPATH=$ORIGIN/lib`（其中 `$ORIGIN` 会由链接器自动展开为可执行文件所在的 `/opt/probe` 目录，指向 `/opt/probe/lib`）。
+
+对于这类普通 glibc 进程（直接依赖名不含斜杠、未使用旧式 `DT_RPATH`、未处于安全执行模式），动态链接器按固定优先级寻找同名共享库：**先查 `LD_LIBRARY_PATH` → 再查该文件的 `DT_RUNPATH` → 最后查 `/etc/ld.so.cache` 与系统默认目录**。
+
+当 `/opt/probe/lib` 与 `/opt/old-app/lib` 里都存在 `libcudart.so.13` 时，不同启动环境的命中结果截然不同：
+
+| 启动环境 | 动态链接器最先命中的共享库 |
+| --- | --- |
+| 未设置 `LD_LIBRARY_PATH` | `/opt/probe/lib/libcudart.so.13`（命中 `DT_RUNPATH`） |
+| 设置 `LD_LIBRARY_PATH=/opt/old-app/lib` | `/opt/old-app/lib/libcudart.so.13`（环境变量抢在 `DT_RUNPATH` 之前） |
+
+排查库解析冲突时，不要靠肉眼猜路径——先用 `readelf -d` 看 ELF 静态声明，再用 `LD_DEBUG=libs,files` 让动态链接器亲口汇报实际搜过哪些目录、最终载入了哪份文件：
+
+```bash
+# 1. 查看 ELF 声明的直接依赖（NEEDED）与内嵌查找路径（RUNPATH / RPATH）
+$ readelf -d /opt/probe/probe-sm90 | grep -E "NEEDED|RUNPATH|RPATH"
+ 0x0000000000000001 (NEEDED)             Shared library: [libcudart.so.13]
+ 0x000000000000001d (RUNPATH)            Library runpath: [$ORIGIN/lib]
+
+# 2. 对比两种启动环境下的真实动态链接过程（节选关键行）
+$ env -u LD_LIBRARY_PATH LD_DEBUG=libs,files /opt/probe/probe-sm90 2>&1 | grep -E "libcudart|calling init"
+     18421:	find library=libcudart.so.13 [0]; searching
+     18421:	 search path=/opt/probe/lib		(RUNPATH from file /opt/probe/probe-sm90)
+     18421:	  trying file=/opt/probe/lib/libcudart.so.13
+     18421:	calling init: /opt/probe/lib/libcudart.so.13     # 确认已真正映射并初始化
+
+$ env LD_LIBRARY_PATH=/opt/old-app/lib LD_DEBUG=libs,files /opt/probe/probe-sm90 2>&1 | grep -E "libcudart|calling init"
+     18509:	find library=libcudart.so.13 [0]; searching
+     18509:	 search path=/opt/old-app/lib		(LD_LIBRARY_PATH)
+     18509:	  trying file=/opt/old-app/lib/libcudart.so.13   # 抢先命中旧目录
+```
+
+> [!warning] 常见误区：读懂 `LD_DEBUG` 与 `DT_RUNPATH` 的三个边界
+> 1. **`trying file=` 不等于加载成功**：它只代表链接器试探了该路径；必须看到后续生成映射或 `calling init:` 记录，才能确认文件已被实际载入。
+> 2. **`DT_RUNPATH` 只管直接依赖**：主程序的 `DT_RUNPATH` 不会自动传递给子依赖；如果某条传递依赖找错库，必须用 `readelf -d` 查声明它的那个 `.so`。
+> 3. **特例会改写搜索次序**：依赖名自带路径、旧式 `DT_RPATH`（优先级高于 `LD_LIBRARY_PATH`）以及 setuid 等安全执行模式（会忽略 `LD_LIBRARY_PATH`），都会改变上述顺序。若库名找不到，进程在启动前即报无法打开共享对象；若选中的同名库缺少所需符号或符号版本，则可能在装载期或首次调用该符号时报错。
+
+## 同样的 NVML 版本失配，两处截然不同的根因
+
+用户态共享库顺利加载后，还必须能和当前内核里正在运行的驱动模块对齐协议版本。Canonical 官方 Ubuntu Server 驱动文档中记录了一个在生产环境几乎人人遇过的经典报错：
+
+```text
+# 终端执行 nvidia-smi 的报错
+Failed to initialize NVML: Driver/library version mismatch
+
+# 同一时间内核日志（dmesg / journalctl -k -b）给出的精确两端版本
+NVRM: API mismatch: the client has the version 570.172.08, but
+NVRM: this kernel module has the version 570.158.01.  Please
+NVRM: make sure that this kernel module and all NVIDIA driver
+NVRM: components have the same version.
+```
+
+多数人看到这条报错，第一反应就是“赶紧重启机器”。重启动作在升级未重载内核模块时确实有效，但**如果你只看到两端版本号不同，其实并不足以断定一定是“没重启”**！
+
+把**磁盘模块版本**、**运行中内核模块版本**和**进程实际加载的 `libnvidia-ml.so.1` 来源**三者摆到一起，同一条失配报错立刻分出两种截然不同的根因：
+
+- **根因一（左列 B / A / B：升级后旧模块仍在运行）**：系统升级把磁盘上的 `nvidia.ko` 和系统库目录里的 NVML 都更新成了新版 `B`（如 `570.172.08`），但内核内存里还没卸载重载，跑的仍是旧版 `A`（如 `570.158.01`）。新启动的 `nvidia-smi` 加载了新版库去敲旧版内核的门，立刻触发失配。
+- **根因二（右列 B / B / A：进程从额外目录加载了旧库）**：磁盘模块和内核运行中模块早就一致升级成了新版 `B`，但当前 Shell 或容器通过 `LD_LIBRARY_PATH` 等配置，把 `nvidia-smi` 引去了某个遗留目录，加载了旧版 NVML `A`。此时哪怕重启十次服务器，只要环境变量不改，报错依然纹丝不动！
 
 ![两种 NVML 版本失配。磁盘模块、运行中模块、进程加载的 NVML 在左列依次为 B、A、B，右列依次为 B、B、A。两列的红色括线都连接运行中模块与进程加载的 NVML。](images/fig-03-04-01-nvml-module-mismatch.png)
 
-**图 03-04-01**　A 表示旧版，B 表示新版。左列的磁盘模块和系统目录 NVML 已更新，已加载模块还是 A，故障与更新时序有关。右列内核已运行 B，进程从额外目录选中了 A，故障与库解析有关。图中的 A/B 是两种状态示意，Canonical 示例只给出了参与交互的两个版本。
+*图 03-04-01：同一 NVML 版本失配报错的两种根因对比（A 表示旧版，B 表示新版）。左列为驱动更新后旧内核模块仍在运行，右列为内核已是新版但进程从额外目录加载了旧库。*
 
-复核要回到发生故障的同一查询。先确认实际加载的 NVML 与运行中的模块能配合，再运行原来的管理请求。若还要确认应用可以计算，用原交付件继续检查 CUDA 枚举、Kernel 完成与结果。这两项复核分别覆盖管理支路和计算支路。
+因此，现场遇到版本失配时，标准动作是同步采集三条证据：
+
+- **查内存运行中模块**：读取 `/proc/driver/nvidia/version` 并对照 `journalctl -k -b`；
+- **查磁盘模块文件**：执行 `modinfo -k "$(uname -r)" nvidia` 核对磁盘上的版本；
+- **查进程实际加载的库**：在**报错的同一个启动环境**下跑 `LD_DEBUG=libs,files nvidia-smi`，查出命中的 `libnvidia-ml.so.1` 路径及所属包。
+
+> [!summary] 核心结论：修复后的双支路复核
+> 解决模块重载或库路径问题后，务必回到原报错环境先复测管理命令（验证 NVML 管理支路恢复），再运行实际 CUDA 交付件完成设备枚举、Kernel 同步与结果校验（验证计算支路恢复）。两条支路都通过，才算真正闭环。
+
+现在，构建交付、进程启动、版本兼容、内核模块与动态库解析五块拼图已全部集齐。在收官篇中，我们将把这些散落的取证方法组装成一份完整的交付基线，用五道真实感故障记录检验你的分层定位能力。
+
+> [!info]- 参考资料
+> - **Ubuntu NVIDIA 驱动与排障文档**：[Ubuntu Server · 安装 NVIDIA 驱动总览](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/)、[预编译模块与 DKMS 安装](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#installing-the-kernel-modules)、[Driver/library version mismatch 示例](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#driver-library-version-mismatch-error)、[NVIDIA 驱动故障排查指南](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/#troubleshooting)
+> - **Linux 内核模块、ABI 与签名**：[Linux kbuild · 外部内核模块](https://docs.kernel.org/kbuild/modules.html)、[Linux kbuild · Module Versioning](https://docs.kernel.org/kbuild/modules.html#module-versioning)、[Linux 内核模块签名文档](https://docs.kernel.org/admin-guide/module-signing.html)
+> - **系统工具与动态链接器**：[modinfo(8) 手册](https://man7.org/linux/man-pages/man8/modinfo.8.html)、[lspci(8) 手册](https://man7.org/linux/man-pages/man8/lspci.8.html)、[glibc ld.so(8) 手册](https://man7.org/linux/man-pages/man8/ld-linux.8.html)、[dlopen(3) 手册](https://man7.org/linux/man-pages/man3/dlopen.3.html)、[NVIDIA NGC 镜像 CUDA 13.2 Runtime 库名参考](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/nvhpc/26.5-runtime-cuda13.2-ubuntu22.04/layers)

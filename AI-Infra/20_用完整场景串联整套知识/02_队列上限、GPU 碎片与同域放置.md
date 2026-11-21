@@ -1,56 +1,106 @@
 # 队列上限、GPU 碎片与同域放置
 
-08:45，`J20` 已有作业对象。全表还有 34 个整卡资源单位，三只 worker 一共请求 12 张，调度却没有开始。要解释等待，先看 `train` 队列是否能接纳三份请求，再看有没有三台同时满足条件的节点。本例要求 A 域内的不同 H100 80 GB 主机，每台至少能交付 4 张整卡、16 CPU、96 GiB 主机内存和 1 个 RDMA VF。
+早高峰 `08:45`，主训练作业刚刚提交入库。打开集群监控总览，6 台服务器账面上足足空着 **34 张整卡**；到了 `08:50`，空卡总数甚至涨到了 **38 张**（仅 A 域 H100 就空着 26 张）。可一份只需要 12 张卡的训练作业，却纹丝不动地僵在等待状态。
 
-## 用 PodGroup 的最低请求复算入队
+这正是训推共存生产集群里最常引发业务方投诉的“幽灵排队”现象。只看全局空闲卡数，永远看不出真相——我们必须把排查拆成先后两关：**队列账本能不能收单**，以及**早高峰在线推理占位之后，A 域到底还剩几台完整落点**。
 
-`train` 的 GPU 有效上限为 16，作业的 PodGroup 最低请求包含 12 GPU、48 CPU、288 GiB 和 3 VF。这个平级队列处于开放状态，其他资源维度充足，没有专属保留。在本例的快照里，没有需另计的在途用量或弹性扣减。Volcano v1.16.0 的 `capacity` 对各资源维度做入队检查，本例 GPU 项可以写成 `已分配 + 本组最低请求 ≤ 16`。实地读取队列状态时，还应查在途组和调度器会话的有效上限。 [Volcano v1.16.0 · Queue 字段](https://volcano.sh/docs/v1.16.0/concepts/queue/) · [v1.16.0 · capacity 入队检查](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/capacity/capacity.go#L1621-L1667)
+## 第一关：队列配额先把 Pod 拦在门外（08:45 → 08:50）
 
-| 时间 | 当时的队列和组 | 判断 |
+集群通过独立的平级队列隔离两类负载：在线推理池使用高优先级 `infer` 队列，训练池使用 `train` 队列。`train` 队列当前开放且无专属预留，其 GPU 有效上限为 16（CPU、内存与 VF 维度均充裕，无在途弹性扣减）。
+
+Volcano `v1.16.0` 的 `capacity` 插件会在创建 Pod 前，用 `PodGroup` 的整组最低请求（12 GPU、48 CPU、288 GiB、3 VF）核对队列上限。本例的 GPU 入队判据非常直白：
+
+$$
+G_{\text{allocated}} + G_{\text{minReq}} \le G_{\text{cap}} = 16
+$$
+
+按这条公式顺着时间轴核对 `train` 队列的账本变化，前 5 分钟的卡顿立刻水落石出：
+
+| 时刻 | `train` 队列现有占用 | 队列核算结果 | 作业与 `PodGroup` 状态 |
+| --- | --- | --- | --- |
+| **08:45** | 2 个旧训练 Pod（分占 `node-1` 与 `node-5`，各 4 GPU） | $8 + 12 = 20 > 16$（超限） | `PodGroup` 停在 `Pending`，**0 个 worker Pod 被创建** |
+| **08:50** | `node-1` 旧训练 Pod 退出归账，仅剩 `node-5` 占 4 GPU | $4 + 12 = 16 \le 16$（通过） | `PodGroup` 转为 `Inqueue`，控制器建出 3 个未绑定 Pod |
+| **09:00** | 节点成组放置满足，3 个 Pod 一次性绑定 | 收敛后队列用量 $4 + 12 = 16$ | `PodGroup` 转 `Running`，队列 GPU 配额恰好打满 |
+
+在终端排查时，只需连续观察 `Queue` 与 `PodGroup` 状态，就能瞬间区分作业到底是“被队列拦住”还是“正在找节点”：
+
+```text
+# 08:45：队列超限，PodGroup 停在 Pending，集群里连 worker Pod 都没有
+$ kubectl get podgroup -n ai-demo
+NAME             STATUS    MINMEMBER   RUNNING   PENDING
+train-12-pg      Pending   3           0         0       # 未过 enqueue，不创建 Pod
+
+# 08:50：node-1 旧任务退场释放 4 卡，PodGroup 进入 Inqueue，建出 3 个待绑定 Pod
+$ kubectl get pod -n ai-demo -l volcano.sh/job-name=train-12 -o wide
+NAME                READY   STATUS    NODE
+train-12-worker-0   0/1     Pending   <none>             # spec.nodeName 为空，转入成组放置
+train-12-worker-1   0/1     Pending   <none>
+train-12-worker-2   0/1     Pending   <none>
+```
+
+> [!tip] 工程直觉：用两眼分清“卡队列”和“卡节点”
+> 看到 `PodGroup` 为 `Pending` 且旗下还没有任何 worker Pod，说明卡在 **Queue 准入**，此时去查节点空卡纯属白忙；一旦 `PodGroup` 变为 `Inqueue` 且 3 个 Pod 已经建出来却没有 `NODE`，排查重心就应立刻切到**逐节点多维余量与成组放置**。
+
+## 第二关：在线推理占位、VF 耗尽与同域碎片（08:50）
+
+`08:50` 队列放行后，为什么 3 个 worker Pod 还是原地等了整整 10 分钟？翻开这一刻全集群 6 台节点的**调度余量**（`Allocatable` 扣除已调度承诺请求，注意监控里空转的卡只要已被分配就不算余量），早高峰训推共存的真实博弈立刻浮现出来：
+
+| 节点 | 网络域 | 整卡池规格 | GPU 余量 | CPU 余量 | 内存余量（GiB） | VF 余量 | 同机现有占用（为什么剩这些余量） | 本作业可落点数 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| `node-1` | A | H100 80 GB | 8 | 32 | 192 | 2 | 旧训练刚归账，整机空闲 | **1** |
+| `node-2` | A | H100 80 GB | 8 | 32 | 192 | 2 | 整机空闲 | **1** |
+| `node-3` | A | H100 80 GB | 2 | 24 | 168 | 1 | 常驻 4 卡在线推理 `infer-llm`（占 1 VF）+ 2 卡早间离线批量推理（0 VF） | **0** |
+| `node-4` | A | H100 80 GB | 8 | 24 | 160 | 0 | RoCE 链路巡检/压测 Pod（0 GPU，占满 2 VF） | **0** |
+| `node-5` | B | H100 80 GB | 4 | 16 | 96 | 1 | `train` 队列另一 B 域 4 卡训练 Pod | **0** |
+| `node-a1` | B | A100 40 GB | 8 | 32 | 192 | 2 | B 域常规/量化推理缓冲池 | **0** |
+
+调度器不会拿“总空卡 38 张”做算术，而是按固定顺序对每台主机过一遍筛子：
+
+**第一步，先卡死硬件规格与网络域硬标签。** 模板通过 `nodeSelector` 锁定 H100 80 GB 与 A 域。B 域的 A100 节点单卡显存只有 40 GB，哪怕空着 8 张卡也装不下单卡需要 80 GB 显存的训练进程；B 域的另一台 H100 节点虽然四维资源样样达标，但跨出已验收的 A 域，直接出局。
+
+**第二步，逐台计算“木桶最短板”落点数。** 对每台通过初筛的 A 域主机，把四项资源余量分别除以单个 worker 的请求量向下取整，再叠加“每机至多放 1 个同组 worker”的硬性反亲和封顶：
+
+$$
+N_{\text{slot}}(i) = \min\!\left(1,\; \left\lfloor\frac{\text{GPU}_i}{4}\right\rfloor,\; \left\lfloor\frac{\text{CPU}_i}{16}\right\rfloor,\; \left\lfloor\frac{\text{Mem}_i}{96}\right\rfloor,\; \left\lfloor\frac{\text{VF}_i}{1}\right\rfloor\right)
+$$
+
+代入 A 域四台主机的真实余量，四个截然不同的工程约束同时现形：
+
+- **两台满血空闲主机（`node-1`、`node-2`）**：四项余量原本足够塞下 2 个 worker，但主机反亲和把每台上限封死在 **1**，两台合计贡献 2 个落点。
+- **被在线推理切碎的混部主机（`node-3`）**：早高峰常驻的 4 卡在线推理副本绝不能随意驱逐，再加上 1 个 2 卡离线批量推理任务，使得 GPU 余量缩到 2 张，$\lfloor 2 / 4 \rfloor = 0$——典型的**训推混部 GPU 碎片**。
+- **满机空卡却无网可接的主机（`node-4`）**：8 张 H100 全空，但 RoCE 巡检 Pod 占满了全部 2 个 VF，$\lfloor 0 / 1 \rfloor = 0$。同一 Pod 的设备必须在同一主机完成本地交付，**绝不可能从这台借 4 张 GPU、再去隔壁借 1 个 VF**。
+
+结果非常残酷：全集群空着 38 张卡、A 域 H100 空着 26 张卡，完整合格的 A 域落点却只有 **2 个**。Volcano `allocate` 虽能试选两台空闲主机，但过不了 `gang` 的 3 节点门槛，于是果断放弃部分绑定，避免 8 张 H100 陷入“占卡死等第 3 个成员”的僵局。
+
+> [!tip] 训推双重视角：同一张 08:50 快照，在线推理扩容为何畅通无阻？
+> 假如同一时刻早高峰流量突增，需要立刻为 `infer-llm` 扩出 1 个 4 卡在线推理副本，它完全不会被卡住：第一，它走独立的 `infer` 队列，不受 `train` 队列 16 卡上限牵制；
+>
+> 第二，推理副本彼此独立，不需要 Gang 等齐三台；第三，推理服务追求跨节点容灾而非锁定 A 域，直接落到 B 域的 `node-5`（余 4 GPU / 16 CPU / 96 GiB / 1 VF）即可预热接客。
+
+## 精准释放破局与三种单变量对照（08:56 → 09:00）
+
+转机出现在 `08:56`：混部主机上那个不占 VF 的 2 卡离线批量推理任务正常完工归账，净释放 `2 GPU / 4 CPU / 8 GiB`，而同机常驻的 4 卡在线推理服务丝毫不受影响。
+
+该节点的调度余量随即补齐为 `4 GPU / 28 CPU / 176 GiB / 1 VF`，GPU 短板消失，A 域一举凑出第 3 个完整落点。`09:00`，调度器一次性完成三台合格主机的成组绑定（见下图）。
+
+![A 域四台节点在 08:50 与 08:56 的余量对比：h1 与 h2 两次均各有 8 GPU 和 2 VF 可供 1 个落点；h3 从 08:50 的 2 GPU 1 VF 缺 GPU 变为 08:56 的 4 GPU 1 VF 凑出第 3 个落点；h4 两次均有 8 GPU 和 0 VF 缺 VF。](images/fig-20-02-01-gang-placement-resource-fit.png)
+
+*图 20-02-01：`08:50` 与 `08:56` 的 A 域节点余量与合格落点对照（图中 `h1`–`h4` 对应 `node-1`–`node-4`，CPU 与内存充足）。`08:56` `node-3` 归还 2 卡凑齐第 3 个落点，`node-4` 仍缺 VF；绑定于 `09:00` 落实。*
+
+为了检验自己是否真正吃透“为什么同样释放资源，位置不同结果天差地别”，不妨回到 `08:50` 快照（此时 `train` 队列额度已过关），分别独立改动下面三项条件：
+
+| 仅改变这一项条件 | 整组能否成组放置 | 背后的机制判据 |
 | --- | --- | --- |
-| 08:45 | `train` 有两个旧 Pod，分别在 `h1` 与 `h5`，各计入 4 GPU。 | `8 + 12 = 20`，超过 16。组保持 `Pending`，按主例配置还没有 worker 可供调度。 |
-| 08:50 | `h1` 的旧 Pod 已退出并归账，`h5` 的用量仍为 4 GPU。 | `4 + 12 = 16`。组进入 `Inqueue`，随后生成三个 worker，它们的 `spec.nodeName` 仍为空。 |
-| 09:00 | 节点余量也已满足，调度器提交三个绑定。 | 收敛后 `train` 的 GPU 用量为 `4 + 12 = 16`。 |
+| **在 B 域节点（`node-5`）多释放 2 张 GPU** | **仍等待** | B 域不满足硬性同域选择，A 域合格落点依然只有 2 个。 |
+| **节点 `node-4` 的巡检释放 1 个 VF**（CPU/内存仍够） | **立刻放行** | 全集群空闲 GPU 总数 1 张未增，但 `node-4` 的短板打通，A 域立刻凑齐第 3 个落点。 |
+| **只把 Volcano `minAvailable` 降为 2** | **绑定 2 个后死锁** | 调度器放行了 2 个 Pod，但固定规模启动器仍死等第 3 个 Agent，8 张 H100 白白空转；除非应用同步支持弹性缩容重启。 |
 
-入队表回答的是队列能否接下这一组请求。处于 `Inqueue` 的三只 Pod 还要竞争具体落点。读现场时按作业和 PodGroup 的 UID 对齐 Queue 用量、组条件和成员状态。组已入队且成员未绑定时，下一项证据是该轮调度的节点筛选结果。 [Volcano v1.16.0 · Enqueue 与 Allocate](https://volcano.sh/docs/v1.16.0/scheduler/actions/) · [v1.16.0 · 成员创建条件](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L400-L414)
+> [!warning] 常见误区：调度绑定成功 ≠ 本地一定交付成功
+> `09:00` 拿到三台节点的绑定结果，只是集群级账本结算完毕。如果节点 `node-3` 在绑定后的瞬间恰好丢失 VF 健康状态，或者附加网络 IPAM 地址池耗尽，Pod 仍会停在容器创建阶段——届时要顺着第 01 篇的 kubelet 设备管理器与 Multus/CNI 日志往下查。
 
-## 用型号、同域和逐节点余量找落点
+本例三台主机的本地交付全部顺畅通过，`09:03` 顺利迈出第 1 个训练步。可稳态跑了不到半小时，监控曲线突然掉头向下——下一篇，我们直奔现场拆解那次诡异的训练步退化。
 
-以下 08:50 快照是节点可用于新请求的**调度余量**，即该资源的 `Allocatable` 扣除已被调度器计入的请求。监控里计算活动为零的卡仍可能已分配。现场还需注意调度缓存可能计入绑定中的请求。
-
-| 节点 | 域 | 池内整卡规格 | GPU 余量 | CPU 余量 | 主机内存余量（GiB） | VF 余量 | 本工单可放 worker |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `h1` | A | H100 80 GB | 8 | 32 | 192 | 2 | 1 |
-| `h2` | A | H100 80 GB | 8 | 32 | 192 | 2 | 1 |
-| `h3` | A | H100 80 GB | 2 | 24 | 168 | 1 | 0 |
-| `h4` | A | H100 80 GB | 8 | 24 | 160 | 0 | 0 |
-| `h5` | B | H100 80 GB | 4 | 16 | 96 | 1 | 0 |
-| `a1` | B | A100 40 GB | 8 | 32 | 192 | 2 | 0 |
-
-先应用型号与域的硬条件。主例的 GPU 池按节点保持同质，模板用 `nodeSelector` 选择 H100 整卡和 A 域，并用基于 `kubernetes.io/hostname` 的硬性 Pod 反亲和将同组的 worker 分开。这个同域限制来自模板明确选择 A 域。读到同一个 `nvidia.com/gpu` 键时，还要核对实际资源策略。如果池内混用整卡、共享名额或不同显存规格，应先查资源名、标签与具体设备的对应关系。`a1` 的 40 GB 卡不满足单卡规格。加总更多 40 GB 卡也无法让一个使用单卡的进程得到所需显存。`h5` 的资源向量足够，但在 B 域。 [Kubernetes v1.36 · 节点选择和反亲和](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/) · [NVIDIA Device Plugin v0.20.1 · GPU 共享](https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.20.1/README.md)
-
-再判断合格节点能否提供一整份资源。给四种资源分别做整数除法，再取最小值，表示被最紧的一项限制的副本数。在本例，主机反亲和又把每台的结果封顶在 1。
-
-- `h1/h2` 资源各够两份，反亲和使它们各贡献一个落点。
-- `h3` 的 GPU 商为 `⌊2 ÷ 4⌋ = 0`，该节点无法提供一份四卡请求。
-- `h4` 的两个 VF 被网络测试 Pod 使用。即使仍有 8 张 GPU，VF 的商为 `⌊0 ÷ 1⌋ = 0`。把 GPU 放在 `h4`、把 VF 放在 `h3` 无法满足同一 Pod 的本地交付。
-
-08:50 全表余量合计 `38`，A 域 H100 余量合计 `26`，A 域完整落点只有 `2`。本例没有已绑定的同组成员，也没有允许依赖即将释放资源的候选。`allocate` 即使暂选 `h1` 和 `h2`，该轮也凑不齐 `gang` 所需的三个成员。现场可从队列已经放行、成员已经创建但 `nodeName` 为空，结合组和节点筛选记录，定位在成组放置。 [Volcano v1.16.0 · 分配提交](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/actions/allocate/allocate.go) · [v1.16.0 · Gang 组和任务门槛](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/gang/gang.go#L175-L196)
-
-## 释放哪一份资源会改变本轮结果
-
-08:56，`h3` 的一只批处理 Pod 结束并归账，净释放 2 GPU、4 CPU 和 8 GiB 主机内存，它原先未请求 VF。`h3` 的余量变成 `4 GPU / 28 CPU / 176 GiB / 1 VF`，因此新增一个落点。09:00 成组放置到 `h1/h2/h3`。这里的第三个落点来自释放在正确的节点，且该节点其余条件已满足。
-
-![A 域的 h1、h2 在两次快照中各提供一个候选。h3 从 08:50 的两张 GPU 增至 08:56 的四张，新增一个候选。h4 两次均有八张 GPU 和零个空余 VF。](images/fig-20-02-01-gang-placement-resource-fit.png)
-
-*图 20-02-01｜数字是调度余量，两次快照的 CPU 和主机内存均满足请求。08:56，`h3` 归还 2 GPU 后凑出第三个合格落点，`h4` 仍缺 VF。空心方框表示候选，实际绑定在 09:00 发生。*
-
-在 08:50 快照上，下面三种改动各自独立，队列额度仍满足。
-
-| 只改变这一项 | 本组能否成组放置 | 推理 |
-| --- | --- | --- |
-| 在 `h5` 释放 2 GPU | 仍等待 | A 域的落点还是 `h1/h2`。 |
-| `h4` 的网络测试释放 1 VF，CPU 与内存继续满足 | 可放 | `h4` 给出第三个 A 域落点，卡数总和无需增加。 |
-| 只把调度器的组门槛降低 | 固定规模应用仍需要三个成员 | 即使配置允许两只先绑定，两个 Agent 会等第三个。应用需要支持改变规模和恢复分工，才能在两机运行。 |
-
-放置通过后，再由 kubelet 以本地健康和已有分配状态交付具体 GPU 与 VF。若 `h3` 在绑定之后丢失 VF 或未能取得附加网络地址，应从节点交付与 CNI 的证据入手。主例的三只 Pod 随后完成首步，观察目标随之转到持续运行中每一步的进展。 [Kubernetes v1.36 · Device Plugin 与设备健康](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices) · [PyTorch 2.9 · 固定规模与弹性规模](https://docs.pytorch.org/docs/2.9/elastic/run.html)
+> [!info]- 参考资料
+> - **Volcano 队列准入与成组放置**：[Volcano v1.16.0 Queue 概念](https://volcano.sh/docs/v1.16.0/concepts/queue/)、[Volcano v1.16.0 Enqueue 与 Allocate](https://volcano.sh/docs/v1.16.0/scheduler/actions/)、[Volcano v1.16.0 capacity 入队检查源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/capacity/capacity.go#L1621-L1667)、[Volcano v1.16.0 成员创建条件源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/controllers/job/job_controller_actions.go#L400-L414)、[Volcano v1.16.0 allocate 分配提交源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/actions/allocate/allocate.go)、[Volcano v1.16.0 gang 门槛源码](https://github.com/volcano-sh/volcano/blob/v1.16.0/pkg/scheduler/plugins/gang/gang.go#L175-L196)
+> - **Kubernetes 节点选择、反亲和与设备健康**：[Kubernetes v1.36 Assign Pods to Nodes](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)、[Kubernetes v1.36 Device Plugin 不健康设备处理](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices)、[NVIDIA Device Plugin v0.20.1 共享与资源名说明](https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.20.1/README.md)
+> - **PyTorch 固定与弹性规模语义**：[PyTorch 2.9 torchrun 弹性启动说明](https://docs.pytorch.org/docs/2.9/elastic/run.html)

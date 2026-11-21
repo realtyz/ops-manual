@@ -1,70 +1,126 @@
+# Pod 高速网络交付的综合检验
 
-两台教学节点各有两张 H100 PCIe、两张 ConnectX-7 和一个承载默认网络的普通网口。高速端口接到同一 RoCE VLAN。两台节点都使用 `nvidia.com/sriov_resource`，每次成功附加 `default/roce-vf` 消耗一个 VF 和一个 IP。以下是构造的配置与观测，四个材料可以独立作答，无需实验集群。
+学完双网络分工、Multus 委派、SR-IOV 分配、IPAM 与 MTU、共享/独占隔离、NUMA/PCIe 对齐、双轮 GDR 验证及策略边界后，我们用四组综合现场材料来检验全章掌握程度。四组材料相互独立，无需实验集群即可推理作答，建议先写下判断再展开参考推理核对。
 
-## 材料一　资源请求、设备分配与地址池
+## 基础集群与参考环境
 
-两台节点都发布 8 个健康 VF，且已有一个已绑定工作负载各占用 1 个。此时先考虑一个只申请 8 个 VF 的 Pod，它没有其他放置限制。随后换成单容器 `default/rank-1`，只申请一个 VF 和一张 GPU。假定 GPU 和其他放置条件满足，该 Pod 绑定到 `gpu-h1`，首次接入留下以下记录。
+集群包含两台 GPU 节点 `gpu-h0` 与 `gpu-h1`。每台配备两张 H100 PCIe、两张 ConnectX-7 高速网卡（PF 为 `ens2f0` / `ens3f0`，同接一个 RoCE VLAN）与一个普通网口。
 
-| 层次 | 教学记录 |
+两台节点统一发布资源键 `nvidia.com/sriov_resource`，每次成功附加 `default/roce-vf` 消耗 1 个 VF 与 1 个 IP。
+
+---
+
+## 材料一：资源请求、设备分配与地址池
+
+两台节点各自上报 8 个健康 VF，每台已有 1 个已绑定工作负载占用 1 个 VF。先评估一个仅申请 **8 个 VF**、无其他约束的 Pod；随后改看单容器 `default/rank-1`（申请 1 个 VF 与 1 张 GPU，绑定到 `gpu-h1`）首次接入留下的记录：
+
+| 观测层次 | `default/rank-1` 首次接入现场记录 |
 | --- | --- |
-| 存入 API 的 Pod | 网络选择是 `[{"name":"roce-vf","interface":"net1"}]`，工作容器申请 `nvidia.com/sriov_resource: 1`。 |
-| `default/roce-vf` 的 NAD | 资源注解为 `nvidia.com/sriov_resource`，使用 `sriov` 插件和 `nv-ipam`，池名 `roce-pool`。 |
-| `gpu-h1` 的 kubelet 分配 | PodResources 中 `resource_name=nvidia.com/sriov_resource`，`device_ids=["0000:41:00.2"]`，主机 `physfn` 指向 `ens2f0` 所属 PF。 |
-| `gpu-h1` 的地址账目 | 该节点的地址块含 16 个地址。15 个已按站点规则保留，另一个已租给该节点上原有的工作负载。 |
-| 该 Pod 的首次 sandbox 调用 | Multus 传给 SR-IOV CNI 的 `deviceID=0000:41:00.2`。事件为 `FailedCreatePodSandBox`，内层消息指出本节点的 `roce-pool` 地址耗尽。 |
+| **API 中的 Pod 声明** | 网络选择为 `[{"name":"roce-vf","interface":"net1"}]`，容器申请 `nvidia.com/sriov_resource: 1` |
+| **`default/roce-vf` NAD** | 资源注解为 `nvidia.com/sriov_resource`，插件为 `sriov` + `nv-ipam`（池名 `roce-pool`） |
+| **`gpu-h1` kubelet 分配** | PodResources 显示 `resource_name=nvidia.com/sriov_resource`、`device_ids=["0000:41:00.2"]`，`physfn` 指向 `ens2f0` |
+| **`gpu-h1` 地址账目** | 本节点地址块共含 16 个地址；其中 15 个按站点规则保留，另 1 个已租给节点上原有工作负载 |
+| **首次 sandbox 调用** | Multus 传给 SR-IOV CNI 的 `deviceID=0000:41:00.2`；事件报 `FailedCreatePodSandBox`，内层提示本节点 `roce-pool` 地址耗尽 |
 
-1. 计算考虑 8 VF Pod 时两台节点分别有多少调度余量。这个 Pod 能放在哪里？
-2. 对 `rank-1`，解释 Pod 中的网络名、NAD 中的资源键和 VF BDF 怎样连到一起。复算 IP 余量，定位首次接入失败，并说明下一项需要检查什么。
-3. 如果另一次接入中 NAD 的资源注解改成 `nvidia.com/sriov-other`，而 PodResources 仍只有原来的条目，推断交接会在哪里中断。
+**任务 1**：
+1. 计算评估 8 VF Pod 时两台节点的调度余量，判断它能否被调度。
+2. 对 `rank-1`，串联 Pod 网络名、NAD 资源键与 VF BDF 的交接关系；复算 IP 余量、定位首次失败层级，并指出下一项核查动作。
+3. 若另一次接入中 NAD 资源注解误写成 `nvidia.com/sriov-other`，而 PodResources 仍为原条目，推断故障会前移到哪一步。
 
-## 材料二　地址、路由和两轮传输
+## 材料二：地址、路由与两轮 RDMA 传输
 
-假设地址问题已经解决。两端都完成了接入，`rank-0` 的 `eth0/net1` 地址为 `10.244.0.10` 和 `192.168.50.11/24`，`rank-1` 为 `10.244.1.10` 和 `192.168.50.21/24`。在 `rank-1`，有效路由到 `10.244.0.10` 走 `eth0`，到 `192.168.50.11` 走 `net1`。两端用 `rdma link show` 确认各自的 VF RDMA 端口与 `net1` 关联。给出三次独立试验。
+假设地址问题已解决，双端完成接入：`rank-0` 的 `eth0 / net1` 为 `10.244.0.10` 与 `192.168.50.11/24`；`rank-1` 为 `10.244.1.10` 与 `192.168.50.21/24`。
 
-| 试验 | 教学记录 |
+在 `rank-1` 上，到 `10.244.0.10` 路由走 `eth0`，到 `192.168.50.11` 走 `net1`。两端均已用 `rdma link show` 确认 VF RDMA 端口与 `net1` 绑定。以下是三组独立试验结果：
+
+| 试验项目 | 现场观察结果 |
 | --- | --- |
-| TCP | 分别向 `10.244.0.10` 和 `192.168.50.11` 建立 TCP 连接。 |
-| 主机内存 RDMA | 从 `rank-1` 向 `rank-0` 使用 `.11` 和两端已核对的 VF RDMA 端口。`ib_write_bw` 完成，退出状态为 0。 |
-| GPU 显存 RDMA | 保持同一方向、端口、消息大小和 perftest 构建。两端均启用 CUDA DMA-BUF。客户端创建 CUDA 缓冲区成功，随后报 RDMA 导入或注册失败。 |
+| **TCP 对照** | 从 `rank-1` 分别向 `10.244.0.10` 与 `192.168.50.11` 建立 TCP 连接 |
+| **主机内存 RDMA** | 从 `rank-1` 向 `rank-0`（`192.168.50.11`）使用核对好的 VF RDMA 端口跑 `ib_write_bw`，退出码 `0` |
+| **GPU 显存 RDMA** | 保持同方向、同端口、同消息大小与同构建，两端启用 CUDA DMA-BUF；客户端创建 CUDA 显存成功，随后报 RDMA 导入/注册失败 |
 
-1. 逐项说出两条 TCP 连接经过的接口。说明主机内存 RDMA 试验确认了哪条路径，以及显存轮最先该查哪一端的哪些条件。
-2. 另设一份 MTU 变体。双端接口仍配置 1500 B，但已确认路径的 IPv4 MTU 为 1400 B，IPv4 首部无选项、回程与策略允许同样大小的报文。计算不分片的 ICMP Echo 数据上限，并解释这一上限和 RDMA 试验各说明什么。
+**任务 2**：
+1. 分别指出两条 TCP 连接的出口接口与传输协议；说明主机内存 RDMA 验证了哪条路径，以及显存轮最先该查哪一端的哪些条件。
+2. 设某 MTU 变体中双端接口仍配 `1500 B`，但整条路径实际 IPv4 MTU 仅 `1400 B`（IPv4 无选项、回程与策略放行）。计算无分片 ICMP Echo 载荷上限，并说明该探测与 RDMA 试验各自的证明范围。
 
-## 材料三　共享、可见性与节点内拓扑
+## 材料三：共享隔离选型与节点内 NUMA 拓扑
 
-同一机房提出两种接入要求。甲允许两个 Pod 共用一张 HCA，只要求各自有附加 IP。乙要求给每个 Pod 一个不同的 PCI 功能，并让相应 RDMA 设备只在其 Pod 网络命名空间可见。附加要求另写了“不同物理端口”。
+业务方提出两类附加网接入需求：
+- **需求甲**：允许两个 Pod 共用一张 HCA，只要求各自拥有独立附加 IP。
+- **需求乙**：每个 Pod 必须独享不同 PCI 功能，且关联 RDMA 设备仅在各自 Pod 网络命名空间可见；此外要求两个 Pod 走**不同的物理端口**。
 
-另取独立的 `gpu-h1` 库存快照。仅 NUMA 1 有一张空闲 GPU，仅 NUMA 0 有一个空闲 VF。一个容器同时需要这两项，插件均正确上报 NUMA 信息，其余准入条件都满足且不限制本地性。
+另取一份 `gpu-h1` 库存快照：当前仅 NUMA 1 剩 1 张空闲 GPU，仅 NUMA 0 剩 1 个空闲 VF。一个单容器 Pod 同时申请 1 张 GPU 与 1 个 VF，插件均准确上报 NUMA 拓扑，其余条件满足且不限制本地性。
 
-1. 为甲与乙各选一套组件，解释各自消耗的资源和共用的容量。乙如何把“不同物理端口”表达进资源池和请求？
-2. 判断默认调度器的数量筛选与 `single-numa-node` 准入各有什么结果。若只把空闲 VF 换成 NUMA 1 的同池 VF，再判断准入和 PCIe 路径应各怎样验证。
+**任务 3**：
+1. 分别为需求甲和需求乙选定组件组合，说明各自消耗的资源与共享的底层容量；需求乙如何把“不同物理端口”落入资源池与 Pod 请求？
+2. 判断默认调度器的数量筛选与 kubelet `single-numa-node` 准入的结果；若将空闲 VF 换到 NUMA 1 的同池 VF，再说明准入结论及如何验证真实 PCIe 路径。
 
-## 材料四　网络策略的证据范围
+## 材料四：双网络策略覆盖的证据边界
 
-默认网络已确认由支持 Kubernetes `NetworkPolicy` 的插件执行策略。一个服务同时监听两个网络的地址。允许对照中，两条路径都能建立 TCP 连接。应用默认网策略后，从同一客户端到 `10.244.0.10` 的连接被拒绝，到 `192.168.50.11` 的连接仍成功。集群启用了 Multus 的 NAD 命名空间隔离，尚未取得附加网的策略执行点与 RoCE 验证记录。
+集群默认网络由支持 Kubernetes `NetworkPolicy` 的主 CNI 执行。一个测试服务同时监听默认 IP（`10.244.0.10`）与附加 IP（`192.168.50.11`），允许对照中两条 TCP 均连通。
 
-本次结果支持哪个策略结论？如果业务还要求限制附加网上的 RoCE 流量，需要补哪些证据？
+应用默认网拒绝策略后，同一客户端连 `10.244.0.10` 被拒，连 `192.168.50.11` 依然连通。集群已开启 Multus 的 NAD 命名空间隔离，但尚未采集附加网数据面策略执行点与 RoCE 验证记录。
 
-## 参考推理
+**任务 4**：
+说明现有记录能支撑哪些严格结论；若业务还要求拦截附加网上的 RoCE 流量，必须补齐哪些证据？
 
-### 1. 先复算节点余量，再追踪资源键与 BDF
+---
 
-两个节点的余量各为 `8 − 1 = 7`，总和是 14 个。8 VF 请求须在同一节点满足，因此两个节点都放不下。改为申请 1 个 VF 的 `rank-1` 后，调度器先选到节点，kubelet 再分配 BDF。网络注解中的 `roce-vf` 在本 Pod 命名空间解析为 `default/roce-vf`。Multus 用 NAD 上的 `nvidia.com/sriov_resource` 匹配本 Pod 的已分配条目，把 `0000:41:00.2` 交给执行接入的 SR-IOV CNI。记录表明设备 ID 已交接，IP 余量为 `16 − 15 − 1 = 0`，因此失败出现在请求地址时。应查 `gpu-h1` 的地址保留、实际租用和回收状态，随后用一次接入结果验证接口和地址。若 NAD 改成 `nvidia.com/sriov-other`，本次分配无法按该名称取出 VF，故障可前移到设备交接。
+## 分步参考推理
 
-### 2. 用协议、端口和缓冲区限定传输结论
+> [!example]- 题 1 参考推理：单节点余量核算、资源键交接与 IP 耗尽定位
+> - **8 VF Pod 的余量与调度判断**：两台节点当前的单节点调度余量均为：
+>
+> $$\text{单节点 VF 余量} = 8 - 1 = 7\text{ 个}$$
+>
+> - 尽管两节点合计余量为 $7 + 7 = 14$ 个，但单个 Pod 的 8 VF 请求必须由同一台节点满足，因此两台节点都放不下，该 Pod 保持 `Pending`。
+> - **`rank-1` 交接串联与 IP 复算**：Pod 注解中的 `roce-vf` 在本命名空间解析为 `default/roce-vf`；Multus 用 NAD 上的 `nvidia.com/sriov_resource` 键在 PodResources 中匹配出 `0000:41:00.2`，并已成功传给 SR-IOV CNI。失败卡在 NV-IPAM 地址分配环节，当前节点 IP 余量为：
+>
+> $$\text{单节点可租 IP 余量} = 16 - 15 - 1 = 0\text{ 个}$$
+>
+> - 下一步应核查 `gpu-h1` 的地址保留规则、实际租用表与残留释放状态，修复后在新一次接入中用 `network-status` 和 `ip -br addr` 验证。
+> - **NAD 资源键错配后果**：若 NAD 资源注解改为 `nvidia.com/sriov-other`，Multus 按此错键无法从 PodResources 取出已分配的 VF BDF，故障会直接前移到 **Multus 设备交接阶段**，不会走到 IPAM。
 
-两个 TCP 连接分别走 `eth0` 和 `net1`，第二个使用了高速网口所在的网络，传输仍是 TCP。主机内存轮确认从 `rank-1` 到 `rank-0` 的这组 VF 端口、主机缓冲区和参数能完成一次 RDMA Write。显存轮先查客户端所选的 CUDA 设备与 GPU BDF、DMA-BUF 导出结果和导入错误，再对照实际内核、GPU 模块、NIC 驱动和 PCIe 路径。检查受管组件时应结合 Operator 的配置代次和节点实际驱动。材料不足以确认具体哪项注册条件失败。MTU 变体中，IP Echo 数据上限为 `1400 − 20 − 8 = 1372 B`。Ping 结果提供该报文尺寸的 IP 往返证据。RDMA 还要核对 GID、使用的 QP 路径 MTU 和实际传输。
+> [!example]- 题 2 参考推理：协议路径区分、GDR 排查焦点与无分片 MTU 计算
+> - **TCP 与主机内存 RDMA 结论**：指向 `10.244.0.10` 的 TCP 走 `eth0`（默认网 TCP）；指向 `192.168.50.11` 的 TCP 走 `net1`（高速以太网上的内核 TCP，仍非 RDMA）。主机内存 `ib_write_bw` 退出码为 0，证明从 `rank-1` 到 `rank-0` 在这组 VF 端口与主机内存参数下的 RDMA Write 通路可用。
+> - **显存轮首查方向**：主机内存已通而显存轮在客户端报导入/注册失败，最先核查客户端选中的 CUDA 设备号与 GPU BDF、DMA-BUF 导出状态和导入错误码，再逐项对照宿主机内核版本、开源 GPU 模块、NIC 驱动及 PCIe 拓扑路径（核对托管组件时同步比对双 Operator 配置代次与节点实载驱动）。
+> - **MTU 变体计算与边界**：路径实际 IPv4 MTU 为 $1400\text{ B}$ 时，无分片 ICMP Echo 载荷上限为：
+>
+> $$\text{无分片 Echo 载荷上限} = 1400 - 20\text{（IPv4 头）} - 8\text{（ICMP 头）} = 1372\text{ B}$$
+>
+> - 无分片 Ping 只证明该尺寸的 IP 报文可往返；RoCE 数据面仍需独立核对 GID、端口 `active_mtu`、QP 路径 MTU 与实际双端 RDMA 传输。
 
-### 3. 用资源粒度选方案，再求共同 NUMA 候选
+> [!example]- 题 3 参考推理：接入方案选型、双 PF 分池与 NUMA 准入推导
+> - **需求甲与需求乙选型**：
+>   - **需求甲**：选 **Macvlan + RDMA Shared Device Plugin**（节点 `shared` 模式），每个 Pod 消耗 1 个共享逻辑单位与 1 个 IP，底层共用同一张 HCA 与物理口带宽。
+>   - **需求乙**：选 **SR-IOV VF + 节点 `exclusive` 模式 + 链式 RDMA CNI**，每只 Pod 独占 1 个 VF 且移入独立网络命名空间。应为两个 PF（`ens2f0` 与 `ens3f0`）建独立资源池与 NAD，让两只 Pod 各自申请对应池（双口 Pod 则双池各取 1 个；上联是否共用另查布线）。
+> - **跨 NUMA 准入与 PCIe 溯源**：节点合计有 1 GPU 与 1 VF，默认调度器数量检查通过。但两项设备的单 NUMA 候选集合交集为空：
+>
+> $$\text{GPU 候选 } \{1\} \cap \text{VF 候选 } \{0\} = \varnothing$$
+>
+> - 因此 kubelet 在 `single-numa-node` 策略下会在节点内拒绝该 Pod；把空闲 VF 换到 NUMA 1 后交集为 $\{1\}$ 即可通过。
+>   - 随后从 PodResources 取出 GPU UUID 与 VF BDF，经 `nvidia-smi`、`physfn`、`lspci -t` 与 `nvidia-smi topo -m` 确认是否同挂一颗 PCIe Switch，并核对进程实选设备。
 
-甲可用 Macvlan + RDMA Shared Device Plugin，分别得到一个接口、地址和共享资源单位，共用 HCA 与物理链路。乙用 SR-IOV VF + `exclusive` 与链式 RDMA CNI，每只 Pod 有独立的 VF，关联 RDMA 设备移入各自命名空间。要分属不同物理端口，可为每个端口的 PF 建独立资源池，在本次放置中让各 Pod 分别请求对应资源名，并选择匹配的 NAD。若是同一个 Pod 需要两个端口，则请求两个资源名各一个，并各声明一次附加接入。上联的共用情况仍要看实际布线。
+> [!example]- 题 4 参考推理：划分控制面 NAD 隔离与数据面策略覆盖边界
+> - **现有记录支持的结论**：已证实默认 CNI 的 `NetworkPolicy` 成功拦截了默认网 `eth0` 的 TCP 流量，而同一客户端经附加网 `net1` 发起的 TCP 仍畅通无阻。Multus 的 NAD 命名空间隔离只在接入解析期约束“能否引用 NAD”，并不提供数据面拦截。
+> - **限制附加网 RoCE 须补齐的证据**：明确附加网数据面策略的执行组件（例如基于 switchdev + TC 硬件卸载与 VF representor 的方案，且确认是否覆盖当前 CNI 架构与 RoCE 协议），核对策略规则已准确下发到目标 VF 的 representor，最后在 `net1` 上执行同端口的 RoCE 允许对照与拒绝拦截双组实测。
 
-拓扑快照中，节点合计 GPU 与 VF 各一，默认调度器的数量检查可通过。两个单 NUMA 候选分别为 `{1}` 和 `{0}`，无共同位置，`single-numa-node` 在节点内拒绝。把空闲 VF 换到 NUMA 1 后，交集变为 `{1}`，准入条件满足。检查物理路径时，按 PodResources 的 GPU UUID 和 VF BDF 找到上游 PCIe 路径，并核对程序用的实际 GPU 与 NIC 端口。
+---
 
-### 4. 把规则与两种数据路径对应起来
+## 全章知识串联：从设备库存到容器内的高速通道
 
-记录支持默认网的 TCP 拒绝结果和附加网 TCP 在相同测试条件下可达。NAD 命名空间隔离限制网络引用，附加数据面需要自己的实施组件和执行点。应明确该实现是否覆盖经过 VF 或硬件卸载路径的 RoCE 流量，核对实际规则与正确的设备端口，再取一组同路径的 RDMA 允许和拒绝对照及相应执行证据。
+回顾第 13 章，一条 Pod 高速网络通道的诞生与排障，始终沿着五个清晰层次自底向上贯通：
 
-## 从设备库存到进程的数据路径
+1. **硬件与库存**：SR-IOV 把高速 PF 切分为独立 VF（或由共享插件包装 HCA），Device Plugin 将可分配数量与 NUMA 提示上报给 Kubernetes。
+2. **调度与拓扑**：kube-scheduler 核算单节点 VF 余量，kubelet Topology Manager 依据 NUMA 交集把关本地准入并分配具体 VF BDF。
+3. **编排与三层配置**：Multus 依 Pod 注解读取 NAD，用完整 `resourceName` 取出 `deviceID` 委派给 SR-IOV CNI（及可选链式 RDMA CNI）与 NV-IPAM，把 `net1` 与不冲突的 IP、路由、MTU 装入容器命名空间。
+4. **双轮数据验证**：依托 GPU Operator 与 Network Operator 交付的驱动栈，先用主机内存 RDMA 立住网络基线，再用显存 GDR 验收 DMA-BUF 或 `nvidia-peermem`。
+5. **策略与多租户边界**：将默认网 `NetworkPolicy`、Multus NAD 准入隔离与附加网数据面硬件策略分清层次、各自验实。
 
-Node 宣布可分配数量，kubelet 把数量变成设备 ID。网络附加定义把网络选择与这一批设备对上，CNI 和 IPAM 将设备变成有地址的 Pod 接口。最后由应用选择协议、端口和缓冲区，物理拓扑及实际策略决定数据经过哪些设备。沿着这条关系，既可以从工作负载需求推导资源和接入方式，也可以从一条失败记录回到负责该交接的组件。第 14 章将继续分析 GPU 的资源单位如何随共享和切分改变，第 15 章再将本地设备约束接到整组 Pod 的放置。
+至此，单张整卡与高速网口都已稳妥进入 Kubernetes Pod。接下来，面对在线大模型推理对成本与隔离的苛刻要求，[第 14 章 GPU 共享、切分与隔离](../14_GPU共享、切分与隔离/00_内容大纲.md)将拆解 Time-Slicing、MPS、MIG 与 HAMi 如何重塑 GPU 资源粒度。
+
+随后的[第 15 章 从单个 Pod 放置到多卡作业调度](../15_从单个Pod放置到多卡作业调度/00_内容大纲.md)，则会把本章的节点内拓扑约束升级到多节点集群的成组放置与训推混部调度。
+
+> [!info]- 参考资料
+> - **Multus、SR-IOV 与 NV-IPAM 参考**：[Multus 多接口与状态说明](https://github.com/k8snetworkplumbingwg/multus-cni/blob/master/docs/how-to-use.md)、[NVIDIA v26.7.1 SR-IOV RDMA 快速开始](https://docs.nvidia.com/networking/display/kubernetes2671/quick-start/sriov-network-rdma.html)、[NV-IPAM 分配机制](https://github.com/Mellanox/nvidia-k8s-ipam#ip-allocation-flow)
+> - **拓扑对齐、GDR 验证与附加网策略**：[Kubernetes v1.36 Topology Manager](https://v1-36.docs.kubernetes.io/docs/tasks/administer-cluster/topology-manager/)、[NVIDIA GPU Operator v26.7.2 GDR 验证](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/gpu-operator-rdma.html)、[multi-networkpolicy-tc 机制](https://github.com/k8snetworkplumbingwg/multi-networkpolicy-tc)

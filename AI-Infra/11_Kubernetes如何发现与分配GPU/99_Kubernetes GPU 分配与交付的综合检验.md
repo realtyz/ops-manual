@@ -1,26 +1,44 @@
+# Kubernetes GPU 分配与交付的综合检验
 
-平台需要交付一个单容器 Pod `gpu-example/probe`，容器名为 `workload`。先用 Device Plugin 提供整卡数量和 H100 节点标签，再用 DRA 直接申请一张总显存严格大于 40 GiB 的卡。下面是两套独立环境的教学摘录，推理时只使用题给的状态，无需实际 GPU。两路均用 Kubernetes v1.36、containerd v2.3.0 与原生 CDI，关闭 MIG 和共享。未列出的节点条件均满足。
+本篇用四组独立的集群快照，把本章的容量核算、节点选卡、DRA 逐卡匹配、CDI 注入排查与双后端辨认全部串在一起。所有推演只需依据给定材料即可完成。
 
-## 两份整卡资源与设备库存
+先明确四组场景共享的参考环境：
+- **组件基线**：Kubernetes v1.36、NVIDIA Device Plugin v0.20.1、NVIDIA DRA Driver v0.5.1、containerd 2.3.0（原生 CDI）。
+- **工作负载**：单容器 Pod `gpu-example/probe`（容器名 `workload`），整卡模式（关闭 MIG 与共享）。未提及的 CPU、内存、污点等条件均满足。
 
-**Device Plugin 快照。** `gpu-h` 标记为 H100，节点上报的 `Capacity / Allocatable` 为 `2 / 2`。卡 A 已分配一个单位，调度器也已计入其请求。卡 B 健康且未分配。`gpu-a` 标记为 A100，卡 C、D 都健康且没有已有请求，Node 也上报 `2 / 2`。新 Pod 的容器只写 `limits["nvidia.com/gpu"]: 1`，节点选择器要求 H100。
+## 场景材料汇总
 
-这个插件使用 `cdi-cri` 和 `uuid`。B 的 UUID 是 `GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`，插件规格种类为 `k8s.device-plugin.nvidia.com/gpu`，B 的规格条目名为其 UUID。作为独立条件变体，调度器刚完成绑定后，插件把 B 标为不健康且仍保留在清单中。kubelet 已收到更新，还未为新 Pod 选卡，API 里暂时还是旧的 `Allocatable: 2`。
+### 场景 A：Device Plugin 整卡与健康变体快照
 
-**DRA 快照。** 整卡类 `gpu.nvidia.com` 匹配下表四张卡，驱动名为 `gpu.nvidia.com`，池名等于所在节点，只能从各自的节点访问。Pod 无型号节点选择器。容器引用 Pod 内的 `accelerator`，该名字通过模板关联到实际 Claim `probe-accelerator-7m2pk`。其中 `card` 请求一个整卡，CEL 条件为 `device.capacity['gpu.nvidia.com'].memory.isGreaterThan(quantity("40Gi"))`。四个设备条目的容量为以下教学值。
+本场景包含两台同型节点，插件配置为 `deviceListStrategy: cdi-cri`、`deviceIDStrategy: uuid`。插件生成的 CDI `kind` 为 `k8s.device-plugin.nvidia.com/gpu`，条目名即 GPU UUID。
 
-| 节点与池 | 池内名 | 设备 | 总显存 | 已有分配 |
+新 Pod 仅声明 `limits["nvidia.com/gpu"]: 1`，并带 `nodeSelector` 要求 H100 节点。
+
+| 节点 | 硬件标签 | `Capacity / Allocatable` | 物理卡状态 |
+| --- | --- | :---: | --- |
+| `node-h100` | H100 | `2 / 2` | 卡 0：已分配且计入调度请求；卡 1：健康空闲（UUID：`GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`） |
+| `node-a100` | A100 | `2 / 2` | 卡 0、卡 1：均健康且空闲，无已有请求 |
+
+**独立健康变体**：调度器刚将 `probe` 绑定到 `node-h100`。随后插件把卡 1 标为 `Unhealthy`（仍在清单中）。kubelet 已收到新清单，但尚未为 `probe` 选卡。此时 API 的 Node 状态暂时仍显示 `Allocatable: 2`。
+
+### 场景 B：DRA 逐卡库存与混装对比快照
+
+整卡类 `gpu.nvidia.com` 匹配下表四张卡（驱动名 `gpu.nvidia.com`，每节点一个池，设备仅本节点可达）。Pod 不设型号 `nodeSelector`。容器引用别名 `accelerator`，经模板生成实际 Claim `probe-accelerator-7m2pk`。
+
+Claim 内部请求 `card` 申请 1 张整卡。CEL 筛选条件为 `device.capacity['gpu.nvidia.com'].memory.isGreaterThan(quantity("40Gi"))`。
+
+| 节点与资源池 | 池内设备名 | 物理卡与标识 | 切片标称显存 | 当前占用状态 |
 | --- | --- | --- | ---: | --- |
-| `gpu-h` | `gpu-0` | A，H100 | `80Gi` | 已分给另一份 Claim |
-| `gpu-h` | `gpu-1` | B，H100，UUID 同上 | `80Gi` | 无 |
-| `gpu-a` | `gpu-0` | C，A100 | `40Gi` | 无 |
-| `gpu-a` | `gpu-1` | D，A100 | `40Gi` | 无 |
+| `node-h100` | `gpu-0` | H100（卡 0） | `80Gi` | 已被另一份 Claim 占用 |
+| `node-h100` | `gpu-1` | H100（卡 1，UUID 同场景 A） | `80Gi` | 空闲 |
+| `node-a100` | `gpu-0` | A100（卡 0） | `40Gi` | 空闲 |
+| `node-a100` | `gpu-1` | A100（卡 1） | `40Gi` | 空闲 |
 
-还有一个用于比较筛选粒度的独立场景。在 `gpu-mix` 装有未分配的 H100 X（`80Gi`）和 A100 Y（`40Gi`）。在 Device Plugin 环境，两张卡同属 `nvidia.com/gpu`，管理员用节点标签表示“含 H100”。在 DRA 环境，两张卡各自有切片设备条目。
+**独立混装节点 `node-mix`**：同机装有 1 张空闲 H100（`80Gi`）与 1 张空闲 A100（`40Gi`）。Device Plugin 环境下两卡同属 `nvidia.com/gpu`，节点挂有标签“含 H100”；DRA 环境下两卡各有独立切片条目。
 
-## 一份创建失败记录和一份扩展资源请求
+### 场景 C：DRA 容器创建失败记录
 
-DRA 快照继续推进，调度器已将 `probe` 绑定到 `gpu-h`。Claim 的教学记录摘录如下，省略了对象头及其他状态字段。
+沿场景 B 推进，调度器已把 `probe` 绑定到 `node-h100`。控制面写入的 `ResourceClaim` 状态如下：
 
 ```yaml
 metadata:
@@ -32,7 +50,7 @@ status:
       results:
         - request: card
           driver: gpu.nvidia.com
-          pool: gpu-h
+          pool: node-h100
           device: gpu-1
   reservedFor:
     - resource: pods
@@ -40,59 +58,102 @@ status:
       uid: 11111111-1111-4111-8111-111111111111
 ```
 
-Pod 的 `metadata.uid` 和 `reservedFor[0].uid` 一致。节点插件记录同一个 Claim UID 已准备成功，将规格写入 `/var/run/cdi`，并返回 `k8s.gpu.nvidia.com/claim=22222222-2222-4222-8222-222222222222-gpu-1`。确认规格中有对应条目，kubelet 交给 CRI 的名称也一致。但 containerd 启用了 CDI，其唯一有效扫描目录为 `/etc/cdi`，目录中无同名条目，`CreateContainer` 报名称无法解析。
+已核实以下现场事实：
+- Pod 的 `metadata.uid` 与 `reservedFor[0].uid` 完全一致。
+- `node-h100` 的 DRA 节点插件对同一 Claim UID 准备成功，将规格写入 `/var/run/cdi`，返回全名 `k8s.gpu.nvidia.com/claim=22222222-2222-4222-8222-222222222222-gpu-1`。
+- 规格条目与 kubelet 传给 CRI 的名称一致。但 containerd 的唯一有效 `cdi_spec_dirs` 为 `/etc/cdi`（无同名条目），导致 `CreateContainer` 报名称无法解析。
 
-最后查看同一 Kubernetes 版本的另一份独立记录。管理员有一个匹配 NVIDIA 整卡的 DeviceClass，设置了 `spec.extendedResourceName: nvidia.com/gpu`，集群启用了 `DRAExtendedResource`。另一个已绑定的 Pod 只写了 `limits["nvidia.com/gpu"]: 1`，没有显式 Claim。它的 `status.extendedResourceClaimStatus.resourceClaimName` 指向一份 Claim，`requestMappings` 把 `workload` 的 `nvidia.com/gpu` 对应到该 Claim 的请求，后者有当前 Pod 的 UID 与设备分配结果。
+### 场景 D：同语法扩展资源记录
+
+另一份独立记录位于同一 Kubernetes v1.36 集群（已开启 `DRAExtendedResource`），现场特征如下：
+- 管理员在匹配 NVIDIA 整卡的 `DeviceClass` 上设置了 `spec.extendedResourceName: nvidia.com/gpu`。
+- 一个已绑定 Pod 的容器仅声明 `limits["nvidia.com/gpu"]: 1`，未写任何显式 `resourceClaims`。
+- 该 Pod 的 `status.extendedResourceClaimStatus.resourceClaimName` 指向一份新生成的 Claim，`requestMappings` 将 `workload` 的 `nvidia.com/gpu` 映射到该 Claim 的请求条目，且该 Claim 已记录设备分配结果与当前 Pod UID。
+
+---
 
 ## 检验任务
 
-1. **上报、计数与放置。** 算出 Device Plugin 快照中两台节点的 GPU 余量，解释正常时 `probe` 绑定的节点。只把新请求改为两张，哪项约束排除了哪台节点？B 的健康变化怎样传播到调度器？假设新的调度快照仍只计入 A 的请求，更新后 `gpu-h` 的 Capacity、Allocatable、余量各是多少？
-2. **本地候选与交接。** 解释健康主例中谁选 B、谁提供 CDI 全名、containerd 应收到什么。若 B 在绑定后选卡前变为不健康，判断最早的失败点，并说明为什么 API 中的旧数字与本地失败能同时出现。
-3. **逐卡条件与分配占用。** 逐个排除 DRA 库存中不满足条件的设备，说明调度器怎样得到可行节点。如果把 B 也分配给别的 Claim，并在 `gpu-a` 再加一张 `40Gi` 的整卡，能否满足原请求？混装场景中，同样请求一张卡，哪种表达能保证得到 X？
-4. **已分配后失败的定位。** 用给定记录标出 Pod UID、Claim UID、设备三元组与 CDI 全名各验证了什么。给出创建失效的最早环节、一个只改变故障条件的修复办法，以及从重试到确认 CUDA 计算的复核顺序。Pod 用完设备后，节点与控制面分别处理什么？
-5. **相同语法的不同后端。** 判断最后一份扩展资源请求的后端，用两项证据支持判断。若现场目前只知道 `limits["nvidia.com/gpu"]: 1`，需要取什么证据才能做同样的判断？
+1. **上报、计数与放置**：算出场景 A 两台节点的 GPU 调度余量，解释正常时 `probe` 的落点。只把新 Pod 改为请求 2 张卡，哪项约束排除了哪台节点？独立健康变体生效并同步到调度器后（账本仍只计入卡 0），`node-h100` 的 `Capacity`、`Allocatable` 与余量各是多少？
+2. **本地选卡与竞态失败**：在场景 A 健康主例中，谁选卡 1、谁提供 CDI 全名、containerd 应收到什么字符串？独立健康变体里，最早的失败点落在哪一步？为何 API 的旧数字与本地失败可以并存？
+3. **逐卡筛选与混装保证**：逐一排除场景 B 的四张卡，说明调度器如何推出可行节点。若 `node-h100` 的 `gpu-1` 也被占用，再给 `node-a100` 加一张 `40Gi` 整卡，能否满足原请求？在混装节点 `node-mix` 请求 1 张卡，哪种机制才能保证拿到 80 GiB H100？
+4. **分配后失败排查与双平面清理**：标出场景 C 中 Pod UID、Claim UID、设备三元组与 CDI 全名各验证了什么。指出最早失效环节、给出一个单变量修复方案，并列出从重试到确认计算的复核顺序。Pod 退出后，节点侧与控制面分别执行什么清理？
+5. **穿透语法辨认后端**：判断场景 D 的请求由哪个后端兑现，给出两项核心证据。如果现场最初只知道 Pod 写了 `limits["nvidia.com/gpu"]: 1`，还要补查什么证据才能做同等判断？
+
+---
 
 ## 参考推理
 
-### 1. 节点型号和单节点余量
+> [!example]- 参考推理 1：节点型号标签与单节点余量核算
+> 1. **初始余量与正常绑定**：只写 `limits["nvidia.com/gpu"]: 1` 自动等价于请求 $q = 1$。按余量公式 $T - R$ 计算：
+>
+>    $$\text{node-h100 余量} = 2 - 1 = 1,\qquad \text{node-a100 余量} = 2 - 0 = 2$$
+>
+>    两台节点均过数量关。H100 标签把候选缩到 `{node-h100}`，因此 `probe` 绑定到 `node-h100`。
+>
+> 2. **改为请求 2 张卡**：当 $q = 2$ 时，`node-h100` 过了标签检查但余量 $1 < 2$ 被淘汰；`node-a100` 余量够但型号标签不匹配被淘汰。交集为空，Pod 保持 `Pending`。
+>
+> 3. **健康更新传播与账本变化**：插件经 `ListAndWatch` 将卡 1 的 `Unhealthy` 推给 kubelet，kubelet 处理后更新 API 中的 Node 状态。卡 1 仍在清单中，因此 `node-h100` 的 `Capacity` 保持 `2`，`Allocatable` 降为 `1`。调度器读到新状态且账本仍计入卡 0 时，余量变为：
+>
+>    $$T - R = 1 - 1 = 0$$
+>
+>    任何正数请求都无法再通过数量检查（若失败 Pod 仍计入账本，差额更低，同样不通过）。
 
-只写 limit 的单卡请求对应 request 1。`gpu-h` 的余量为 `2 − 1 = 1`，`gpu-a` 为 `2 − 0 = 2`。数量允许两台节点，H100 标签把候选缩到 `gpu-h`。若请求改为 2，`gpu-h` 通过标签检查但余量差 1，`gpu-a` 通过数量检查但型号不匹配，因此无可放置节点。 [Kubernetes v1.36 GPU 请求与节点选择](https://v1-36.docs.kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/) · [NodeResourcesFit v1.36.0](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/scheduler/framework/plugins/noderesources/fit.go)
+> [!example]- 参考推理 2：节点绑定后本地选卡与竞态切分
+> 1. **健康主例的三方交接**：绑定后，由 `node-h100` 的 **kubelet Device Manager** 从 `{卡 0, 卡 1}` 扣除已占 `{卡 0}`，选出卡 1 并调插件 `Allocate`（`cdi-cri` 模式返回 `k8s.device-plugin.nvidia.com/gpu=GPU-bbbb...`）。
+>    - kubelet 经 CRI 交给 containerd 组装 OCI 配置；运行后用本地 PodResources API 核对卡 1 UUID，再在容器内枚举并跑探针验算。
+>
+> 2. **健康变体的最早失败点**：卡 1 变不健康并进入 kubelet 本地缓存后，健康集合只剩 `{卡 0}`。扣除已占的 `{卡 0}`，候选数为零。最早失败在 **kubelet 本地接纳与选卡阶段**，早于 `Allocate` 调用。
+>
+> 3. **新旧视图并存的原因**：调度器按历史缓存完成绑定，kubelet 按本机最新 `ListAndWatch` 清单选卡，而 Node 状态回写 API 属于异步流程。排查时需按时间戳对齐本地健康更新、分配记录与 Node 状态刷新时间。
 
-Device Plugin 在 `ListAndWatch` 流上传递 B 的健康变化，kubelet 处理列表后更新 API 中的 Node 状态。调度器读到这次更新时，由于 B 仍在清单中，`gpu-h` 的 Capacity 为 2，Allocatable 降为 1。对于下一次请求，只要已计入的请求仍只有 A 的一个单位，余量就是 `1 − 1 = 0`。已绑定的故障 Pod 若也计入账本，差额会更低，仍无法通过新增正数请求的数量检查。 [Kubernetes v1.36 设备健康更新](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices) · [NodeResourcesFit v1.36.0](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/scheduler/framework/plugins/noderesources/fit.go)
+> [!example]- 参考推理 3：DRA 逐卡筛选、容量不可拼凑与混装对比
+> 1. **四卡逐一排除**：四张卡都符合整卡类 `gpu.nvidia.com`。CEL 条件要求显存**严格大于** `40Gi`，因此 `node-a100` 两张 `40Gi` 卡直接淘汰。剩余 `node-h100` 两张 `80Gi` 卡中，`gpu-0` 已被另一份 Claim 占用，仅剩 `gpu-1`。该设备仅从 `node-h100` 可达，调度器锁定 `node-h100`。
+>
+> 2. **新增 40 GiB 卡为何无效**：若 `gpu-1` 也被占用，在 `node-a100` 再加 `40Gi` 整卡仍不满足条件。CEL 对单张设备独立求值，两张 `40Gi` 卡不能拼成一张大于 `40Gi` 的卡。
+>
+> 3. **混装节点的保证差异**：在 `node-mix` 上，“含 H100”标签只能把 Pod 放到该节点，两张卡同属 `nvidia.com/gpu` 池，kubelet 本地选卡仍可能分出 A100；唯有 **DRA** 用逐卡显存条件过滤掉 A100，保证只拿 H100。
+>    - 分配结果里的 `gpu-1` 须以 `driver / pool / device` 三元组联合定位，才能明确指向 `node-h100`。
 
-### 2. 节点绑定后才有具体设备 ID
+> [!example]- 参考推理 4：跨层证据归因、单变量修复与双平面回收
+> 1. **四项核心身份的验证范围**：
+>    - **Pod UID**：与 `reservedFor` 匹配，证明该 Pod 获准消费此 Claim。
+>    - **Claim UID**：关联控制面 Claim 对象与节点 `NodePrepareResources` 日志。
+>    - **设备三元组**（`gpu.nvidia.com / node-h100 / gpu-1`）：定位目标节点池内设备，再经 `ResourceSlice` 回查物理 UUID。
+>    - **CDI 全名**：同时出现在准备结果、`/var/run/cdi` 规格与 CRI 请求中，说明分配、准备与传参全部畅通。
+>
+> 2. **最早失败点与单变量修复**：containerd 仅扫描 `/etc/cdi`，导致 `CreateContainer` 最早失败于 **CDI 名称解析**。单变量修复只需保持请求与规格不动，将 `/var/run/cdi` 加入 containerd 有效 `cdi_spec_dirs` 并确认已加载条目。
+>
+> 3. **端到端复核顺序**：重试后依次确认 containerd 成功解析同名 CDI、容器创建启动、宿主机与容器 `nvidia-smi -L` 均对齐目标 H100 的 UUID，最后运行兼容 CUDA 探针写入整数 `7`、同步并拷回校验通过。
+>
+> 4. **双平面资源清理**：节点侧在本机最后一个消费者退出后，由 kubelet 调用 `NodeUnprepareResources` 清理准备记录与 `/var/run/cdi` 临时规格；控制面由 Claim 控制器移除最后一项有效 `reservedFor` 后清空 `status.allocation`，让物理卡回到可调度库存（模板 Claim 随 Pod 回收）。
 
-健康时 kubelet 从 `{A, B}` 中扣除已分配的 `{A}`，选 B 并调用插件 `Allocate`。插件以 `cdi-cri` 返回 `k8s.device-plugin.nvidia.com/gpu=GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`，kubelet 将全名转交 CRI。containerd 用它匹配节点规格并组装 OCI 配置。分配完成后，可在运行窗口用本机 PodResources 查询 B 的设备 ID，容器启动后再用 UUID 和探针验证。 [kubelet v1.36.0 设备管理器](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go) · [NVIDIA v0.19.2 CDI 交接](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.19.2/internal/plugin/server.go)
+> [!example]- 参考推理 5：穿透 `nvidia.com/gpu` 语法辨认实际后端
+> 1. **后端判断与两项证据**：场景 D 由 **DRA 后端**兑现。证据一是 `status.extendedResourceClaimStatus` 将容器 `workload` 的 `nvidia.com/gpu` 映射到自动生成的 Claim。证据二是该 Claim 已记录具体设备分配结果，并保留给当前 Pod UID。`DeviceClass` 配置说明映射能力就绪，Pod 与 Claim 状态则证实本次实际走了 DRA。
+>
+> 2. **仅见 `limits["nvidia.com/gpu"]: 1` 时的补充取证**：先查 `spec.nodeName` 与 Pod 状态。已绑定则查 `status.extendedResourceClaimStatus`、关联 Claim 与 `NodePrepareResources`，或反查目标节点 Device Plugin 注册、本地分配 ID 与 `Allocate`。
+>    - 若 Pod 尚未绑定，则结合 `DeviceClass` 映射配置、候选节点供给形态（切片或 `Allocatable`）及调度事件判断。
 
-故障变体中，kubelet 最新健康集合只剩 A，而 A 已占用，本次候选数为零。失败在 kubelet 的本地接纳和选卡，早于该容器的 `Allocate` 调用。调度器完成绑定和 kubelet 处理后续健康更新是两个时点，Node 状态发布也有自己的时序。可按节点和时间对照 `ListAndWatch` 健康变更、本地分配、Pod 绑定记录以及 API 里 Node 状态的采集时间。 [Kubernetes v1.36 设备健康更新](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices) · [v1.36.0 本地健康检查](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)
+---
 
-### 3. 合格设备必须可达且未被占用
+## 全章机制串联与后续衔接
 
-C、D 恰好是 `40Gi`，均未通过严格大于条件。A、B 通过，但 A 已被另一份 Claim 占用，只剩 B，且只能从 `gpu-h` 访问。因此调度器能用 `gpu-h` 满足节点与设备约束。若 B 也被占用，`gpu-a` 新增的 `40Gi` 同样不合格。两个设备各有 `40Gi` 也无法合成一个通过条件的设备。 [Kubernetes v1.36 DRA 调度工作流](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#how-resource-allocation-with-dra-works) · [NVIDIA GPU 显存选择](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/guides/gpu-allocation/allocating-gpus/#select-a-gpu-by-memory-size)
+回看全章，无论走传统 Device Plugin 还是新一代 DRA，定位任何 GPU 分配问题都绕不开下面四问：
 
-混装时，“含 H100”标签只让 `gpu-mix` 通过节点筛选，X、Y 都在该节点同名资源的候选集合里。DRA 用逐设备条件筛掉 Y；假如 X 已被占用，DRA 的这份申请会等合格设备或其他可行节点。对于分配结果里的 `gpu-1`，用驱动、池与设备名作联合定位，即可区分 `gpu-h` 的 B 和 `gpu-a` 的 D。 [Kubernetes v1.36 节点选择](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector) · [ResourceSlice v1 API](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/resource/resource-slice-v1/)
+| 核心问题 | Device Plugin 路径证据 | DRA 路径证据 |
+| --- | --- | --- |
+| **Pod 能放到哪台节点？** | Node `Allocatable` 余量 $T - R$ + 节点标签交集 | `ResourceSlice` 逐卡属性/容量 + `DeviceClass` / CEL + 可达节点 |
+| **最终分到了哪张物理卡？** | 绑定后查 kubelet 本地分配记录（PodResources `List`） | 绑定前查 Claim `status.allocation` 三元组与 `reservedFor` |
+| **节点如何兑现给运行时？** | 插件 `Allocate` 响应（如 `cdi-cri` 全名）→ CRI → containerd | 插件 `NodePrepareResources` 生成临时 CDI → CRI → containerd |
+| **业务是否真正用上了卡？** | 核对物理 UUID 与容器 `nvidia-smi -L`，跑通最小 CUDA 探针验算 | 切片 UUID 对齐容器 `nvidia-smi -L`，跑通最小 CUDA 探针验算 |
 
-### 4. 从准备结果到可执行计算
+同一张物理 GPU 在底层以 UUID 锚定身份，在 DRA 库存里以三元组定位，在容器交接时化作 CDI 全名。用节点名、Pod UID、Claim UID 和容器名把这几层串齐，就打通了从第 10 章容器访问到 Kubernetes 集群交付的完整骨架。
 
-Pod UID 证明消费者身份与 `reservedFor` 匹配。Claim UID 把 API 对象与节点准备记录关联起来。三元组定位 `gpu-h` 的 B，再由切片 UUID 关联物理卡。CDI 全名同时出现在准备结果与创建请求中，`kind` 和条目名也能拼出该全名。这些证据把问题缩小到 containerd 的规格可见性。运行时只读 `/etc/cdi`，所以当前创建最早失败于 CDI 解析。 [ResourceClaim v1 API](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/) · [NVIDIA v0.5.1 CDI 命名](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/v0.5.1/cmd/gpu-kubelet-plugin/cdi.go) · [containerd v2.3.0 CDI 配置](https://github.com/containerd/containerd/blob/v2.3.0/docs/cri/config.md)
+接下来，第 12 章引入 **GPU Operator**，解决如何在多节点上自动化安装和协同维护驱动、Toolkit、Device Plugin、GFD 与 DRA 驱动。第 13 章把同类设备交付思路拓展到高速 RDMA 网卡。第 14—15 章则打破整卡独占假设，进入 GPU 共享切分与多 Pod 调度。
 
-保留请求和规格，让 containerd 的有效扫描集合包含 `/var/run/cdi` 并确认其已加载该条目。重试后先验证同名设备能解析、容器已创建并启动，再用宿主机和容器的管理枚举核对 B 的 UUID。最后用与驱动和设备兼容的探针选到 B，执行一次小 Kernel，同步并回读预期值 7。这样能区分创建成功、目标设备可见和应用计算通过。 [containerd v2.3.0 创建实现](https://github.com/containerd/containerd/blob/v2.3.0/internal/cri/server/container_create_linux.go) · [NVIDIA SMI UUID](https://docs.nvidia.com/deploy/nvidia-smi/index.html) · [CUDA 13.2.1 同步与错误处理](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__DEVICE.html)
+---
 
-清理时，最后一个本地消费者结束后，节点侧解除准备，驱动清理准备记录和临时规格。控制面在最后一项有效消费者记录被移除时清空调度器分配，由模板生成的 Claim 也随拥有它的 Pod 管理。分别检查节点记录和 API 状态，才能确认两侧的回收进展。 [kubelet v1.36.0 解除准备](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/dra/manager.go) · [Kubernetes v1.36.0 Claim 控制器](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/controller/resourceclaim/controller.go#L1360-L1448)
-
-### 5. 以实际分配对象辨认后端
-
-最后一份记录走 DRA。证据一是 Pod 的扩展资源 Claim 状态明确把当前容器和资源键映射到生成的 Claim。证据二是该 Claim 记录了具体设备，并保留给当前 Pod UID。DeviceClass 配置说明这条路为何可用，实际 Pod 和 Claim 的状态说明这次已选中它。 [Kubernetes v1.36 DRA 扩展资源](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#extended-resource-allocation-by-dra) · [Pod 扩展资源 Claim 状态字段](https://github.com/kubernetes/api/blob/v0.36.0/core/v1/types.go)
-
-仅给出 limit 时，先查目标节点与 Pod 状态，再查 DeviceClass 映射、对应 Claim 和节点准备调用，或反查目标节点的 Device Plugin 注册、设备 ID 与 `Allocate` 响应。对未绑定的 Pod，还要结合候选节点的供给配置和调度事件，因为此时可能尚未生成关联记录。
-
-## 从 Pod 放置到容器计算的完成条件
-
-| 问题 | 可建立结论的证据 |
-| --- | --- |
-| 这个 Pod 可以放在哪里 | Device Plugin 路径检查节点数量余量与标签，DRA 路径检查设备条件、已有分配及可达节点。 |
-| 这次请求最终分到了什么 | Device Plugin 路径看 kubelet 的本地设备分配，DRA 路径看 Claim 的设备与消费者。 |
-| 节点怎样兑现分配 | 按路径核对 `Allocate` 响应或 Claim 准备结果，再看运行时实际消费的设备配置。 |
-| 应用真的用起来了吗 | 核对容器 UUID 与原分配，然后以同步并校验过的计算结果完成验证。 |
-
-同一个物理设备可以在节点上按 UUID 识别，在 DRA 库存中按三元组定位，再通过 CDI 名传给运行时。按节点、Pod UID、Claim UID 和容器名对齐这些证据，就能把调度的选择接到第 10 章的容器访问与计算。第 12 章将引入负责部署和维护这些组件的 GPU Operator。第 14、15 章分别改变资源单位与放置粒度，继续使用本章所建立的请求、分配和交付关系。
+> [!info]- 参考资料
+> - **Device Plugin 调度、健康与实现**：[Scheduling GPUs (v1.36)](https://v1-36.docs.kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)、[Device Plugin and Unhealthy Devices (v1.36)](https://v1-36.docs.kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#device-plugin-and-unhealthy-devices)、[nodeSelector (v1.36)](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector)、[NodeResourcesFit fit.go (v1.36.0)](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/scheduler/framework/plugins/noderesources/fit.go)、[kubelet v1.36.0 Device Manager](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/devicemanager/manager.go)、[NVIDIA Device Plugin v0.20.1 server.go](https://github.com/NVIDIA/k8s-device-plugin/blob/v0.20.1/internal/plugin/server.go)
+> - **DRA 库存、匹配、准备与回收**：[How Resource Allocation with DRA Works (v1.36)](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#how-resource-allocation-with-dra-works)、[Extended Resource Allocation by DRA (v1.36)](https://v1-36.docs.kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#extended-resource-allocation-by-dra)、[ResourceSlice v1 API](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/resource/resource-slice-v1/)、[ResourceClaim v1 API](https://v1-36.docs.kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/)、[NVIDIA DRA Select GPU by Memory](https://dra-driver-nvidia-gpu.sigs.k8s.io/docs/guides/gpu-allocation/allocating-gpus/#select-a-gpu-by-memory-size)、[NVIDIA DRA v0.5.1 cdi.go](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/blob/v0.5.1/cmd/gpu-kubelet-plugin/cdi.go)、[kubelet v1.36.0 DRA Manager](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/cm/dra/manager.go)、[Kubernetes v1.36.0 ResourceClaim Controller](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/controller/resourceclaim/controller.go#L1360-L1448)、[Kubernetes API v0.36.0 core/v1 types.go](https://github.com/kubernetes/api/blob/v0.36.0/core/v1/types.go)
+> - **容器运行时与计算核验**：[containerd v2.3.0 CRI 配置](https://github.com/containerd/containerd/blob/v2.3.0/docs/cri/config.md)、[containerd v2.3.0 container_create_linux.go](https://github.com/containerd/containerd/blob/v2.3.0/internal/cri/server/container_create_linux.go)、[NVIDIA SMI](https://docs.nvidia.com/deploy/nvidia-smi/index.html)、[CUDA 13.2.1 同步 API](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-runtime-api/group__CUDART__DEVICE.html)

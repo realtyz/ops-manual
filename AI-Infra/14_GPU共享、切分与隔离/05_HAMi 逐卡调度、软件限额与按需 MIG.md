@@ -1,50 +1,144 @@
+# HAMi 逐卡调度、软件限额与按需 MIG
 
-设 A 需要在同一张卡上取得 12 GiB 显存份额。节点上每张卡虽各有一个共享名额，空闲显存却可能分散在多个设备上。只数名额无法定位能放下 A 的设备。HAMi（Heterogeneous AI Computing Virtualization Middleware，异构 AI 计算虚拟化中间件）提供调度和设备交付组件。在 NVIDIA 后端，调度路径能按卡匹配请求，设备插件落实具体分配。本文用 v2.11.0 的 Linux 本地 GPU 路径，对照容器内软件限额和按需创建 MIG。 [HAMi 项目与软件架构](https://project-hami.io/docs/core-concepts/architecture) · [HAMi v2.11.0 发行说明](https://github.com/Project-HAMi/HAMi/releases/tag/v2.11.0)
+设想一套量化后的 14B 在线推理服务，单副本在峰值 KV Cache 下恰好需要 `12 GiB` 显存与 `30%` 算力预算。把它放进原生 Time-Slicing 池，调度器只数名额不管每张卡还剩多少显存，极易把两套服务撞成 OOM；放进静态 MIG 池，`2g.10gb` 装不下，升到 `3g.20gb` 又白白浪费近 `8 GiB` 显存，而且每次调整比例还要排空整张卡。
 
-## 显存、算力与名额必须在同一张卡上满足
+**HAMi（Heterogeneous AI Computing Virtualization Middleware，异构 AI 计算虚拟化中间件）** 正是为了填平这条鸿沟而生。它通过自定义调度器与设备插件协同工作，在单卡粒度上同时追踪名额、显存和算力预算。
 
-独立的 HAMi 教学池有两张 A100-SXM4-40GB。采用默认 NVIDIA 资源名，`memoryFactor: 1`，显存与算力缩放系数均取 1。A 的工作容器用以下字段申请一张卡上的份额，省略 Pod 对象、镜像等。显存请求写整数 MiB，计算预算写整数百分比。 [HAMi v2.11.0 chart 参数](https://raw.githubusercontent.com/Project-HAMi/HAMi/v2.11.0/charts/hami/values.yaml) · [HAMi 逐卡调度](https://project-hami.io/docs/core-concepts/scheduling)
+在 NVIDIA 后端，HAMi `v2.11.0` 提供两条核心落地路径：**软件层显存与算力硬限额（HAMi-core）**，以及**按需动态切分硬件实例（Flexible MIG）**。下文逐一拆解其调度账本与执行边界。
+
+## 逐卡三维联合筛选：节点合计够用，为什么依然落不下？
+
+在一套独立的双卡 A100-SXM4-40GB HAMi 资源池中（采用默认 NVIDIA 资源名，`memoryFactor: 1`，显存与算力缩放系数均为 `1`），上述 14B 推理副本用如下 Pod 清单声明单卡三维份额：
 
 ```yaml
-resources:
-  limits:
-    nvidia.com/gpu: 1
-    nvidia.com/gpumem: 12288
-    nvidia.com/gpucores: 30
+apiVersion: v1
+kind: Pod
+metadata:
+  name: infer-14b-vgpu
+spec:
+  containers:
+    - name: llm-engine
+      image: vllm/vllm-openai:latest
+      resources:
+        limits:
+          nvidia.com/gpu: 1          # 申请 1 张 GPU 上的 1 个共享名额
+          nvidia.com/gpumem: 12288   # 申请 12,288 MiB（12 GiB）软件显存硬上限
+          nvidia.com/gpucores: 30    # 申请 30% 算力调度预算（整数百分比）
 ```
 
-| 教学快照中的余额 | 共享名额 | 显存 | 算力预算 |
-| --- | ---: | ---: | ---: |
-| `GPU-A` | 1 | 16,384 MiB | 20% |
-| `GPU-B` | 1 | 10,240 MiB | 60% |
+观察节点两张物理卡当前的实时剩余账本：
 
-节点合计有 26,624 MiB 显存余额和 2 个名额，但 `GPU-A` 差 10 个百分点的算力预算，`GPU-B` 差 `12,288 − 10,240 = 2,048 MiB`。没有一张卡同时通过所有筛选。若 `GPU-A` 上原有任务退出并恰好释放 10 个百分点，其他余额足够，A 就可以选到 `GPU-A`。
+| 物理卡 | 剩余共享名额 | 剩余显存余额 | 剩余算力预算 | 能否满足 `(1, 12288 MiB, 30%)` |
+| --- | ---: | ---: | ---: | --- |
+| `GPU 0` | `1` | `16,384 MiB` | `20%` | **不能**（算力缺 `10` 个百分点） |
+| `GPU 1` | `1` | `10,240 MiB` | `60%` | **不能**（显存缺 `2,048 MiB`） |
 
-再看一张空卡的独立快照。若只允许在该卡上放置，且卡上有 3 个名额、至少 28,672 MiB 显存和 100% 的算力预算，A 与一个申请 8,192 MiB、40% 的 B 会消耗 20,480 MiB、70% 和两个名额。第三个与 B 相同的任务加入后，名额与显存账面都够，算力合计却达到 110%。三项约束要在每次放置时同时重算。
+算一下节点总量，你会发现总剩余显存高达 `26,624 MiB`、剩余名额有 `2` 个，看似绰绰有余。但因为单卡任务的三项约束**必须在同一张物理卡上同时满足**，逐卡核算后结果截然不同：
 
-## 调度结果怎样交给设备插件
+$$\text{GPU 0 算力缺口} = 30\% - 20\% = 10\%, \qquad \text{GPU 1 显存缺口} = 12,288 - 10,240 = 2,048\ \text{MiB}$$
 
-符合条件的新 Pod 经 HAMi Webhook 选择 `hami-scheduler`。调度路径读取逐卡状态，在绑定时用 Pod 注解传递所选节点、GPU 和份额。kubelet 在容器准备阶段调用 HAMi Device Plugin，插件据此交付设备。对照下面两种记录，可分辨调度选择是否已落实。 [HAMi v2.11.0 架构](https://project-hami.io/docs/core-concepts/architecture) · [HAMi v2.11.0 调度与插件交接协议](https://project-hami.io/docs/developers/protocol)
+两张卡各有短板，新推理副本只能等待。只有当 `GPU 0` 上某个已有任务退出并释放出至少 `10%` 算力预算时，`GPU 0` 的三项余量才同时过关，调度器才会放行。
 
-| 位置 | 记录与含义 |
-| --- | --- |
-| Node | `.status.allocatable` 提供计数，`hami.io/node-nvidia-register` 用 `id`、`count`、`devmem`、`devcore` 描述设备身份及容量，调度时再扣除已分配份额。 |
-| Pod | `hami.io/vgpu-devices-allocated` 记录选定设备和份额，`hami.io/vgpu-devices-to-allocate` 是插件待完成的清单。插件完成分配后，`hami.io/bind-phase` 可从 `allocating` 变为 `success`，分配失败时可见 `failed`。 |
+同一张空卡上连续装箱也遵循完全一致的联合校验。假设一张空卡配置了 `3` 个共享名额、至少 `28,672 MiB` 可用显存和 `100%` 算力预算：
 
-## HAMi-core 的显存检查与 Kernel 节流
+- 放入第 1 个副本（`12,288 MiB, 30%`）和第 2 个副本（`8,192 MiB, 40%`）后，已用 `2` 个名额、`20,480 MiB` 显存、`70%` 算力。
+- 当第 3 个副本（同样申请 `8,192 MiB, 40%`）到达时，名额（$3 \le 3$）与显存（$28,672\ \text{MiB}$）账面都过关，但算力合计达到：
 
-软件共享路径由插件提供容器注入信息，HAMi-core 库在进程调用 CUDA 时按设备限额检查。如果 A 的 12,288 MiB 限额中已有 10,240 MiB 被计入，再申请 3,072 MiB，总量就会到 13,312 MiB。即使物理卡仍有空位，这次经过拦截的请求也应触发显存超限。框架和 CUDA 内部开销会影响有效用量，应根据实际调用范围核对。 [HAMi v2.11.0 软件资源隔离与注入](https://project-hami.io/docs/key-features/device-resource-isolation)
+$$C_{\text{sum}} = 30\% + 40\% + 40\% = 110\% > 100\%$$
 
-计算限制通过节流提交的 Kernel 实现。控制库用令牌约束提交，令牌不足时等待补充。按 v2.11.0 语义，`default` 在同卡有相同或更高优先级的其他容器执行 Kernel 时启动节流，`force` 始终启用节流，`disable` 关闭节流。因而 A 独自在卡上运行时，`default` 的 30% 调度预算仍记在账上，运行时可以利用空闲执行资源。软件节流改变提交时机，实际 SM、缓存和带宽仍由同卡任务共享。限额依赖容器内的拦截库正常加载及其覆盖的调用路径，安全评估还须检查容器和宿主机权限。 [HAMi v2.11.0 算力节流与限制](https://project-hami.io/docs/key-features/device-resource-isolation#compute)
+调度器立刻拦下第 3 个副本——**三项约束在每次放置时必须同时重算，任何一维越界都不得放行**。
 
-核对显存时，从调度侧读 `hami_vgpu_memory_allocated_bytes`，从设备插件侧读 `hami_vgpu_memory_limit_bytes` 和 `hami_vgpu_memory_used_bytes`，三者分别是调度分配、运行时上限和已用量。用同一时间、GPU 和工作容器对应三项。以增量分配结果检查限额，以固定输入下的单跑和并跑检查节流与尾延迟。 [HAMi v2.11.0 观测来源](https://project-hami.io/docs/core-concepts/observability) · [HAMi v2.11.0 实时用量指标](https://project-hami.io/docs/userguide/monitoring/real-time-device-usage)
+## 调度器与设备插件的注解交接协议
 
-## Flexible MIG 的规格选择、预留与交付
+原生 Kubernetes 只靠 `Node.status.allocatable` 传整数总量，HAMi 如何把“具体选中哪张物理卡、给多少 MiB 和算力”从调度器安全交给节点上的设备插件？全靠一组结构化的 Node 与 Pod 注解完成状态接力：
 
-现在把 A 的 12,288 MiB 需求带到 Flexible MIG。这个模式由 HAMi 在已准备为 MIG 的 GPU 上，按请求选择 Profile 并在启动容器时创建硬件实例。节点配置用 `operatingmode: mig`，Pod 可以用 `nvidia.com/vgpu-mode: "mig"` 指定该模式。仍请求 `nvidia.com/gpu: 1` 和 `nvidia.com/gpumem: 12288`，此处用所选 Profile 验收硬件计算资源。 [HAMi v2.11.0 Flexible MIG 配置](https://project-hami.io/docs/userguide/nvidia-device/dynamic-mig-support)
+```mermaid
+flowchart
+    accDescr: 新 Pod 经 HAMi Webhook 指定 hami-scheduler，调度器读取节点 hami.io/node-nvidia-register 逐卡账本，将选中设备写入 Pod 分配注解，kubelet 调用 HAMi Device Plugin 完成分配与 HAMi-core 注入，并将 bind-phase 置为 success。
+    P["新推理 Pod\n(gpu/gpumem/gpucores)"] --> W["HAMi Mutating Webhook\n接管调度器名称"]
+    W --> S["hami-scheduler\n读节点逐卡账本并选卡"]
+    S -->|"写 vgpu-devices-allocated"| K["kubelet 触发 Allocate"]
+    K --> DP["HAMi Device Plugin\n注入 HAMi-core 或建 MIG"]
+    DP -->|"bind-phase: success"| R["容器启动并生效限额"]
+```
 
-1. **筛规格和窗口。** 假定 `migProfileAllowlist` 只允许 `2g.10gb` 和 `3g.20gb`，前者的实际容量不足 12 GiB。后一规格的 NVML（NVIDIA Management Library，NVIDIA 管理库）报告容量足够，且 A100 有一处合法空窗 4–7 时，调度器可以为 A 预留该父 GPU、Profile 和 `start: 4, size: 4`。若 0、4 两个窗口的起点都被已有小实例占用，A 等待可用位置。
-2. **落实预留。** `hami.io/vgpu-mig-allocations` 先记录父 GPU、Profile 和位置。节点端 `Allocate` 重新检查设备状态，在预留位置建 GI 与 CI，注入 MIG 设备并补上 `migUUID` 等身份。
-3. **回收。** Pod 结束后，HAMi 回收该 Pod 的实例，释放对应位置供后续创建。检查实际回收时，将注解里的实例身份和宿主机枚举对在一起。 [HAMi v2.11.0 预留和实例生命周期](https://project-hami.io/docs/userguide/nvidia-device/dynamic-mig-support#reservation-and-instance-lifecycle) · [NVIDIA A100 Profile](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/supported-mig-profiles.html#a100-mig-profiles)
+*图 14-05-01：HAMi 逐卡调度与设备插件注解交接流程。调度器决定落卡与配额，插件在节点端落实注入并回写状态。*
 
-按需创建时，平台依据逐卡的合法空窗判断新请求。预建 `mixed` 资源池则依据已经发布的 `nvidia.com/mig-3g.20gb` 数量判断。采用默认资源名时，本例让 HAMi 和 NVIDIA Device Plugin 各自管理独立的节点池，避免同节点上报同一资源名。GPU Operator 可继续管理驱动等组件，目标卡的 MIG 实例由单一管理路径负责。实际注入兼容性、MIG 模式启用和回收需在选定平台验证。 [HAMi 安装前提与 GPU Operator](https://project-hami.io/docs/installation/prerequisites) · [Flexible MIG 与 MIG Manager 的迁移条件](https://project-hami.io/docs/userguide/nvidia-device/dynamic-mig-support)
+线上核对一次 HAMi 分配是否真正落地，重点核查下面两处对象记录：
+
+| 对象位置 | 关键注解 / 字段 | 排障与核对含义 |
+| --- | --- | --- |
+| **Node** | `.status.allocatable` 与 `hami.io/node-nvidia-register` | `allocatable` 给出名额总数；注册注解中的 `id`、`count`、`devmem`、`devcore` 精确登记每张物理卡的 UUID 与原始容量，调度时实时扣除已绑 Pod 份额。 |
+| **Pod** | `hami.io/vgpu-devices-allocated`、`hami.io/vgpu-devices-to-allocate`、`hami.io/bind-phase` | 前两者记录调度选定的目标卡 UUID 与待交付清单；插件完成交付后 `bind-phase` 由 `allocating` 变为 `success`，失败则标记为 `failed`。 |
+
+## HAMi-core 软件显存硬墙与 Kernel 节流
+
+在默认软件共享模式下，HAMi Device Plugin 在容器启动时把用户态拦截库 **HAMi-core** 注入容器并接管 CUDA 调用路径，提供两道软件隔离机制：
+
+1. **显存分配硬拦截（挡住 KV Cache 连坐 OOM）**：每当推理进程调用 CUDA 申请显存，HAMi-core 都会实时累加该容器的已用显存并对照其 `gpumem` 限额。例如某推理副本的上限是 `12,288 MiB`，当前已驻留 `10,240 MiB`（权重 + 存量 KV Cache），此时突发长上下文再申请 `3,072 MiB`：
+
+$$10,240 + 3,072 = 13,312\ \text{MiB} > 12,288\ \text{MiB}$$
+
+   **即使底层物理卡还空着十几 GiB 显存，这笔被拦截的申请也会立刻返回 OOM**。超限服务自己触发请求拒绝或限流，绝不会把同卡邻居拖下水。
+2. **基于令牌的 Kernel 算力节流（`gpuCorePolicy`）**：HAMi-core 通过发放和消耗时间令牌约束 Kernel 提交速率，对应容器环境变量 `GPU_CORE_UTILIZATION_POLICY` 支持三种策略：
+   - **`default`**：仅当同卡存在相同或更高优先级的其他容器同时运行 Kernel 时触发节流；卡上只剩自己跑时，虽然 `30%` 依然记在调度账本上，但运行时可以弹性吃满整卡空闲算力。
+   - **`force`**：无论邻居是否活跃，始终严格按 `gpucores` 上限压制提交速率，适合需要稳定基准压测或防止冷启动突刺的场景。
+   - **`disable`**：彻底关闭算力节流，仅保留显存硬拦截。
+
+> [!warning] 常见误区：软件限额挡得住 OOM，挡不住 HBM 带宽争抢
+> HAMi-core 是用户态拦截方案。它通过拦截 CUDA 内存分配完美隔离了显存上限，并通过令牌放缓了 Kernel 提交节奏，但**物理 SM、L2 缓存与 HBM 内存通道依然归同卡所有容器共享**。邻居一旦发起高带宽 Decode 洪峰，本服务的 TPOT 仍可能产生抖动。此外，安全边界高度依赖容器内拦截库不被特权绕过。
+
+核对 HAMi-core 显存账目是否一致，可将三项核心监控指标按同一时刻、同一物理卡和同一容器并排比对：`hami_vgpu_memory_allocated_bytes`（调度器账本分配量）、`hami_vgpu_memory_limit_bytes`（插件注入的运行时上限）与 `hami_vgpu_memory_used_bytes`（实时已用量）。
+
+## Flexible MIG：按需预留、动态建切片与自动回收
+
+如果业务既想要 **MIG 的物理级 HBM 带宽与 P99 隔离**，又不想忍受静态预建池的高碎片和手动排空，HAMi `v2.11.0` 提供了 **Flexible MIG** 模式——在已开启 MIG 模式的物理卡上，按 Pod 显存需求实时匹配最小合法 Profile 并现场建出硬件实例。
+
+管理员先在节点配置中将目标卡声明为 `operatingmode: mig`，推理 Pod 只需沿用同样的 `gpumem` 字段并加上一条注解即可触发按需硬件切分：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: infer-14b-dyn-mig
+  annotations:
+    nvidia.com/vgpu-mode: "mig"    # 指示 HAMi 使用 Flexible MIG 而非软件拦截
+spec:
+  containers:
+    - name: llm-engine
+      image: vllm/vllm-openai:latest
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          nvidia.com/gpumem: 12288 # 需求 12 GiB，由调度器自动匹配最小可用 MIG Profile
+```
+
+这套按需硬件交付走过严谨的三步生命周期：
+
+1. **筛 Profile 与预留窗口**：设 `migProfileAllowlist` 仅允许 `2g.10gb` 与 `3g.20gb`。调度器按 NVML 实报容量淘汰 `2g.10gb`，自动选中 `3g.20gb` 并核查几何空窗：若 `4–7` 空闲则预留 `start: 4, size: 4`，若 `0` 与 `4` 均被占则排队等待。
+2. **节点落实建实例**：预留信息经由 `hami.io/vgpu-mig-allocations` 注解下发到节点。kubelet 调用 `Allocate` 时，插件重新核验物理卡状态，现场在预留窗位创建 GI 与 CI，把生成的 MIG 设备注入容器并回填 `migUUID`。
+3. **退出即回收**：Pod 结束运行后，HAMi 自动拆除对应的 CI 与 GI，第一时间把该物理放置窗口还回池中，供下一批不同规格的在线推理服务复用。
+
+> [!warning] 节点池归属红线：严禁双重管理同一张物理卡
+> 采用默认 `nvidia.com/gpu` 资源名时，**HAMi 节点池与 NVIDIA Device Plugin 节点池必须物理隔离**，禁止两个插件在同一节点争抢上报同一资源名。
+>
+> 同时，开启 Flexible MIG 的物理卡必须把硬件切分权独占交给 HAMi，不可与 GPU Operator 的 MIG Manager 同时托管同一张卡（驱动与 Toolkit 仍可继续由 GPU Operator 托管）。
+
+## 五维工程评估：HAMi-core vs HAMi Flexible MIG
+
+| 工程维度 | HAMi-core（软件显存/算力限额） | HAMi Flexible MIG（按需动态硬件切片） |
+| --- | --- | --- |
+| **显存硬隔离** | **强（软件拦截硬墙）**。越界申请立刻被拦截 OOM，彻底阻断 KV Cache 溢出连坐邻居。 | **极强（物理级）**。容器拿到的就是真实 MIG 硬件 GI，显存与控制器彻底物理隔离。 |
+| **算力与 HBM 带宽干扰** | **中度干扰**。令牌节流限制了 SM 占空比，但 L2 缓存与 HBM 显存通道仍共享。 | **极低（物理级）**。HBM 带宽、L2 缓存与 SM 切片全链路硬件隔离，同卡并跑近乎零干扰。 |
+| **P99 尾延迟表现** | **中—良**。明显优于 Time-Slicing，但高并发 LLM Decode 混跑仍存在带宽争抢尾延迟波动。 | **极佳**。运行期隔离效果等价于静态 MIG，可稳定承接严格 TTFT/TPOT P99 SLO。 |
+| **卡内碎片率** | **极低**。支持 MiB 级任意显存切分与 1% 级算力切分，装箱密度极高。 | **中等**。仍受离散 MIG Profile 与合法放置窗口约束，但退出即回收大幅减少了长期闲置碎片。 |
+| **运维灵活性** | **极高**。无需重启卡、无需排空邻居，按 Pod YAML 随时动态申请任意比例。 | **高**。相比静态预建池免去了人工改标签和整卡排空重配，但需在目标平台严验建删与回收稳定性。 |
+
+> [!summary] 核心结论
+> 在在线推理池里，**HAMi-core** 是“低成本防 OOM 连坐 + 高密度混跑”的利器，适合非核心在线推理、测试环境与中小模型高密部署；**HAMi Flexible MIG** 则把硬件物理隔离和动态调度揉在了一起。当然，在大量集群里静态 MIG 预建池依然是运维最成熟的主流方案——下一篇我们完整走一遍静态 MIG 重配置到监控归因的闭环。
+
+> [!info]- 参考资料
+> - **HAMi 架构、版本与配置参数**：[HAMi 核心架构文档](https://project-hami.io/docs/core-concepts/architecture)、[HAMi v2.11.0 发行说明](https://github.com/Project-HAMi/HAMi/releases/tag/v2.11.0)、[HAMi v2.11.0 Helm Chart values.yaml](https://raw.githubusercontent.com/Project-HAMi/HAMi/v2.11.0/charts/hami/values.yaml)、[HAMi 安装前提与 GPU Operator 协作](https://project-hami.io/docs/installation/prerequisites)
+> - **逐卡调度与交接协议**：[HAMi 逐卡调度机制](https://project-hami.io/docs/core-concepts/scheduling)、[HAMi 调度器与插件交接协议](https://project-hami.io/docs/developers/protocol)
+> - **软件资源隔离与观测指标**：[HAMi 软件显存与设备隔离](https://project-hami.io/docs/key-features/device-resource-isolation)、[HAMi 算力节流与 gpuCorePolicy](https://project-hami.io/docs/key-features/device-resource-isolation#compute)、[HAMi 可观测性架构](https://project-hami.io/docs/core-concepts/observability)、[HAMi 实时设备用量指标](https://project-hami.io/docs/userguide/monitoring/real-time-device-usage)
+> - **Flexible MIG 按需切分**：[HAMi v2.11.0 Flexible MIG 配置指南](https://project-hami.io/docs/userguide/nvidia-device/dynamic-mig-support)、[HAMi Flexible MIG 预留与实例生命周期](https://project-hami.io/docs/userguide/nvidia-device/dynamic-mig-support#reservation-and-instance-lifecycle)、[NVIDIA A100 MIG Profile 规格表](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/620/supported-mig-profiles.html#a100-mig-profiles)

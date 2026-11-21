@@ -1,39 +1,98 @@
 # InfiniBand 子网管理、P_Key 分区与 IPoIB
 
-A0 和 B0 各通过一个原生 InfiniBand（IB）端口连接同一台交换机。A0 要通过可靠连接（RC）的队列对（QP）写入 B0 的主机内存。线缆训练完成之后，端口还需要获得子网地址，交换机也需要知道该从哪里去 B0。负责配置这些信息的是子网管理器（Subnet Manager，SM）。OpenSM 是一种 SM 实现，可以运行在接入 fabric 的主机上。具备相应能力的交换机也可承载 SM。 [IETF RFC 4392，§2](https://www.rfc-editor.org/rfc/rfc4392) · [NVIDIA InfiniBand Cluster Bring-up Procedure](https://docs.nvidia.com/infiniband-cluster-bring-up-procedure.pdf)
+插好光纤、给交换机和服务器通电后，如果搭的是普通以太网，交换机很快就能靠自学习 MAC 地址跑通二层转发。但在原生 InfiniBand（IB）集群里，你常常会遇到一个经典困惑：**光纤灯全绿、物理链路显示 `LinkUp`，可机器之间却一个包都发不出去，端口死死卡在 `Initializing` 状态。**
 
-## 从物理链路到按 LID 转发
+原因在于 IB 网络没有“自发泛洪学习”这一套机制。它的交换机转发表、端口地址和访问隔离，全部依赖一个大脑统一算好再下发——这就是 **Subnet Manager（SM，子网管理器）**。
 
-先看这个子网的正常过程。线缆两端完成链路训练后，当前主 SM 可以借助管理报文发现设备和端口，并据此建立拓扑。它分配子网内使用的本地标识符（LID），计算路径并向交换机下发转发表，同时配置分区及端口属性，使端口进入可承载正常数据流量的 `Active` 状态。子网管理服务里的子网管理员（Subnet Administrator，SA）处理查询。客户端可以请求 PathRecord，取得建连所需的路径属性，比如 LID、路径最大传输单元（MTU）和服务级别。完成准备后，A0 发往 LID `19` 的数据由交换机查表送往 B0。拓扑发生变化时，SM 可重新计算和配置。 [IETF RFC 4392，§2.1](https://www.rfc-editor.org/rfc/rfc4392#section-2.1) · [NVIDIA InfiniBand Cluster Bring-up Procedure](https://docs.nvidia.com/infiniband-cluster-bring-up-procedure.pdf)
+## 一、没有 Subnet Manager，IB 只是插着线的孤岛
 
-下面是按 rdma-core v57.0 字段构造的 A0 两次快照，其余端口字段省略。用 `ibstat` 同看物理和逻辑状态，用 `sminfo` 查询 SM。 [rdma-core v57.0，ibstat 源码](https://github.com/linux-rdma/rdma-core/blob/v57.0/infiniband-diags/ibstat.c) · [NVIDIA InfiniBand Cluster Bring-up Procedure，查询主 SM](https://docs.nvidia.com/infiniband-cluster-bring-up-procedure.pdf#page=41)
+在 IB 架构里，整个互联网络被称为 **Fabric**。你可以把 **Subnet Manager（SM）** 想象成整个高铁网的“总调度中心”：光把铁轨铺好（物理链路训练完成）远远不够，必须等总调度中心盘点完所有车站、编好站号并下发时刻表，列车才能发车。
 
-| 观察 | 链路已训练，子网尚未完成初始化 | 子网初始化后 |
-| --- | --- | --- |
-| `Link layer` | `InfiniBand` | `InfiniBand` |
-| `Physical state` | `LinkUp` | `LinkUp` |
-| `State` | `Initializing` | `Active` |
-| `Base lid` | `0` | `18` |
-| `SM lid` | `0` | `1` |
-| 从 A0 查询 SM | 未取得回应 | 取得 LID `1` 的主 SM 信息 |
+常见的开源 SM 实现是 **OpenSM**，它既可以作为守护进程跑在某台接入集群的 Linux 主机上，也可以直接内嵌在具备管理能力的 IB 交换机里。为防单点故障，生产集群通常会部署主备多个 SM，由优先级最高者成为主 SM（Master SM）。
 
-第一次采样表明链路训练已经完成，接下来应从 SM 所在端核对主 SM 状态、它连接的 fabric 以及发现列表。A0 未收到查询响应也可能是管理路径尚未建立。第二次采样可以继续用 `ibtracert` 核对 `18 → IB 交换机 → 19` 的子网路径，随后再查这次 RC 建连使用的分区。管理探测和应用数据各自经过相应的权限检查。 [NVIDIA InfiniBand Cluster Bring-up Procedure](https://docs.nvidia.com/infiniband-cluster-bring-up-procedure.pdf) · [rdma-core v57.0，ibtracert 源码](https://github.com/linux-rdma/rdma-core/blob/v57.0/infiniband-diags/ibtracert.c)
+一条原生 IB 链路从插上线缆到真正能传输业务数据，严格走完下面四个步骤：
 
-## P_Key 的分区号与成员资格
+1. **物理链路训练**：线缆两端网卡与交换机完成电/光信号协商，物理状态变为 `LinkUp`，但此时端口逻辑状态仍为 `Initializing`，无地址也无转发表。
+2. **拓扑发现与地址分配**：主 SM 发送管理报文（SMP）扫描全网设备与连线，为每个端口分配子网唯一的 **LID**，同时计算无环最优路径，把转发表下发给全网 IB 交换机。
+3. **激活端口与下发策略**：SM 为各端口配置分区规则和链路属性，把端口逻辑状态推进到 **`Active`**。此时数据面才真正放行。
+4. **路径查询与业务转发**：SM 伴生的 **子网管理员（Subnet Administrator，SA）** 负责响应客户端的 `PathRecord` 查询，返回对端 LID、路径 MTU 和服务级别。客户端据此完成 RC 建连，交换机随后按目的 LID 线速转发。
 
-同一交换网络可以为不同工作负载划分通信范围。IB 的分区由分区键（Partition Key，P_Key）标识，SM 为端口配置 P_Key 表。一个键的低 15 位是分区号，最高位为 1 表示完整成员，为 0 表示受限成员。要通过两个端点的分区检查，分区号须相同，且至少有一端使用完整成员的键。应用设置 QP 时提供的是本地 `pkey_index`。索引给出查表的位置，两端索引可以不同。在 Linux 上可分别读取 `/sys/class/infiniband/<设备>/ports/<端口>/pkeys/<索引>`，将应用使用的本地索引还原成实际键值。 [IETF RFC 4392，Partitioning](https://datatracker.ietf.org/doc/html/rfc4392#section-2.2) · [rdma-core，ibv_modify_qp](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_modify_qp.3) · [Linux v6.6，P_Key 表 sysfs ABI](https://docs.kernel.org/6.6/admin-guide/abi-stable.html)
+## 二、用 `ibstat` 与 `sminfo` 辨认子网初始化状态
 
-以下为 OpenSM `partitions.conf` 的教学片段。端口全局唯一标识符（GUID）使用占位值，前者代表 A0，后者代表 B0。实际文件中的其他分区项省略。 [OpenSM 分区配置格式](https://raw.githubusercontent.com/linux-rdma/opensm/master/doc/partition-config.txt)
+排查原生 IB 不通时，第一步永远是区分“线没通（物理层）”还是“SM 没接管（逻辑层）”。下面是 `rdma-core v57.0` 中 `ibstat` 与 `sminfo` 在子网初始化前后的典型输出对照（以 `node-1` 的 `mlx5_0` 端口 1 为例）：
+
+```bash
+# 1. 现象：光纤已插好，但主 SM 尚未启动或管理路径未通
+$ ibstat mlx5_0 1
+Port 1:
+    State: Initializing               # 逻辑未激活：不能收发业务 RDMA 流量
+    Physical state: LinkUp            # 物理层正常：光模块和线缆协商成功
+    Base lid: 0                       # 未分到 LID，明确指向 SM 未下发配置
+    SM lid: 0                         # 尚不知道主 SM 在哪
+    Link layer: InfiniBand
+
+# 2. 主 SM 接管并完成全网配置后复查
+$ ibstat mlx5_0 1
+Port 1:
+    State: Active                     # 逻辑已就绪，可承载正常数据面流量
+    Physical state: LinkUp
+    Base lid: 18                      # 已获得本端口的 LID 18
+    SM lid: 1                         # 主 SM 位于 LID 1
+    Link layer: InfiniBand
+
+# 3. 进一步核对主 SM 身份并追踪到对端（LID 19）的转发跳数
+$ sminfo
+sminfo: sm lid 1 sm guid 0x0002c90300000001, activity count 1024 priority 15 state 3 SMINFO_MASTER
+$ ibtracert 18 19                     # 核对 LID 18 -> IB 交换机 -> LID 19 的逐跳路径
+```
+
+把这两次采样压缩成排查口诀就是：**`LinkUp + Initializing + Base lid 0` 查 SM 服务与管理连通性；`LinkUp + Active + 有 LID` 之后，再查 `ibtracert` 与分区权限。**
+
+## 三、P_Key 分区隔离：为什么链路全绿还是建连失败？
+
+多租户或多业务共享同一套 IB Fabric 时，需要把不同工作负载圈在各自的逻辑隔离域里。IB 用 **P_Key（Partition Key，分区键）** 实现类似以太网 VLAN 的隔离，但它比普通 VLAN 多了一层**成员角色校验**。
+
+每个 16 位 P_Key 由两部分拼成：
+- **低 15 位**：分区号（例如 `0x0021`），代表归属哪个逻辑隔离域。
+- **最高位（第 15 位）**：成员资格位。**`1` 表示完整成员（Full Member）**，如 `0x8021`；**`0` 表示受限成员（Limited Member）**，如 `0x0021`。
+
+> [!summary] P_Key 互通铁律
+> 两个端点能否通过分区检查，必须同时满足两条规则：
+> 1. 两端使用的 P_Key **低 15 位分区号完全相同**；
+> 2. 两端中**至少有一端是完整成员**（Full ↔ Full 可通，Full ↔ Limited 可通，**Limited ↔ Limited 互相禁止通信**）。
+
+这种设计非常巧妙：如果把存储服务器设为完整成员、把多台租户计算节点设为受限成员，所有计算节点都能访问共享存储，但租户彼此之间在硬件层就完全不可见。
+
+下面是一段精简的 OpenSM `partitions.conf` 配置，展示了如何在同一套 Fabric 上同时划分训练分区 `Train` 与诊断分区 `Diag`（端口 GUID 分别对应发起节点 `node-1` 与接收节点 `node-2`）：
 
 ```text
+# 分区名=分区号[,属性] : 端口GUID=成员角色, ... ;
 Train=0x0021 : 0x0002c903000000a1=full, 0x0002c903000000b1=limited ;
 Diag=0x0022,ipoib : 0x0002c903000000a1=full, 0x0002c903000000b1=full ;
 ```
 
-最初 A0 的 `Train` 表项为 `0x8021`，B0 为 `0x0021`。两端 QP 分别选中这两个表项后，低 15 位同为 `0x0021`，且 A0 是完整成员，满足这项检查。若把 A0 也改为 `limited`，等待配置生效并确认两端 QP 都选中新的受限表项，则两端仍属于 `0x0021`，但已没有完整成员。这对 QP 无法通过分区检查。链路可继续保持 `LinkUp`，端口也可保持 `Active`。 [IETF RFC 4392，Partitioning](https://datatracker.ietf.org/doc/html/rfc4392#section-2.2) · [OpenSM 分区配置格式](https://raw.githubusercontent.com/linux-rdma/opensm/master/doc/partition-config.txt)
+按上述配置生效后，发起节点在 `Train` 分区拿到的键值是 `0x8021`（Full），接收节点拿到的是 `0x0021`（Limited），两端可以正常通信。应用配置 QP 时传入的是本地表索引 `pkey_index`（两端索引号可以不同），运维时可以直接读 Linux sysfs 把索引还原成真实键值：
 
-## 同一 fabric 上的 IPoIB 与原生 RDMA
+```bash
+# 查看本地端口 1 的 P_Key 表项，确认 QP 选用的索引对应哪一个 16 位键值
+$ cat /sys/class/infiniband/mlx5_0/ports/1/pkeys/0
+0x8021
+```
 
-IP over InfiniBand（IPoIB）让 Linux 以 IP 网络接口的方式使用 IB。应用通过 IPoIB 接口发 `ping` 时，ICMP 经 IP 和 `ib_ipoib` 驱动封装到 IB 上。原生 RC Write 则沿所选 RDMA QP 使用 IB 传输。一些工具还可在 IPoIB 上开 Socket 来交换建连信息，随后在原生 RC QP 上传送测试载荷。 [Linux v6.2，IP over InfiniBand](https://docs.kernel.org/6.2/infiniband/ipoib.html) · [IETF RFC 4392](https://www.rfc-editor.org/rfc/rfc4392)
+如果有人把 `Train` 分区里发起节点的配置误改成 `limited` 并重载，两端虽然都还在 `0x0021` 分区里、端口也依然显示 `LinkUp` 和 `Active`，但此时两端变成了 **Limited ↔ Limited**，硬件会直接拦截这对 QP 的报文。
 
-假设两端 Linux 都创建了 `ib0.8022` 子接口，P_Key 为 `0x8022`，对应上例的 `Diag` 分区。核对接口的 `pkey` 和所用源 IP 后，一次成功的 `ping` 可以确认这两个地址在 `Diag` 上有 IP 往返。此时 `Train` 里的两个受限成员仍不能通信。要确认 `Train` 的数据路径，应核对指定两端端口上的 P_Key 表项，并在该分区执行一次 RC 写入，检查完成状态和目标缓冲区内容。 [Linux v6.2，IPoIB Partitions and P_Keys](https://docs.kernel.org/6.2/infiniband/ipoib.html)
+## 四、IPoIB 能 `ping` 通，不代表原生 RDMA 能跑通
+
+Linux 内核提供了 **IPoIB（IP over InfiniBand，`ib_ipoib` 驱动）**，能把 IB 端口虚拟成一个标准的 Linux IP 网卡（例如 `ib0` 或子接口 `ib0.8022`）。很多分布式启动器或测试工具会借用 IPoIB 跑 SSH、TCP 建连握手或 `ping` 探测，随后再切到原生 RC QP 传输海量张量。
+
+这就埋下了一个极易踩坑的诊断盲区：**IPoIB 和原生 RDMA 业务走的是两套完全不同的路径与分区检查。**
+
+假设两台节点都在 `Diag` 分区（`0x8022`）上建了子接口 `ib0.8022`。此时执行 `ping`，ICMP 报文经由 IP 协议栈和 `ib_ipoib` 驱动封装，走的是 `0x8022` 分区——即便 `ping` 延迟漂亮、零丢包，也只能说明两台机器在 `Diag` 分区上的 IP 往返是通的。
+
+> [!warning] 常见误区：切忌用 IPoIB 的 `ping` 替原生 RDMA 担保
+> 上例中，哪怕 `Diag`（`0x8022`）的 IPoIB `ping` 一切正常，`Train`（`0x0021`）里两个受限成员的原生 RC 通信依然是断的。验证业务真正依赖的原生 IB 路径时，必须核对两端 QP 绑定的实际 `pkey_index` 对应键值，并在该分区直接执行一次原生 RDMA 写入与完成校验。
+
+> [!info]- 参考资料
+> - **IB 子网管理与分区规范**：[RFC 4392 · IP over InfiniBand (IPoIB) §2.1](https://www.rfc-editor.org/rfc/rfc4392#section-2.1)、[IETF RFC 4392 §2.2（IPoIB 分区与组播）](https://datatracker.ietf.org/doc/html/rfc4392#section-2.2)、[NVIDIA InfiniBand Cluster Bring-up Procedure（Master SM 查询）](https://docs.nvidia.com/infiniband-cluster-bring-up-procedure.pdf#page=41)
+> - **OpenSM 与诊断源码**：[OpenSM Partition Configuration Format](https://raw.githubusercontent.com/linux-rdma/opensm/master/doc/partition-config.txt)、[rdma-core v57.0 `ibstat.c`](https://github.com/linux-rdma/rdma-core/blob/v57.0/infiniband-diags/ibstat.c)、[rdma-core v57.0 `ibtracert.c`](https://github.com/linux-rdma/rdma-core/blob/v57.0/infiniband-diags/ibtracert.c)
+> - **Verbs 与内核接口**：[rdma-core `ibv_modify_qp(3)`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_modify_qp.3)、[Linux Kernel InfiniBand sysfs ABI](https://docs.kernel.org/6.6/admin-guide/abi-stable.html)、[Linux Kernel IP over InfiniBand（IPoIB）](https://docs.kernel.org/6.2/infiniband/ipoib.html)

@@ -1,51 +1,59 @@
+# GPUDirect Storage 的直达路径与验证
 
-普通文件读取先把数据交给主机，再由训练进程把输入张量搬到 GPU。**GPUDirect Storage（GDS）** 提供另一条受支持的文件 I/O 路径：CPU 上的应用通过 cuFile 接口提交文件偏移、长度和目标 GPU 缓冲，符合条件的存储设备可以把文件载荷直接 DMA 到显存。它改变的是数据搬运路径，不负责选择样本、解码图像或决定 Rank 怎样通信。 [NVIDIA GDS 架构](https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html)
+前面四篇里，数据从 NVMe 进显存总要在主机内存里倒一手。字节先进内核页缓存，再进应用缓冲，最后才走 H2D 过一遍 PCIe。盘和 GPU 明明挂在同一台服务器的 PCIe Switch 下，为什么非要多绕主机内存一圈？
 
-为了隔离这段路径，本篇改用一个独立主例：同一节点的 NVMe 上保存已经预处理好的定长张量记录，应用可以把这些记录直接交给 GPU 消费或继续处理。它不再使用第 01 篇需要 CPU 解码的压缩图像，避免把预处理位置变化误算成 GDS 的 I/O 收益。
+**GPUDirect Storage（GDS）** 就是为了裁掉这段主机折返跑而生的。应用通过 **cuFile** 接口递交文件句柄、偏移、长度与目标显存地址。符合条件的存储控制器即可经 PCIe 点对点 DMA，把文件载荷直接写进 GPU 显存。
 
-## 普通读取、GDS 直达与兼容路径的差别
+为了纯看搬运路径本身，本篇切到一个干净的单机场景。本地 NVMe 上存放着已经预处理好的定长张量记录，读进显存就能直接算（在线推理用 `fastsafetensors` 直读权重、或从本地 NVMe 换入 KV 块也是典型落地场景）。如果数据仍是需要 CPU 解码的压缩图像，单换读取接口无济于事。
 
-最小正常请求需要四类输入：一个已打开并注册的文件句柄、文件内偏移与长度、目标 GPU 缓冲地址及缓冲内偏移、足够的平台与挂载支持。CPU 仍负责打开文件、注册句柄、提交 cuFile I/O 和处理完成状态；直达指的是**有效载荷不经过应用的主机数据缓冲和随后的 H2D**，不是“不再需要 CPU 或软件栈”。
+## 一、普通缓冲读、GDS 直达与兼容路径
+
+直达的本质是**载荷数据绕开了主机内存与应用 H2D**。但控制流依然归 CPU 管：打开文件、注册句柄、下发 `cuFileRead` 与回收完成状态，全都要靠主机线程发起。
 
 ![三栏使用相同的单机拓扑。左栏中，载荷经页缓存和应用缓冲进入显存。中栏中，NVMe 经 PCIe Switch 将载荷直接送到显存缓冲。右栏中，载荷经主机缓冲进入显存。蓝色虚线表示三种路径都由 CPU 提交 I/O。](images/fig-09-05-01-gds-read-paths.png)
 
-*图 09-05-01｜同一台节点上的三种 NVMe 读取路径。橙色箭头表示载荷，蓝色虚线表示 I/O 控制。左右两栏的 H2D 箭头概括搬运起点和终点，实际路径经 CPU 侧 PCIe 根端口和 Switch。中栏假定设备拓扑、文件请求和目标缓冲满足直达条件。*
+*图 09-05-01：同一台节点上的三种 NVMe 读取路径。橙色实线为数据载荷，蓝色虚线为 CPU 发起的 I/O 控制。中栏直达要求设备拓扑、文件请求与目标显存缓冲同时满足后端条件。*
 
-| 路径 | 载荷怎样到达 GPU | 主机数据缓冲与 H2D | 判断重点 |
+把图里的三条路径拆成一张对照表，差异一目了然：
+
+| 读取路径 | 数据载荷流经的物理站 | 是否经主机数据缓冲与 H2D | 核心工程判断点 |
 | --- | --- | --- | --- |
-| 普通缓冲读取 | NVMe → 页缓存 → 应用缓冲 → 页锁定/暂存缓冲 → GPU | 需要 | 热页缓存可省后端读，但不能省主机处理和 H2D |
-| GDS 直达 | NVMe 经可用的 PCIe 路径 → GPU 缓冲 | 省去这条应用主机数据路径 | 文件、请求、设备、驱动与挂载均须满足实际后端条件 |
-| cuFile 兼容路径 | cuFile 通过支持的主机/POSIX 路径取得数据，再交给 GPU | 仍有主机侧阶段 | 是否经过页缓存取决于打开方式和实选路径，不能统称为直达 |
+| **普通缓冲读取** | NVMe → 页缓存 → 应用缓冲 → 锁页缓冲 → GPU | 是 | 热页缓存能省读盘，但主机拷贝、CPU 消耗与 H2D 照跑 |
+| **GDS 直达** | NVMe → PCIe P2P DMA → GPU 显存缓冲 | 否（绕开主机内存） | 省下主机内存带宽与 CPU 搬运，但严苛依赖软硬件条件 |
+| **cuFile 兼容路径** | cuFile 借道 POSIX/主机缓冲取回数据，再 H2D 入显存 | 是（自动降级回退） | 保证程序不报错中断，但吞吐与开销退回主机中转模式 |
 
-图中直接路径是一种逻辑简化。在未显式注册目标缓冲的某些情形或其他请求条件下，cuFile 还可能先使用内部 GPU 缓冲，再在 GPU 内搬到用户缓冲；这类设备内部中转与“经主机内存”不是一回事。具体请求也可能因不对齐、文件系统或后端不支持而采用内部缓冲、转兼容路径或返回错误，须按当时 API 返回和路径记录判断。 [GDS 缓冲注册与最佳实践](https://docs.nvidia.com/gpudirect-storage/pdf/best-practices-guide.pdf)
+底层直达路径还有两处容易看混的细节：
+- **显存内部中转 ≠ 主机中转**：若未提前用 `cuFileBufRegister` 注册复用显存缓冲，或单次请求对齐不佳，cuFile 可能先 DMA 到一块内部 GPU 暂存区，再在卡内拷到目标地址。这仍属于设备内部搬运，和退回主机内存截然不同。
+- **远端 GDS 与 NCCL GDR 各管各的**：受支持的并行文件系统或 RDMA 存储同样支持远端 GDS，由网卡把远端载荷直接送进显存。但第 06 章的 GPUDirect RDMA 解决的是网卡通信，NCCL 日志里的 GDR 标志只覆盖集合通信，无法替代 cuFile 对文件 I/O 的核验。本机 NVMe 走 GDS 更无需额外加装 RDMA 网卡。
 
-受支持的远端文件系统也能提供 GDS 候选路径：客户端仍解析文件与存储协议，受支持的 RDMA 存储路径可由 NIC 把载荷送入 GPU 可访问的缓冲。这里要求文件系统、客户端、服务端与网络栈共同支持。第 06 章的 **GPUDirect RDMA（GDR）** 说明 NIC 能访问已映射 GPU 内存，NCCL 日志中的 GDR 选择也只覆盖通信路径；它们都不能替代 cuFile 对本次文件 I/O 的验证。本地 NVMe GDS 则不需要因为名称中有 GPUDirect 就额外加入一张 RDMA NIC。 [GDS 本地及远程存储路径](https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html)
+## 二、决定请求能否走直达的三道门槛
 
-## 文件、缓冲与软件栈共同决定候选路径
+调用了 `cuFileRead` 且顺利拿到数据，距离“真正走了 GDS 直达”还差着三道硬门槛。
 
-### 文件句柄与 O_DIRECT 不是同一个判断
+### 1. 文件句柄与 `O_DIRECT` 标志
 
-应用通过 `cuFileHandleRegister` 注册已打开文件，再向 `cuFileRead` 提供目标 GPU 缓冲、文件偏移、缓冲偏移和长度。挂载与文件系统必须支持所选后端。
+应用先打开目标文件，再用 `cuFileHandleRegister` 注册句柄，随后提交偏移、长度与 GPU 缓冲地址。
 
-CUDA 12.2 / GDS 1.7 起，cuFile 也接受未使用 `O_DIRECT` 打开的文件描述符；有可用直接路径时，这类请求仍可能走 GDS，否则在允许兼容模式时可经兼容路径并使用页缓存。`O_DIRECT` 表达的是绕过主机页缓存的直接 I/O 要求，并不指定 DMA 的目的地一定是显存。因此，看到该标志既不能单独证明 GDS，也不能把没有该标志一概判为普通读取。 [GDS O_DIRECT 指南](https://docs.nvidia.com/gpudirect-storage/o-direct-guide/index.html) · [cuFile API](https://docs.nvidia.com/gpudirect-storage/api-reference-guide/)
+很多人习惯把 `O_DIRECT` 当成 GDS 开关，其实混淆了两层语义。`O_DIRECT` 只表达“跳过主机页缓存的直接 I/O”，并不指定目的地是显存。反过来，从 CUDA 12.2（GDS 1.7）起，cuFile 也接受未带 `O_DIRECT` 打开的文件描述符。只要直达路径可用，请求照样走 GDS；不可用且允许兼容模式时，再退回 POSIX 路径。
 
-### 缓冲、偏移与长度决定请求能否直接处理
+### 2. 偏移、长度与显存缓冲对齐
 
-需要核对 GPU 地址是否有效、缓冲偏移与文件偏移怎样对齐、请求长度是否满足所选文件系统和后端要求。教学对照可以使用 4 KiB 对齐的 GPU 缓冲、4 KiB 整倍数的文件与缓冲偏移，并完整读取一条 1 MiB 记录；这是为了减少特殊分支而设的示例，不是所有后端的统一最低要求。
+直达后端对对齐极为敏感。工程上通常准备 **4 KiB 对齐的 GPU 缓冲**，按 **4 KiB 整数倍**设置文件与缓冲偏移，并整块读取连续记录（例如单次读 `1 MiB`）。对复用的显存缓冲，建议显式调用 `cuFileBufRegister` 避免内部中转。一旦出现非对齐切片或后端不支持该文件系统，cuFile 便可能静默降级到兼容路径，甚至直接报错。
 
-复用缓冲时可用 `cuFileBufRegister` 显式注册，以避免某些路径的内部 GPU 中转。若请求不对齐或文件不受当前后端支持，应查实际返回值和统计，区分内部中转、POSIX 兼容与错误，不能把“调用有数据返回”当成路径证明。 [GDS API 使用与对齐建议](https://docs.nvidia.com/gpudirect-storage/pdf/best-practices-guide.pdf)
+### 3. 硬件拓扑与上游 PCI P2PDMA 后端
 
-### PCI P2PDMA 是特定版本与平台上的直接后端
+早期本地 NVMe 走 GDS 强依赖内核模块 `nvidia-fs` 与驱动补丁，内核升级维护成本很高。从 CUDA 12.8（GDS 1.13）起，Linux x86_64 平台引入了基于主线内核 **PCI P2PDMA** 的上游直达路径。单盘 NVMe 可直接跳过 `nvidia-fs` 补丁实现卡盘直通。
 
-传统 GDS 本地 NVMe 路径依赖 `nvidia-fs` 等组件。CUDA 12.8 / GDS 1.13 起，受支持的 Linux x86_64 NVMe 组合可以使用上游内核 **PCI P2PDMA（PCI Peer-to-Peer DMA）**，从而避开传统路径对 `nvidia-fs` 和定制 NVMe 驱动补丁的依赖。
+> [!note] 版本与平台说明：对齐 `CUDA 13.2.1` 与上游 PCI P2PDMA
+> 按本书统一基线（Ubuntu 24.04 LTS、Linux 6.8+、OpenRM R595、`CUDA 13.2.1` 内置 `cuFile 1.17.0.44`），单盘 XFS 本地 NVMe 已原生满足上游 PCI P2PDMA 的软件条件。
+>
+> 历史上不同官方指南对最低驱动口径略有差异（架构文档记为 OpenRM R570+，部署指南记为 R565.47+；RHEL 9.4 的 5.14 内核亦通过回移植支持）。若涉及多盘软 RAID、NVMe 多路径或远端并行存储，须查具体存储支持矩阵。
 
-本篇版本对照限定为 CUDA 12.9 Update 1、cuFile 1.14.1.1、H100、单盘 XFS、Linux x86_64。若选择 Ubuntu 22.04，GDS 历史发行条目列出的内核条件为 6.2 或以上。NVIDIA 软件架构概览对该 P2PDMA 路径列出 OpenRM R570 或以上，另一 NVMe 部署指南列出 OpenRM 565.47 或以上；两处官方口径不同，本篇不合并成无条件的统一最低版本。CUDA 12.9 Update 1 发行说明列出的 Linux 驱动为 575.57.08，可作为同时满足上述两个条件的 R575 OpenRM 候选，但仍须按实际路径启用相应设置。RHEL 9.4 的 5.14 内核条目说明发行版可能回移植能力，不能只按主版本号推断功能。单盘条件也避开了该上游路径的 RAID 与 NVMe 多路径限制。 [GDS 软件架构与 P2PDMA 条件](https://docs.nvidia.com/gpudirect-storage/overview-guide/software-architecture.html) · [NVMe P2PDMA 部署前置条件](https://docs.nvidia.com/deploy/gds-support-for-nvme/latest/pre-installation-steps.html) · [GDS 发行说明的历史 v1.13/v1.14 条目](https://docs.nvidia.com/gpudirect-storage/release-notes/new-features-and-changes.html) · [CUDA 12.9 Update 1 组件版本](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-toolkit-release-notes/index.html)
+## 三、配置开关与三层取证闭环
 
-这些条件共同描述一个待核验的文档示例，不表示上述组件已经在本章环境中联合运行。还要在实际机器上确认内核 PCI P2PDMA 能力、GPU 与 NVMe 的 PCIe 可达性、目标文件所在挂载和当前后端。其他文件系统、远程挂载与 RAID 组合应查对应支持矩阵，而不是从单盘 XFS 外推。
+开启兼容回退（`allow_compat_mode: true`）后，直达条件哪怕没满足，程序也会悄悄退回主机拷贝照常跑完。因此生产验收绝不能只看“读出数据没报错”，必须把配置开关和三层取证闭环起来。
 
-## 从平台能力到本次请求的实走证据
-
-下面是一份**教学配置节录**，用于说明需要观察的开关；使用时应合并进已安装版本实际读取的 `/etc/cufile.json`，省略项保持该版本默认或既有配置，不是一份已执行的完整文件。两个 `use_pci_p2pdma` 分别位于通用属性和 NVMe 块设备属性中，选择该上游 P2PDMA 路径时须同时启用。允许兼容路径后，条件不满足时应用仍可能成功读回数据，所以成功返回并不证明直达。 [GDS NVMe P2PDMA 的 cufile.json 设置](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/nvme-p2pdma-troubleshooting.html#cufile-json-settings) · [GDS 兼容模式诊断](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/advanced-troubleshooting.html#gds-and-compatibility-mode)
+启用上游本地 NVMe P2PDMA 时，须在 `/etc/cufile.json` 的**全局属性和 NVMe 块设备属性两处**同时打开 `use_pci_p2pdma`：
 
 ```json
 {
@@ -64,18 +72,39 @@ CUDA 12.2 / GDS 1.7 起，cuFile 也接受未使用 `O_DIRECT` 打开的文件�
 }
 ```
 
-验证要分三层取证。
+配置生效后，按“平台候选能力 → 进程实走路径 → 同条件 A/B 对比”三层逐级取证：
 
-1. **平台有哪些候选能力。** 用 `findmnt -T /path/to/records.bin` 确认目标文件实际位于哪个挂载，用 `lspci -t` 核对 GPU 与 NVMe 的层级，再运行安装版本附带的 `gdscheck -p` 查看候选模式。若输出 `NVMe: p2pdma, compat`，说明工具报告两类候选，不说明某个请求已经选择前者。
-2. **本次请求走了哪类 I/O。** 用 `gds_stats -p <pid> -l 3` 查看活动进程统计，并按目标版本核对每 GPU 的请求计数 `n`、POSIX 计数 `posix`、不对齐计数 `unalign` 和数据量 `MiB`。在单独的短诊断轮次开启 `logging.level=TRACE`，若对应请求记录 `cufile IO mode: POSIX`，可确认该请求经过兼容路径。TRACE 会增加开销，不应混入性能计时。 [gds_stats 示例](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/gds-library-tracing.html#example-displaying-sample-user-level-statistics-for-each-gds-process) · [用户态计数字段](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/user-space-counters-in-gpudirect-storage.html#distribution-of-io-usage-in-each-gpu) · [兼容模式日志](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/advanced-troubleshooting.html#gds-and-compatibility-mode)
-3. **直接请求使用哪个后端。** 结合该版本暴露的 P2PDMA 统计与后端选择记录判断。`/proc/driver/nvidia-fs/stats` 只覆盖 `nvidia-fs` 模块处理的请求，缺少其计数既可能是走了上游 P2PDMA，也可能是走了兼容路径，必须结合前两层证据。若统计把两种直接后端合并，可在只启用一种直接后端的隔离环境中做对照。 [P2PDMA 与 nvidia-fs 的统计边界](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/nvme-p2pdma-troubleshooting.html#statistics) · [nvidia-fs 驱动统计](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/displaying-gds-nvidia-fs-driver-statistics.html)
+```bash
+# 第一层：核对挂载、PCIe 层级与平台支持的候选模式
+findmnt -T /mnt/nvme/records.bin      # 确认目标文件确实落在本地 XFS/NVMe 挂载上
+lspci -t                              # 确认 NVMe 与目标 GPU 之间的 PCIe 拓扑可达
+gdscheck -p                           # 查看候选后端；看到 "NVMe: p2pdma, compat" 仅说明具备候选能力
 
-工具字段与输出随版本变化，上述命令和字段是文档对照，实际目标文件、请求和性能均需在目标 Linux GPU 节点核实。 [GDS 1.14 用户态统计变更](https://docs.nvidia.com/gpudirect-storage/pdf/release-notes.pdf)
+# 第二层：采集活动进程实时统计，核实本次请求到底有没有静默降级
+gds_stats -p <pid> -l 3               # 重点盯每卡总请求 n、兼容降级计数 posix、非对齐 unalign 与 MiB
+# 若怀疑静默回退，在短时诊断轮打开 logging.level=TRACE（切勿带入性能压测）：
+# 日志出现 "cufile IO mode: POSIX" 即铁证已退回兼容路径
 
-## 端到端收益取决于这段 I/O 是否在关键路径上
+# 第三层：对照直达对比基准，用环境变量强制回退做同条件 A/B 测速
+CUFILE_FORCE_COMPAT_MODE=true ./read_records_bench
+```
 
-性能对照应保持文件、偏移、请求大小、目标缓冲、并发和处理位置一致。先运行已经核实为 P2PDMA 的直接路径，再用 `CUFILE_FORCE_COMPAT_MODE=true` 运行同一程序，分别记录实际模式、缓存状态、I/O 完成时间、CPU 成本和批次可用时刻。普通缓冲读取的热页缓存基线应另列，因为“直达与兼容”和“冷读与热读”是两个不同变量。 [GDS 配置与基准指南](https://docs.nvidia.com/gpudirect-storage/configuration-guide/index.html) · [GDS 环境变量](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/installing-gpudirect-storage.html#environment-variables-used-by-gpudirect-storage)
+> [!warning] 常见误区：`/proc/driver/nvidia-fs/stats` 没增长 ≠ 没走 GDS
+> `/proc/driver/nvidia-fs/stats` 只统计经过传统 `nvidia-fs` 模块的请求。采用主线内核 PCI P2PDMA 时，请求根本不经过 `nvidia-fs`。该文件计数为零，既可能是成功走了上游 P2PDMA，也可能是退回了兼容路径。必须结合 `gds_stats` 里的 `posix` 计数、TRACE 日志与 P2PDMA 专属统计交叉核验。
 
-假设一次直接读取比兼容路径少 6 ms，但这段读取原本完全藏在前一批 125 ms 的计算期间，队列始终有下一批可用，那么局部 I/O 提前 6 ms 而稳态步时可以不变。CPU 时间、主机内存路径占用与缓冲余量是否改善，应分别测量；相同记录的有效载荷字节也不会仅因直达而减少。若批次经常因这段 I/O 晚到，且没有更下游的共享瓶颈，提早完成才可能缩短步时。对仍需 CPU 解码的压缩图像，还必须重新设计预处理在哪里发生，不能只替换读取 API 就宣称整条数据管线加速。
+## 四、局部 I/O 快了，整步就一定快吗
 
-下一篇把这种“局部缩短是否传到整步”的判断放进多 Rank 时间线，并与存储、CPU、H2D、通信和显存证据一起分析。
+做 GDS 收益对比时，务必固定文件、偏移、请求大小、缓冲、并发度与缓存冷热状态。先跑确认走 P2PDMA 的直达组，再用 `CUFILE_FORCE_COMPAT_MODE=true` 跑同条件兼容组。普通缓冲读的热页缓存基线则应单独列出，切忌把“直达 vs 兼容”和“冷读 vs 热读”混在一起测。
+
+就算确认单次读取比兼容路径快了 **6 ms**，端到端训练步时也未必缩短。假如这次读取原本藏在前一批 `125 ms` 的计算期间，且预取队列从未见底，提前 `6 ms` 交货只是让数据在队列里多等 `6 ms`。训练步时依然稳稳停在 `125 ms`。
+
+> [!summary] 核心结论：什么时候 GDS 真正值回票价
+> 1. **I/O 站在关键路径上**：例如在线推理扩容时加载百 GB `safetensors` 权重（`fastsafetensors`）、训练故障恢复读大块 Checkpoint，或从本地 NVMe 突发换入长上下文 KV 缓存。此时没有长计算可掩盖读取，省下的每一毫秒都直接缩短启动 RTO 或首字延迟。
+> 2. **主机内存带宽或 CPU 告急**：即便端到端步时未变，绕开主机内存也能释放大量 CPU 周期与 DRAM 带宽，缓解多卡争用。反之，若样本仍须 CPU 解码，就必须先把解码迁往 GPU（如 DALI）或提前预处理，单换 API 无法加速整条管线。
+
+单机局部直达讲清了。但在多机训练集群里，慢步往往伴随存储抖动、CPU 抢占、H2D 阻塞和集合通信拉长同时出现。下一篇我们站回多 Rank 全局时间线，学一套百试百灵的逐段隔离排障法。
+
+> [!info]- 参考资料
+> - **GPUDirect Storage 架构与最佳实践**：[NVIDIA GDS Overview Guide](https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html)、[GDS Software Architecture](https://docs.nvidia.com/gpudirect-storage/overview-guide/software-architecture.html)、[GDS Best Practices Guide (PDF)](https://docs.nvidia.com/gpudirect-storage/pdf/best-practices-guide.pdf)、[GDS O_DIRECT Guide](https://docs.nvidia.com/gpudirect-storage/o-direct-guide/index.html)、[cuFile API Reference](https://docs.nvidia.com/gpudirect-storage/api-reference-guide/)
+> - **上游 PCI P2PDMA 部署、版本与发行说明**：[CUDA 13.2 Release Notes](https://docs.nvidia.com/cuda/archive/13.2.0/release-notes/index.html)、[GDS Release Notes · New Features & Changes](https://docs.nvidia.com/gpudirect-storage/release-notes/new-features-and-changes.html)、[GDS Release Notes (PDF)](https://docs.nvidia.com/gpudirect-storage/pdf/release-notes.pdf)、[NVMe P2PDMA Pre-Installation Steps](https://docs.nvidia.com/deploy/gds-support-for-nvme/latest/pre-installation-steps.html)、[GDS Configuration Guide](https://docs.nvidia.com/gpudirect-storage/configuration-guide/index.html)
+> - **配置、统计与故障诊断**：[NVMe P2PDMA `cufile.json` Settings](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/nvme-p2pdma-troubleshooting.html#cufile-json-settings)、[P2PDMA Statistics](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/nvme-p2pdma-troubleshooting.html#statistics)、[GDS & Compatibility Mode](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/advanced-troubleshooting.html#gds-and-compatibility-mode)、[`gds_stats` Library Tracing](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/gds-library-tracing.html#example-displaying-sample-user-level-statistics-for-each-gds-process)、[User-Space Counters per GPU](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/user-space-counters-in-gpudirect-storage.html#distribution-of-io-usage-in-each-gpu)、[Displaying `nvidia-fs` Driver Statistics](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/displaying-gds-nvidia-fs-driver-statistics.html)、[GDS Environment Variables](https://docs.nvidia.com/gpudirect-storage/troubleshooting-guide/installing-gpudirect-storage.html#environment-variables-used-by-gpudirect-storage)

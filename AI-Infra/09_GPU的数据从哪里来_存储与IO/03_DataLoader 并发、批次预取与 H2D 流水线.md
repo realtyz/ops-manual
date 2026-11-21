@@ -1,124 +1,154 @@
+# DataLoader 并发、批次预取与 H2D 流水线
 
-前两篇已经知道一批数据要经过哪些阶段，以及存储为何可能晚交付。连续训练还有另一条优化空间：GPU 处理第 N 批时，主机可以准备第 N+1 批。这样的流水线能把某些等待移出关键路径，却不会消除读取、解码和拷贝本身。判断它是否有效，要分别看**持续生产能力、队列中的余量和跨批依赖**。
+每一步训练若都死等“读文件 → 解码 → 拷显存 → 开算”排成直线，GPU 大半时间都在晒太阳。连续训练的提速诀窍，在于把这几个阶段错开做流水：GPU 算第 $N$ 批时，主机已经把第 $N+1$ 批备好了。
 
-## 三层预取提前完成不同的工作
+可工程里常碰到两类怪现象。一是把 `prefetch_factor` 调得老高，GPU 照样干等数据。二是把 `num_workers` 翻倍，训练步反而更慢，甚至把容器内存撑爆。要彻底看透原因，必须把**持续生产能力、队列缓冲余量和设备真重叠条件**拆开算。
 
-“预取”在不同层次指不同动作，不能用一个开关概括。
+## 一、三层“预取”，各管一段等待
 
-| 层次 | 提前准备什么 | 可以隐藏哪段等待 | 主要代价与限制 |
+大家口头常说的“预取”，在操作系统、框架和 CUDA 里其实是三件不同的事。每一层只管隐藏自己那一段等待，谁也替代不了谁。
+
+| 预取层次 | 提前准备什么 | 能隐藏哪一段等待 | 主要代价与上限 |
 | --- | --- | --- | --- |
-| 文件预读 | 预计即将访问的文件数据页 | 后续读取等待后端 I/O 的时间 | 随机访问可能命中少；无用预读消耗后端带宽和页缓存 |
-| DataLoader 批次预取 | 加载 worker 已读取、解码并整理的主机批次 | 训练进程取下一批时的主机生产等待 | 消耗 CPU、共享存储请求、进程间传递和主机内存 |
-| 设备拷贝流水线 | 已提交或已完成 H2D 的下一批设备输入 | 计算 Stream 等待 H2D 的时间 | 需要页锁定源缓冲、拷贝资源、独立目标槽位和正确的 Stream/Event 依赖 |
+| **内核文件预读** | 预测即将读取的连续文件页（`readahead`） | 后续读盘等待后端存储 I/O 的时间 | 随机读命中率低；无效预读白耗后端带宽与页缓存 |
+| **DataLoader 批次预取** | 由加载 worker 提前读完、解码并整理好的 CPU 张量批次 | 训练主进程取批时的主机生产等待 | 消耗 CPU 核、共享存储并发、IPC 传递与主机内存 |
+| **设备拷贝流水线** | 提前提交给拷贝 Stream 的下一批 H2D 显存输入 | 计算 Stream 等待 H2D 搬运完成的时间 | 依赖页锁定内存、拷贝引擎、双缓冲槽位与 Event 同步 |
 
-文件页已经预读，只说明后端字节可能更接近应用；CPU 解码和批整理仍要执行。DataLoader 预取把主机批次也提前做好，训练进程拿到的是 CPU 张量。再向后，训练进程提前提交 H2D，才有机会让下一批拷贝与前一批设备计算重叠。 [Linux readahead](https://man7.org/linux/man-pages/man2/readahead.2.html) · [PyTorch 2.9 DataLoader](https://docs.pytorch.org/docs/2.9/data.html) · [CUDA 12.9 拷贝与计算重叠](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-c-programming-guide/index.html#overlap-of-data-transfer-and-kernel-execution)
+内核预读把文件页拉进了内存，但图片还没解码。DataLoader 预取把 CPU 张量排进了队，但数据还没过 PCIe。只有把第三层异步 H2D 也接上，GPU 才真正不断流。
 
-## 从串行、单 worker 到双 worker 推导稳态间隔
+## 二、从完全串行到双 worker：推导稳态出批间隔
 
-下面是一个独立的**时间算例**，仍使用每 Rank 每步一批、目标设备阶段 125 ms 的主例。设每批：
+拿一组清晰的耗时参数算笔流水账。沿用单步目标 `125 ms` 的训练场景，设单批各阶段耗时为：
+- 存储读取 $R = 50\text{ ms}$；
+- CPU 解码与批整理 $P = 90\text{ ms}$；
+- H2D 拷贝 $H = 8\text{ ms}$；
+- GPU 计算与通信 $G = 125\text{ ms}$。
 
-- 文件读取 `R = 50 ms`；
-- CPU 解码与批整理 `P = 90 ms`；
-- H2D `H = 8 ms`；
-- GPU 计算与通信 `G = 125 ms`。
+这里忽略主机提交开销，假设缓冲充足，且 H2D 与 GPU 计算可在独立硬件引擎上并行推进。
 
-忽略主机提交开销，缓冲充足，H2D 和设备计算使用可独立推进的资源。先不考虑多 worker 之间的 CPU 或存储争用。
+### 1. 完全串行：批批死等
 
-### 完全串行：每批都从头等到尾
+不做任何跨批重叠时，每一批都从头跑到尾才开下一批，出批间隔直接相加：
 
-如果同一批依次完成读取、处理、H2D 和计算，且不同批次之间不重叠，出批间隔为：
+$$T_{\text{serial}} = R + P + H + G = 50 + 90 + 8 + 125 = 273\text{ ms}$$
 
-`T_serial = R + P + H + G = 50 + 90 + 8 + 125 = 273 ms`。
+在这种模式下，GPU 超过一半的时间都在等主机备料。
 
-第一批结果也在 273 ms 时完成。这个数描述没有跨批重叠的基线，不是任何 DataLoader 配置的固定延迟。
+### 2. 单 worker 流水：读取与解码绑在同一进程里
 
-### 单 worker 流水：读取与处理不能拆成两个独立阶段
+开启 1 个加载 worker 异步生产下一批。单个 worker 必须先读完本批、再解码本批，无法把 $R$ 和 $P$ 拆给两份批次同时执行。因此，主机生产阶段绑定为 $R + P = 140\text{ ms}$。
 
-一个加载 worker 串行完成一批的读取和处理，主机生产阶段就是 `R + P = 140 ms`。虽然下一批主机生产可以与前一批 H2D 或 GPU 工作重叠，但稳态出批间隔仍不能短于最慢阶段：
+整条流水线的稳态节奏受限于最慢的那一环：
 
-`T_1worker = max(R + P, H, G) = max(140, 8, 125) = 140 ms`。
+$$T_{\text{1worker}} = \max(R + P,\; H,\; G) = \max(140,\; 8,\; 125) = 140\text{ ms}$$
 
-这说明不能直接写成 `max(50, 90, 8, 125)`：该写法暗含读取与解码能同时处理不同批次，而单 worker 串行执行时并不满足。把队列加深只能暂时存放提前生产的批次，不能把长期平均生产间隔从 140 ms 降到 125 ms。
+> [!warning] 常见误区：别把单 worker 错算成 $\max(50, 90, 8, 125)$
+> 写成 $\max(50, 90, 8, 125) = 125\text{ ms}$，暗含的前提是读文件与解码能同时处理不同批次。单个同步 worker 做不到这一点。此时哪怕把预取队列加到 100 批，长期出批间隔依然卡死在 `140 ms`——因为每生产一批就要 `140 ms`，队列早晚被 `125 ms` 的消费节奏抽干。
 
-### 双 worker 流水：用两路生产提高主机阶段容量
+### 3. 双 worker 流水：用并发把主机产能拉过 GPU 红线
 
-改为每 Rank 两个加载 worker。假定两路能并行处理不同批次，存储和 CPU 资源足以让每批仍分别保持 50 ms 与 90 ms，且交付顺序不形成额外阻塞。每个 worker 平均 140 ms 生产一批，两路合计的理想平均生产间隔为：
+改为每 Rank 启 2 个加载 worker。若 CPU 核与存储带宽富余、两路互不拖累，每个进程仍需 `140 ms` 产出一批，合起来的平均间隔减半：
 
-`T_host,2 = (R + P) ÷ 2 = 70 ms`。
+$$T_{\text{host},2} = \frac{R + P}{2} = \frac{50 + 90}{2} = 70\text{ ms}$$
 
-于是整条流水线的理想稳态间隔为：
+此时主机产能（`70 ms/批`）终于跑赢 GPU 消化速度（`125 ms/批`），稳态间隔回到了 GPU 自身：
 
-`T_2workers = max(70, 8, 125) = 125 ms`。
+$$T_{\text{2workers}} = \max(70,\; 8,\; 125) = 125\text{ ms}$$
 
-| 方式 | 主机生产能力 | 理想稳态出批间隔 | 限制因素 |
+| 流水组织方式 | 主机侧生产能力 | 理想稳态出批间隔 | 决定节奏的瓶颈 |
 | --- | --- | ---: | --- |
-| 无跨批重叠 | 一批完成后才处理下一批 | 273 ms | 所有阶段串行相加 |
-| 单 worker 跨批流水 | 每 140 ms 一批 | 140 ms | 单路读取加处理 |
-| 双 worker 跨批流水 | 理想平均每 70 ms 一批 | 125 ms | GPU 计算与通信 |
+| **完全串行** | 一批全跑完才启动下一批 | `273 ms` | 四段耗时串行相加 |
+| **单 worker 跨批流水** | 每 `140 ms` 产出一批 | `140 ms` | 单路“读取 + 解码”产能 |
+| **双 worker 跨批流水** | 理想平均每 `70 ms` 产出一批 | `125 ms` | GPU 计算与集合通信 |
 
-双 worker 的第一份结果仍需经过完整的读取、处理、H2D 和计算，启动延迟不会因稳态间隔缩短而等比例下降。实际框架还可能按采样顺序交付批次；若前一批特别慢，后面已完成的批次也可能等待交付。
+落地时还要盯紧两个边界条件：
+- **首批冷启动不提速**：多 worker 改善的是稳态吞吐，第 1 批结果依然要完整走完 `273 ms`。若框架按采样顺序严格交付，前面某批偶发卡顿也会拦住后面已做好的批次。
+- **过度并发反噬产能**：假如 CPU 核紧张，开 2 个 worker 引发严重争抢，每批解码从 `90 ms` 拉长到 `220 ms`。此时主机平均产能反倒退回：
 
-再改变一个条件：若两个 worker 争用 CPU，使每批处理从 90 ms 拉长到 220 ms，读取仍为 50 ms，则两路理想平均生产间隔变为 `(50 + 220) ÷ 2 = 135 ms`，稳态间隔至少回到 135 ms。worker 数翻倍并没有违反资源约束，真正需要核对的是并发后各阶段的实际时长和合计能力。
+$$T_{\text{host,争用}} = \frac{50 + 220}{2} = 135\text{ ms} > 125\text{ ms}$$
 
-## 队列深度决定能吸收多少短时波动
+给 `num_workers` 加码前，务必实测并发后的单批耗时，别拿理想除法盲推。
 
-假设刚消费完一批，队列里另有两批已就绪，之后每 125 ms 消费一批。如果生产暂时停止，这两批分别覆盖 125 ms 和 250 ms 的消费点；到 375 ms 的第三个消费点时，还需要新批次已经到达。
+## 三、队列深度用来“扛抖动”，不是“变魔术”
 
-所以“有两批余量”描述的是可覆盖的消费点数，不是对所有故障都提供固定的 250 ms 免疫期。若长期平均生产速率低于消费速率，再深的队列最终也会耗尽；若平均产能足够，队列才有机会吸收短抖动。
+假设刚消费完当前批次，就绪队列里另有 2 个成品批次，消费节奏为每 `125 ms` 一批。后端存储若突然暂停，这 2 批余量可顶住 `125 ms` 和 `250 ms` 两个消费点。到了 `375 ms` 的第三个消费点，新批次就必须接上了。
 
-观察时应把两类现象分开：
+据此看取批等待（`next_batch_wait`），一眼就能分清两类病因：
+- **偶发尖峰后迅速恢复**：平均产能达标，队列只是被短时抖动打穿。适当留足少量队列余量，或排查瞬时抖动即可缓解。
+- **队列常年见底、步步等待**：长期产能低于消费速度。加再深的队列也只是多撑几秒，必须给存储或 CPU 解码扩容。
 
-- 偶发 `next_batch_wait` 尖峰，随后队列恢复：优先检查短时存储时延、CPU 调度或交付抖动。
-- 队列持续变空、取批等待反复出现：先比较长期生产与消费速率，再定位最慢阶段。
+## 四、PyTorch 2.9 DataLoader 关键参数与内存预算
 
-## DataLoader 参数对照与在途内存预算
-
-以下是传给**每个 Rank** 的 PyTorch 2.9 DataLoader 教学参数。固定批大小、采样器和 `collate_fn`。前两组比较同步加载与多进程预取，并按接口要求连带设置 `prefetch_factor`；后两组则分别只改变页锁定和预取深度。它们用于设计对照，不表示四组配置已在同一环境实测。
+在 PyTorch 2.9 中，控制加载流水线主要靠下面四个核心参数。调优时建议按单变量递进对照，把同步基线、多进程、锁页与预取深度的影响拆开看：
 
 ```python
-# 依次将一组字典展开为 DataLoader 的关键字参数
-dict(num_workers=0, prefetch_factor=None, pin_memory=False)
-dict(num_workers=4, prefetch_factor=2, pin_memory=False)
-dict(num_workers=4, prefetch_factor=2, pin_memory=True)
-dict(num_workers=4, prefetch_factor=4, pin_memory=True)
+from torch.utils.data import DataLoader
+
+# 典型生产配置：固定批大小与采样器，逐项核对并发、预取与锁页开关
+loader = DataLoader(
+    dataset,
+    batch_size=32,
+    sampler=sampler,
+    num_workers=4,           # 每 Rank 启动 4 个独立加载子进程；设为 0 时主进程同步加载
+    prefetch_factor=2,       # 每个 worker 最多预取 2 批（num_workers=0 时必须为 None）
+    pin_memory=True,         # 将返回给主进程的 CPU 批次拷贝至页锁定内存，供异步 H2D 使用
+    persistent_workers=True, # epoch 结束后保留子进程常驻，避免每轮重建进程与缓存冷启动
+)
 ```
 
-`num_workers=0` 表示由训练进程同步加载；此时 `prefetch_factor` 必须为 `None`。`num_workers=4` 表示每 Rank 使用四个加载子进程，它们在每次创建 DataLoader 迭代器时启动；只有设置 `persistent_workers=True` 才会在迭代结束后保留、供下一轮复用。`prefetch_factor=2` 表示每个 worker 预取两批，即全部 worker 合计 `4 × 2 = 8` 批的目标预取规模。多进程让一路等待存储时另一路可以继续处理，但 CPU 核、解码线程池、共享存储或进程间传递饱和后，增加 worker 也会增加排队。 [PyTorch 2.9 多进程加载、prefetch_factor 与 persistent_workers](https://docs.pytorch.org/docs/2.9/data.html#multi-process-data-loading)
+多进程预取很爽，但内存账单涨得极快。用双节点四卡作业算笔账：每 Rank 配 `num_workers = 4`、`prefetch_factor = 2`，每批解码后 CPU 张量大小为 `32 MiB`。
 
-**内存算例。** 四个 Rank 共 `4 × 4 = 16` 个加载 worker。按每 Rank 八批预取都已物化、每批 CPU 张量 32 MiB 估算：
+先算全作业的总加载进程数与每 Rank 的目标预取批次数：
 
-- 每 Rank：`8 × 32 MiB = 256 MiB`；
-- 每节点两个 Rank：512 MiB；
-- 全作业四个 Rank：1 GiB。
+$$N_{\text{workers,总}} = 4\text{ Rank} \times 4\text{ worker/Rank} = 16\text{ 个加载进程}$$
 
-这只是预取批次张量本身的部分预算，不是 DataLoader 总内存承诺。解码中间态、正在交付和消费的批次、页锁定复制期间可能同时存在的副本、进程地址空间与数据集元数据都要另计。加载进程通过共享内存传递张量时，还要检查 `/dev/shm` 的实际占用和限制。把 `prefetch_factor` 从 2 调为 4，在其他条件相同的理想估算下，每 Rank 预取张量部分从 256 MiB 增到 512 MiB。 [PyTorch 2.9 多进程内存说明](https://docs.pytorch.org/docs/2.9/multiprocessing.html#sharing-strategies)
+$$B_{\text{prefetch,单Rank}} = 4\text{ worker} \times 2\text{ 批/worker} = 8\text{ 批}$$
 
-## 页锁定、异步提交与真正的设备重叠
+假设预取队列填满，仅**在途成品张量**本身就要吃掉的主机内存为：
 
-`pin_memory=True` 让返回的主机张量位于页锁定内存。`.to(device, non_blocking=True)` 则请求尽可能异步地提交拷贝；两者结合提供了重叠机会，但并不保证设备上一定并行。还需要：
+$$M_{\text{单Rank}} = 8 \times 32\text{ MiB} = 256\text{ MiB}$$
 
-1. 源缓冲确实适合异步 DMA，设备有可用的拷贝引擎，实际传输与计算资源允许并发。
-2. 下一批 H2D 在拷贝 Stream 提交，其计算在另一 Stream 上通过 Event 等待对应拷贝完成。
-3. 不同批次使用独立的目标槽位，或等上一批消费者完成后才复用同一槽位。
-4. 主机在拷贝完成前不改写或释放源缓冲；设备目标缓冲也要等最后一个消费者完成才复用。
+$$M_{\text{单节点(2 Rank)}} = 2 \times 256\text{ MiB} = 512\text{ MiB}, \qquad M_{\text{全作业(4 Rank)}} = 4 \times 256\text{ MiB} = 1\text{ GiB}$$
+
+若顺手把 `prefetch_factor` 从 `2` 调成 `4`，每 Rank 仅预取成品张量就翻倍到 **512 MiB**（单节点 `1 GiB`）。
+
+> [!warning] 常见误区：别忘了“隐形内存”与 `/dev/shm` 上限
+> 上面算的只是预取成品张量的底价，远非 DataLoader 的真实内存峰值。解码中间态、正在消费的当前批次、`pin_memory` 复制瞬间并存的双份副本，以及 16 个 Python 进程的解释器与数据集索引，都会层层叠加。容器默认 `/dev/shm` 往往只有 `64 MiB`。PyTorch 多进程借共享内存传张量时，一旦在途批次撑破配额，作业会直接报 `Bus error` 崩掉。
+
+## 五、页锁定、异步提交与真正的拷贝计算重叠
+
+把 `pin_memory=True` 和 `.to(device, non_blocking=True)` 都加上，H2D 拷贝就会自动和 GPU 计算重叠吗？未必。这两个开关只算拿到入场券，想让硬件引擎真并行，还得凑齐四个条件：
+
+1. **源缓冲适合异步 DMA**：源张量落在页锁定内存，且 GPU 具备独立的拷贝引擎与可用带宽；
+2. **双流配合 Event 依赖**：下一批 H2D 提交到专门的拷贝 Stream，计算 Stream 通过 Event 等它落稳后再开算；
+3. **独立双缓冲槽位**：第 $N+1$ 批写进独立的显存槽位（槽 0 与槽 1 轮换），不覆盖正在算的第 $N$ 批；
+4. **守住缓冲生命周期**：H2D 完成前不改写或释放主机源缓冲，旧批次算完前也不提前复用旧显存槽位。
 
 ```mermaid
 sequenceDiagram
-    participant CPU as 训练进程
+    accDescr: 展示训练进程使用双缓冲槽位、独立拷贝 Stream、计算 Stream 与 CUDA Event 实现第 N 批计算与第 N+1 批 H2D 重叠的时序过程。
+    participant CPU as 训练主进程
     participant Copy as 拷贝 Stream
     participant GPU as 计算 Stream
-    CPU->>GPU: 提交第 N 批 Kernel，读设备槽 0
-    par 第 N 批设备计算
-        GPU->>GPU: 执行第 N 批 Kernel
-    and 准备第 N+1 批
-        CPU->>Copy: 从页锁定源缓冲提交 H2D，写设备槽 1
-        Copy->>Copy: 完成后记录 ready[N+1]
+    CPU->>GPU: 提交第 N 批 Kernel（读取设备槽 0）
+    par GPU 算第 N 批，拷贝引擎搬第 N+1 批
+        GPU->>GPU: 执行第 N 批前向与反向 Kernel
+    and 硬件并行推进
+        CPU->>Copy: 从页锁定缓冲异步提交 H2D（写入设备槽 1）
+        Copy->>Copy: H2D 完成后记录事件 ready[N+1]
     end
-    Copy-->>GPU: 计算 Stream 等待 ready[N+1]
-    GPU->>GPU: 执行第 N+1 批 Kernel
-    Note over Copy,GPU: 第 N+2 批若复用槽 0，还须等第 N 批消费完成
+    Copy-->>GPU: 计算 Stream 等待事件 ready[N+1]
+    GPU->>GPU: 立刻接续执行第 N+1 批 Kernel（读取设备槽 1）
+    Note over Copy,GPU: 第 N+2 批要复用设备槽 0，必须先等第 N 批消费完成
 ```
 
-图中的 Event 建立的是设备工作依赖，不是让主机空等。`.to()` 返回、H2D 在设备上完成、Kernel 开始执行是三个不同观测点。验证重叠时，应在 CPU/CUDA 时间线中对照主机提交、设备 H2D 区间和上一批 Kernel 区间；只有两个**设备区间实际相交**，才能确认发生了拷贝与计算重叠。 [CUDA 12.9 拷贝与计算重叠](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-c-programming-guide/index.html#overlap-of-data-transfer-and-kernel-execution) · [PyTorch 2.9 Tensor.to 的 non_blocking 契约](https://docs.pytorch.org/docs/2.9/generated/torch.Tensor.to.html) · [PyTorch 2.9 Profiler](https://docs.pytorch.org/docs/2.9/profiler.html)
+*图 09-03-01：基于双缓冲槽位与跨流 Event 的 H2D / 计算重叠时序。Event 建立 GPU 侧硬件依赖，不阻塞 CPU 继续发单。*
 
-若 H2D 在双路节点上反复变慢，还要回到第 04 章的拓扑：源缓冲实际页位于哪个 NUMA 节点，目标 GPU 接在哪一侧，两个 Rank 是否共享同向 PCIe 上行。至此，持续输入的读取、生产、缓冲和设备交接已经连成一条流水线。下一篇转向方向相反、突发更强的 Checkpoint 写出与恢复。
+> [!summary] 核心结论：验证重叠，只认设备时间线相交
+> 代码里 `.to(..., non_blocking=True)` 瞬间返回，仅说明主机入队完毕。数据何时拷完、拷贝和计算是否真正重叠，都要看 PyTorch Profiler 或 Nsight Systems 时间线。只有设备侧 H2D 区间与上一批 Kernel 区间在横轴上实际相交，重叠才算落地。若双路节点上 H2D 依然偏慢，请回到第 04 章排查锁页缓冲是否跨了 NUMA，或两张卡是否挤在同一条 PCIe 上行上。
+
+到这里，持续喂数的整条输入流水线就打通了。下一篇我们把数据流向彻底反转：训练跑得好好的，为什么一保存 Checkpoint，存储压力就瞬间暴涨几十倍？
+
+> [!info]- 参考资料
+> - **Linux 预读与 PyTorch DataLoader**：[Linux man-pages · `readahead(2)`](https://man7.org/linux/man-pages/man2/readahead.2.html)、[PyTorch 2.9 · Multi-process Data Loading](https://docs.pytorch.org/docs/2.9/data.html#multi-process-data-loading)、[PyTorch 2.9 · Multiprocessing Sharing Strategies](https://docs.pytorch.org/docs/2.9/multiprocessing.html#sharing-strategies)
+> - **异步拷贝、重叠与性能追踪**：[PyTorch 2.9 · `Tensor.to` 异步语义](https://docs.pytorch.org/docs/2.9/generated/torch.Tensor.to.html)、[PyTorch 2.9 · Profiler](https://docs.pytorch.org/docs/2.9/profiler.html)、[CUDA 13.2.1 Best Practices · Overlapping Transfers with Computation](https://docs.nvidia.com/cuda/archive/13.2.1/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation)

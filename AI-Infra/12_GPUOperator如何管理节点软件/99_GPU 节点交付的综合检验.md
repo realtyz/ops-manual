@@ -1,47 +1,100 @@
+# GPU 节点交付的综合检验
 
-集群已有 `gpu-h0` 和 `cpu-0`，你负责加入 `gpu-h1`。两台 GPU 节点各有两张独占的 H100 PCIe。主例使用 GPU Operator `v26.7.2`、Kubernetes v1.36、x86_64 Ubuntu 24.04 LTS、containerd 2.3、CDI 和 Device Plugin，NRI 关闭。以下均为教学记录。用给出的材料先作判断，再与参考推理对照，无需运行命令或使用 GPU。
+学完控制环路、init 启动门禁、Validator 边界、预装与离线制品链以及托管 DRA 后，我们用三组综合现场材料来检验整套排障与设计直觉。所有题目均可仅凭已有条件独立推导，建议先写下判断，再展开参考推理逐项核对。
 
-## 同一台节点的三个观测时点
+## 基础集群环境与角色映射
 
-安装时的 Helm 值中，`clusterPolicy.deployCR`、`driver.enabled`、`toolkit.enabled` 均为 `true`。线上 `ClusterPolicy.spec.driver.enabled` 和 `spec.toolkit.enabled` 同样为 `true`。插件 DaemonSet 模板要求 `nvidia.com/gpu.deploy.device-plugin=true`。假定 `gpu-h0` 始终有一个就绪插件，`cpu-0` 不匹配模板，其他 Pod 放置约束满足。
+主环境运行 **Kubernetes `v1.36`**、**GPU Operator `v26.7.2`**、**x86_64 Ubuntu 24.04 LTS** 与 **containerd `2.3.0`**，启用原生 CDI 与 Device Plugin，关闭 NRI 插件。节点构成如下：
 
-| 时点 | `gpu-h1` 的 Node 与组件 | 插件 DaemonSet 期望 / 当前 / 就绪节点数 | `gpu-h1` 的 GPU Capacity / Allocatable |
+| 语义角色 | 节点名 | 硬件规格 | 说明 |
+| --- | --- | --- | --- |
+| 普通 CPU 节点 | `cpu-0` | 无 GPU | 不匹配任何 GPU 组件模板 |
+| 已有就绪节点 | `gpu-h0` | 2 × H100 PCIe（整卡独占） | 默认始终有 1 个就绪插件 Pod |
+| 新入池目标节点 | `gpu-h1` | 2 × H100 PCIe（整卡独占） | 本次交付与排查的核心对象 |
+
+---
+
+## 现场材料一：新节点入池的三个观测时点
+
+安装时的 Helm 值与线上 `ClusterPolicy.spec` 中，`clusterPolicy.deployCR`、`driver.enabled` 与 `toolkit.enabled` 均为 `true`。插件 DaemonSet 模板要求节点带 `nvidia.com/gpu.deploy.device-plugin=true`，且其余放置约束均已满足。
+
+| 观测时点 | `gpu-h1` 节点与组件现场状态 | 插件 DaemonSet 期望 / 当前 / 就绪（节点） | `gpu-h1` GPU Capacity / Allocatable（整卡） |
 | --- | --- | ---: | ---: |
-| A | Node 已 `Ready`，已有 NFD 的 NVIDIA PCI 标签。插件部署标签与插件 Pod 都缺失。此刻 `ClusterPolicy` 显示 `ready`。 | 1 / 1 / 1 | 两键缺失 |
-| B | 插件部署标签已为 `true`。插件 Pod 已绑定 `gpu-h1`，其沙箱报告缺 `nvidia` handler。Toolkit 正等驱动，driver 主容器重启过。 | 2 / 2 / 1 | 两键缺失 |
-| C | 两台插件 Pod 已就绪。`gpu-h1` 的 Device Plugin 已上报两张卡，两张随后都被标为不健康。默认的 `plugin-validation` 查看 Node 容量。 | 2 / 2 / 2 | 2 / 0 |
+| **时点 A** | Node 已 `Ready`，已有 NFD 的 NVIDIA PCI 标签，但缺少插件部署标签与插件 Pod；此刻 `ClusterPolicy` 汇总显示 `ready`。 | `1 / 1 / 1` | 两键缺失 |
+| **时点 B** | 插件部署标签已变为 `true`；插件 Pod 已绑定 `gpu-h1`，但沙箱报错缺 `nvidia` handler；Toolkit 正等驱动，driver 主容器曾重启。 | `2 / 2 / 1` | 两键缺失 |
+| **时点 C** | 两台 GPU 节点的插件 Pod 均已就绪；`gpu-h1` 已上报两张卡，但两张随后均被标记为不健康；集群使用默认 `plugin-validation`（检查 Node 容量）。 | `2 / 2 / 2` | `2 / 0` |
 
-## 两种改变交付条件的材料
+## 现场材料二：混合预装与隔离网络驱动切换（变体一）
 
-**变体一。** 以健康的两节点主例为起点。`gpu-h0` 预装驱动，`gpu-h1` 继续由 Operator 安装驱动，Toolkit 和 Device Plugin 仍由 Operator 为两个池提供。将 `gpu-h1` 移到隔离网络，其 Ubuntu 24.04 节点的运行内核为 `6.8.0-52-generic`。传统 driver 镜像已从内网拉取，主容器报告包仓库不存在匹配的头文件。计划切换到 R595 预编译模式时，内核也计划升到 `6.8.0-53-generic`。内网镜像仓库清单只有 `595-6.8.0-52-generic-ubuntu24.04` 对应的预编译镜像。
+以健康的两节点主环境为起点，运维策略发生以下变更：
 
-**变体二。** 在独立的新建集群采用 `GPUCluster/gpu-cluster`，节点版本与主例相同，ComputeDomain 关闭，已有 `NVIDIADriver` 交付驱动。`GPUCluster` 报告 `ready`，`gpu-h1` 有 DRA 节点插件与两张整卡的 `ResourceSlice`。普通 Pod 引用整卡类 `gpu.nvidia.com` 的 Claim，`status.allocation` 显示已分配该节点上的一张卡。Pod 已绑定，节点插件的准备调用成功。containerd 在创建容器时报告无法解析返回的 CDI 全名。
+| 变更维度 | 现场条件与目标计划 |
+| --- | --- |
+| **维护分工调整** | `gpu-h0` 改为宿主机预装驱动，`gpu-h1` 继续由 GPU Operator 托管驱动；两个节点池的 Toolkit 与 Device Plugin 仍由 Operator 统一部署。 |
+| **离线当前故障** | `gpu-h1` 移入无公网的隔离网络，运行 Ubuntu 24.04 LTS，内核为 `6.8.0-52-generic`；传统 driver 镜像已从内网拉取成功，但主容器报错包仓库找不到匹配头文件。 |
+| **后续切换计划** | 团队计划将 `gpu-h1` 切到 R595 预编译驱动模式，并同步将内核升级至 `6.8.0-53-generic`；目前内网镜像仓库仅同步了 `595-6.8.0-52-generic-ubuntu24.04`。 |
+
+## 现场材料三：独立新集群的 `GPUCluster` 托管 DRA（变体二）
+
+另有一套独立新建的集群（节点 OS、K8s 与 containerd 版本与主环境一致），通过 Helm 启用了 `GPUCluster/gpu-cluster`（关闭 ComputeDomain），并由 `NVIDIADriver` 交付驱动：
+- `GPUCluster` 报告 `ready`，`gpu-h1` 上运行着 DRA 节点插件，并已发布包含两张整卡的 `ResourceSlice`。
+- 普通业务 Pod 引用整卡类 `gpu.nvidia.com` 的 `ResourceClaim`，其 `status.allocation` 显示已分配 `gpu-h1` 上的一张卡。
+- Pod 已绑定到 `gpu-h1`，DRA 节点插件的设备准备调用也返回成功，但 **containerd 创建容器时报错无法解析返回的 CDI 全名**。
+
+---
 
 ## 检验任务
 
-1. 沿 A 到 B 说明哪一层的输入变了，为什么期望数和当前数增加，就绪数仍为 1。分别指出 A 和 B 最先查哪项证据。
-2. 在 C 判断默认插件容量检查能否通过，并复算新 Pod 的 GPU 调度余量。若稍后仅恢复一张卡且没有已计入的 GPU 请求，推算新的容量与可分配量，说明如何继续验收。
-3. 在变体一给出两池的驱动维护安排。根据运行内核推导传统驱动缺少的包和切换后的预编译标签，说明各自到哪里查证。
-4. 在变体二指出哪几层已有完成证据，以及最该查的下一环。如果把这份 Helm 配置用到已有 `ClusterPolicy` 的集群，说明首先遇到哪项部署条件。
+1. **跟踪覆盖与阻塞（材料一 A → B）**：说明从 A 到 B 哪一层输入变了，为什么期望数与当前数升至 `2` 而就绪数仍为 `1`？分别指出 A、B 最先该查哪项证据。
+2. **拆解 Validator 盲区与余量复算（材料一 C）**：判断时点 C 默认 `plugin-validation` 能否通过，并复算新 Pod 调度余量。若稍后仅恢复一张卡且无已计入请求，推算新余量并说明下一步验收。
+3. **划分维护责任与离线制品依赖（材料二）**：给出两池驱动配置方案；推导传统驱动当前缺少的包名与切换预编译后的目标镜像标签，并说明各自查证入口。
+4. **定位托管 DRA 注入故障与迁移约束（材料三）**：指出哪些层级已有完成证据、最该查的下一环是什么；若把该 Helm 配置直接套用到已有 `ClusterPolicy` 的集群，首先违反哪项前提？
 
-## 参考推理
+---
 
-### 1. 用节点覆盖解释 DaemonSet 计数
+## 分步参考推理
 
-时点 A 的 PCI 标签已经有了，下一步对照 Operator 的部署标签、节点排除设置和实际 DaemonSet 模板。三个 1 都来自 `gpu-h0`，`ClusterPolicy` 的汇总无法证明 `gpu-h1` 已覆盖。到 B，策略保持为启用，改变的是节点的部署标签。`gpu-h1` 因此满足模板条件并有了插件 Pod，期望和当前从 1 变为 2。新插件缺少沙箱所需的 handler，使就绪数留在 1。Toolkit 还在等待驱动，尚不能配置运行时。先查 `gpu-h1` 上 `nvidia-driver-ctr` 的上一实例及内核日志，确定驱动卡在安装还是加载。
+> [!example]- 题 1 参考推理：用节点部署标签与 init 依赖解释 DaemonSet 计数变化
+> - **时点 A 的判断与首查**：NFD 的 PCI 标签已到位，三个 `1` 全部来自旧节点 `gpu-h0`，`ClusterPolicy` 汇总 `ready` 此时仅反映旧节点状态，尚未覆盖 `gpu-h1`。最先应核对 **Operator 部署标签、节点排除设置与插件 DaemonSet 模板选择器**，确认新节点为何缺 `nvidia.com/gpu.deploy.device-plugin=true`。
+> - **A → B 的输入变化**：集群策略开关没变，变的是**节点部署标签**（`gpu-h1` 变为 `true`）。新节点因此命中模板并建出插件 Pod，期望数与当前数同步升至 `2`。
+> - **就绪数停在 1 的原因与首查**：插件 Pod 缺 `nvidia` handler 无法建沙箱，根因是 Toolkit 仍在等驱动就绪，而 driver 主容器已重启过。最先应读 `gpu-h1` 上 `nvidia-driver-ctr` 的 `--previous` 日志与内核日志，区分包安装还是模块加载失败。
 
-### 2. 用健康上报计算调度余量
+> [!example]- 题 2 参考推理：破除默认容量探针盲区并复算调度余量
+> - **默认插件校验结果**：时点 C 中 `Capacity = 2`，满足默认 `plugin-validation`（`WITH_WORKLOAD="false"`）的“容量至少为 1”，因此**默认检查仍可能通过**。
+> - **时点 C 的调度余量复算**：两卡均不健康使 `Allocatable = 0`。无其他占卡请求时，调度余量为：
+>
+> $$\text{剩余可调度整卡数（时点 C）} = \text{Allocatable} - \text{已计入请求} = 0 - 0 = 0\text{ 张}$$
+>
+> - **单卡恢复后的状态**：仅恢复 1 张健康卡且 kubelet 写回后，`Capacity / Allocatable = 2 / 1`，调度余量为：
+>
+> $$\text{剩余可调度整卡数（单卡恢复后）} = 1 - 0 = 1\text{ 张}$$
+>
+> - **下一步验收**：提交带 `nodeSelector: kubernetes.io/hostname=gpu-h1`、申请 1 卡的普通 VectorAdd Pod。确认 `spec.nodeName=gpu-h1`，运行窗口内用 PodResources 核对设备 UUID，并以日志 `Test PASSED` 和退出码 `0` 确认计算通过。
 
-时点 C，`Capacity=2` 已满足默认 `plugin-validation` 的至少一张卡的容量检查。`Allocatable=0`，所以在没有其他请求的条件下，调度余量是 `0 − 0 = 0`。若一张卡恢复健康且 kubelet 已写回状态，则 `Capacity/Allocatable=2/1`，剩余一张。此时提交一个带目标节点选择器、申请一张 GPU 的普通 VectorAdd Pod。确认它被调度到 `gpu-h1`，用 PodResources 核对设备分配（需要在运行窗口取证），用 `Test PASSED` 和退出码 0 确认 CUDA 计算。这一次通过的范围是所测节点、设备与镜像。
+> [!example]- 题 3 参考推理：混合池维护分工与隔离网络双制品链核查
+> - **两池驱动方案**：保持全局 `driver.enabled: true`，仅在预装节点 `gpu-h0` 打单节点排除标签 `nvidia.com/gpu.deploy.driver=false`（禁用 `operands=false` 以免连 Toolkit 与插件一并排除）。这样 `gpu-h0` 驱动归节点团队，`gpu-h1` 归 Operator，两池共用托管 Toolkit 与插件。
+> - **传统驱动当前缺包**：镜像已从内网拉通，问题在第二段包源。按运行内核 `6.8.0-52-generic`，缺少精确头文件包 **`linux-headers-6.8.0-52-generic`**。应查 `repoConfig` 包源配置、内网仓库索引与容器日志。
+> - **预编译切换与升级**：内核升至 `6.8.0-53-generic` 后，R595 查询目标变为 **`595-6.8.0-53-generic-ubuntu24.04`**。现有 `-52-generic` 镜像对应旧内核，无法满足升级节点。切换前须核对 `v26.7` 预编译支持矩阵，并确认内网仓库已同步新标签与架构摘要。
 
-### 3. 从驱动维护方追到制品仓库
+> [!example]- 题 4 参考推理：锁定 DRA 最后一公里 CDI 解析与互斥前提
+> - **已有完成证据的层级**：`GPUCluster` 就绪与 DRA 插件运行证明协调与覆盖；`ResourceSlice` 证明两卡库存发布；`ResourceClaim` 的 `status.allocation` 与 Pod 绑定证明选卡与落点；准备调用成功证明设备准备完成。
+> - **最该查的下一环**：聚焦本机运行时 CDI 解析。把 DRA 插件返回的 CDI 全名，与 `gpu-h1` 上 containerd 生效的 `enable_cdi`、`cdi_spec_dirs` 及目录规格逐字比对（重发切片无效）。修通后用同形态 Claim 测试 Pod 验注入与 CUDA。
+> - **套用到老集群的前提冲突**：首先违反**集群策略互斥与新装前提**。`v26.7` 中 `GPUCluster` 与 `ClusterPolicy` 不能并存，且托管 DRA 仅支持独立新装，不支持从已有 `ClusterPolicy` 原地迁移。
 
-应保留全局 `driver.enabled=true`，只在 `gpu-h0` 使用 `nvidia.com/gpu.deploy.driver=false`，由节点团队维护其驱动。`gpu-h1` 仍由 Operator 管理，两个池继续部署 Toolkit 与设备插件。传统 driver 镜像既已拉到，先查其包源配置和日志，确认能否取到 `linux-headers-6.8.0-52-generic` 及其他所需依赖。换内核后，预编译模式应查 `595-6.8.0-53-generic-ubuntu24.04`。用支持矩阵核对 OS、内核变体和分支，再查内网镜像仓库是否有这个完整标签和目标架构的摘要。已备的 `-52-generic` 镜像对应旧内核。
+---
 
-### 4. 用 Claim 和容器事件定位 DRA 注入
+## 全章知识串联：节点软件如何托举集群算力
 
-`GPUCluster` 状态与目标节点插件表明协调与覆盖，ResourceSlice 表明已发布库存，Claim 的分配和 Pod 绑定表明所用设备与节点已确定。准备调用返回后，containerd 还要从本机 CDI 规格解析名称。比较插件返回的全名与运行时扫描目录里的规格，确认 `enable_cdi`、`cdi_spec_dirs` 和实际文件，再用相同形态的 Claim 消费者验证注入与 CUDA。若集群已有 `ClusterPolicy`，则不满足 `GPUCluster` 托管路径的集群前置条件。v26.7 的托管流程面向新装，两个策略不能并存。
+把第 12 章的七篇内容收束到同一条因果链上，无论是训练集群扩容还是推理池升级，所有运维与排障动作都落在这个骨架里：
 
-## 节点软件如何支撑资源交付
+1. **声明与纳管**：运维方借 Helm 与 `ClusterPolicy`（或新装 DRA 集群的 `GPUCluster`）声明期望软件栈。NFD 发现硬件，Operator 控制器打标维护模板，DaemonSet 把组件落到目标节点。
+2. **门禁与解耦**：节点上靠 init 容器建立“驱动 → Toolkit → Validator → Device Plugin/GFD/Exporter”的启动秩序。混合池的维护责任则收口到全局开关、单节点排除、`/run/nvidia/driver` 契约与 `NVIDIADriver` CR。
+3. **制品与验收**：离线与异构环境须分清镜像通道与内核包源通道（或预编译内核锁标签）。交付放行的唯一闭环标准，永远是业务形态 Pod 跑通调度、分配、CDI 注入与 CUDA 计算。
 
-把安装和使用放回同一张关系图，故障就可以落到一项具体的输入、执行者或输出。安装方交付策略和制品，控制器据此部署节点组件。组件准备驱动、资源库存和运行时，Kubernetes 再用库存放置工作负载，最终让进程使用设备。更换节点镜像、驱动制品或分配后端时，要从改变的输入起顺着这条关系验收。第 13 章将把同一种思路应用于高速网络交付，增加 NIC 驱动、附加网络和 Pod 内的数据路径。
+到这里，我们已经把 GPU 算力软件栈自动化交付给了 Kubernetes 节点。不过，多机训练的梯度同步与 PD 分离推理的跨机 KV Cache 迁移，光有 GPU 还不够，还需要 Pod 直接握住高速 RDMA 网卡。
+
+[第 13 章 Multus 与 RDMA：把高速网络交给 Pod](../13_Multus与RDMA_把高速网络交给Pod/00_内容大纲.md)将把同一套分层交付与排障思路延伸到高速网络设备栈。
+
+> [!info]- 参考资料
+> - **GPU Operator 故障排查与安装场景**：[NVIDIA GPU Operator 故障排查](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/troubleshooting.html)、[NVIDIA 常用部署方式](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/getting-started.html#common-deployment-scenarios)
+> - **离线、预编译与托管 DRA 参考**：[NVIDIA 离线镜像与包仓库配置](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/install-gpu-operator-air-gapped.html)、[NVIDIA 预编译驱动指南](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/precompiled-drivers.html)、[NVIDIA 托管 DRA 安装与验证](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.7/dra-intro-install.html)
